@@ -1,0 +1,140 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ModelNew granularity: (D) full forward rewrite for the attention computation.
+# - Replaced ops: the whole dense scores=matmul(q,k^T)*scale, masked_fill(window),
+#   softmax(-1), matmul(attn,v) pipeline is replaced by a single FlashAttention-style
+#   Triton kernel `flash_swa_kernel`.
+# - Fusion: QK^T, scaling, sliding-window causal masking, online softmax, and
+#   attn@V are all fused into ONE kernel with tiled online-softmax accumulation.
+#   The kernel iterates ONLY over key blocks inside each query's causal window,
+#   skipping the O(N^2) masked region entirely.
+# - Remaining PyTorch ops: only tensor reshape/views (no compute); everything
+#   numeric happens inside the Triton kernel.
+
+
+@triton.jit
+def flash_swa_kernel(
+    Q, K, V, O,
+    scale,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    WINDOW: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_bh = tl.program_id(1)
+
+    base = off_bh * N * D
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+
+    q_ptrs = Q + base + offs_m[:, None] * D + offs_d[None, :]
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N, other=0.0)
+
+    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+
+    # key range restricted to the causal sliding window
+    lo = start_m * BLOCK_M - WINDOW + 1
+    lo = tl.maximum(lo, 0)
+    lo = (lo // BLOCK_N) * BLOCK_N
+    hi = start_m * BLOCK_M + BLOCK_M
+
+    for start_n in range(lo, hi, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        n_valid = offs_n < N
+
+        k_ptrs = K + base + offs_n[:, None] * D + offs_d[None, :]
+        k = tl.load(k_ptrs, mask=n_valid[:, None], other=0.0)  # (BLOCK_N, D)
+
+        qk = tl.dot(q, tl.trans(k)) * scale  # (BLOCK_M, BLOCK_N)
+
+        rel = offs_m[:, None] - offs_n[None, :]
+        mask = (rel >= 0) & (rel < WINDOW) & n_valid[None, :]
+        qk = tl.where(mask, qk, float("-inf"))
+
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
+
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+
+        l_i = l_i * alpha + tl.sum(p, 1)
+
+        v_ptrs = V + base + offs_n[:, None] * D + offs_d[None, :]
+        v = tl.load(v_ptrs, mask=n_valid[:, None], other=0.0)  # (BLOCK_N, D)
+
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+
+    l_i = tl.where(l_i == 0.0, 1.0, l_i)
+    out = acc / l_i[:, None]
+
+    o_ptrs = O + base + offs_m[:, None] * D + offs_d[None, :]
+    tl.store(o_ptrs, out.to(O.dtype.element_ty), mask=offs_m[:, None] < N)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_heads: int, head_dim: int, window_size: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.window_size = window_size
+        self.scale = head_dim ** -0.5
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        B, H, N, D = q.shape
+
+        q = q if q.is_contiguous() else q.contiguous()
+        k = k if k.is_contiguous() else k.contiguous()
+        v = v if v.is_contiguous() else v.contiguous()
+
+        qf = q.view(B * H, N, D)
+        kf = k.view(B * H, N, D)
+        vf = v.view(B * H, N, D)
+        out = torch.empty_like(qf)
+
+        BLOCK_M = 64
+        BLOCK_N = 64
+
+        grid = (triton.cdiv(N, BLOCK_M), B * H)
+        flash_swa_kernel[grid](
+            qf, kf, vf, out,
+            self.scale,
+            N=N,
+            D=D,
+            WINDOW=self.window_size,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            num_warps=4,
+            num_stages=2,
+        )
+        return out.view(B, H, N, D)
+
+
+# ---- benchmark configuration ----
+batch_size = 4
+num_heads = 8
+seq_len = 1024
+head_dim = 64
+window_size = 256
+
+
+def get_inputs():
+    q = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    k = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    v = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    return [q, k, v]
+
+
+def get_init_inputs():
+    return [num_heads, head_dim, window_size]
+```

@@ -1,0 +1,238 @@
+You are a senior Triton-kernel developer.
+Your job is to FIX the Python script shown below so that it successfully passes the benchmark.
+
+IMPORTANT CONTEXT
+- The failure may come from Python/Triton compilation errors (Triton JIT-compiles at the FIRST kernel
+  launch, so a triton CompilationError can surface inside forward), CUDA execution crashes
+  (illegal memory access from missing/wrong masks or bad pointer arithmetic), numerical mismatch, or timeout.
+- Do NOT rely on error_type names; infer the failure cause from ERROR_LOG and Main Critical Problem.
+
+MANDATORY
+- ModelNew MUST include an equivalent PyTorch module ONLY as a PARAMETER HOLDER
+  (for initialization / state_dict parity with the reference).
+- ModelNew MUST source weights/bias from that module.
+- ModelNew MUST NOT call the holder module’s forward for replaced operators.
+- Do NOT create independent parameters for replaced operators (no torch.randn for weights/bias).
+- The code MUST contain at least one custom Triton kernel (defined with `@triton.jit`) that optimizes the computation process and is actually launched in `ModelNew.forward`. Do NOT remove all Triton kernels or replace them with pure PyTorch operations.
+
+REPAIR STRATEGY (FOLLOW STRICTLY)
+- Apply the SMALLEST change necessary to address the Main Critical Problem.
+- Do NOT refactor unrelated code or redesign the kernel unless strictly required.
+- You MUST choose exactly ONE repair path below based on observable evidence in ERROR_LOG.
+- Follow ONLY the chosen path. Do NOT apply rules from other paths.
+
+PATCH BUDGET (STRICT)
+- You may modify up to 3 code regions if and only if they are inseparable to fix the SAME root cause.
+- If tl.dot is used, fixing a crash may require 2-3 coupled edits (tile shapes + masks + grid); this is allowed and still counts as "smallest change".
+
+DECISION FLOW (evaluate in order; stop at the first matching case)
+
+(1) Python / Triton compilation failure detected in ERROR_LOG (Python traceback, triton CompilationError, invalid tl.* usage):
+    - Fix imports, `@triton.jit` function signatures, `tl.constexpr` annotations, meta-parameter passing (BLOCK sizes, autotune `key=` lists), or Python/Triton syntax.
+    - Do NOT modify kernel math, indexing, or algorithmic semantics.
+
+(2) CUDA execution crash detected (e.g., illegal memory access, launch failure):
+    - Focus on boundary masks of EVERY tl.load / tl.store, grid size computation (triton.cdiv over the full problem size), and pointer/offset arithmetic (element offsets, correct strides for non-contiguous tensors).
+    - Ensure all computed offsets are within allocated tensor ranges; call .contiguous() on inputs or pass real x.stride(i) values.
+    - Do NOT change algorithmic semantics or introduce new optimizations.
+    - If OLD CODE contains "tl.dot", you MUST enforce ALL of the following (otherwise the fix is invalid):
+        a) tl.dot operand block shapes are tl.constexpr, powers of 2, and >= 16 in each dimension.
+        b) Every masked tl.load feeding tl.dot supplies an explicit `other=` fill value (e.g., other=0.0).
+        c) The accumulator is fp32 (e.g., acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)) and is only cast to the output dtype at the final tl.store.
+
+(3) Numerical mismatch detected (e.g., outputs not close, max_abs_err reported):
+    - Fix issues in the following strict priority order:
+        a) Output coverage / masking (grid covers every output tile; masks match tensor bounds exactly).
+        b) Parameter parity (use parameter-holder weight/bias correctly).
+        c) Output shape formula (stride / padding / output_padding / groups / dilation / bias).
+        d) Unsupported reference arguments without explicit asserts.
+        e) dtype / layout / contiguity assumptions (fp16/bf16 inputs need fp32 accumulation; wrong stride arguments for non-contiguous tensors).
+        f) Race conditions: if different programs can write the SAME output element, use tl.atomic_add / tl.atomic_max (or restructure the grid) instead of a racy tl.store.
+    - Do NOT introduce new optimizations while fixing correctness.
+
+(4) Timeout or hang detected:
+    - Reduce pathological behavior (e.g., excessive kernel launches, oversized @triton.autotune config sets, per-shape recompilation, unmasked out-of-bounds accesses that hang the GPU, missing parallelism).
+    - Keep semantics unchanged.
+
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `triton`, `triton.language as tl`.
+   2. `@triton.jit` kernel definition(s) (block sizes as `tl.constexpr` parameters).
+   3. Python launch wrapper(s) that compute the grid
+      (e.g. `grid = lambda meta: (triton.cdiv(n, meta['BLOCK_SIZE']),)`).
+   4. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your Triton kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────────────────────────────
+Traceback (most recent call last):
+  File "/home/elek/KernelMem/utils/compile_and_run.py", line 740, in compare_and_bench
+    raise ValueError(_build_mismatch_debug_msg(
+    ...<9 lines>...
+    ))
+ValueError: Outputs are not close (atol=0.01, rtol=0.01). max_abs_err=nan, mean_abs_err=nan
+in[0]: shape=(4, 8, 1024, 64), dtype=torch.float32, contiguous=True, device=cpu
+in[1]: shape=(4, 8, 1024, 64), dtype=torch.float32, contiguous=True, device=cpu
+in[2]: shape=(4, 8, 1024, 64), dtype=torch.float32, contiguous=True, device=cpu
+ref_out: shape=(4, 8, 1024, 64), dtype=torch.float32, device=cuda:0
+test_out: shape=(4, 8, 1024, 64), dtype=torch.float32, device=cuda:0
+max_err_index=(0, 0, 319, 0), ref_val=0.5063812732696533, cand_val=nan
+
+────────────────────────────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────────────────────────────
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# Granularity: (D) fully rewrite forward.
+# Replaced ops: the entire QK^T scale + windowed-causal mask + softmax + AV
+#   dense attention is replaced by a single FlashAttention-style Triton kernel
+#   (sliding_window_attn_kernel) that iterates ONLY over the key blocks inside
+#   each query's causal window, skipping the masked O(N^2) region entirely.
+# Fusion: matmul(QK^T) + scale + windowed-causal masking + online softmax +
+#   matmul(attn,V) are all fused into sliding_window_attn_kernel.
+# Remaining PyTorch ops: none in the attention math (only shape/alloc glue),
+#   because a fused flash kernel avoids materializing the (B,H,N,N) scores.
+
+
+@triton.jit
+def sliding_window_attn_kernel(
+    Q, K, V, Out,
+    N, WINDOW, scale,
+    stride_bh, stride_n, stride_d,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+
+    base = pid_bh * stride_bh
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+
+    q_ptrs = base + offs_m[:, None] * stride_n + offs_d[None, :] * stride_d
+    q_mask = offs_m[:, None] < N
+    q = tl.load(Q + q_ptrs, mask=q_mask, other=0.0)
+
+    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+
+    start_m = pid_m * BLOCK_M
+    # key positions relevant: j > i-WINDOW and j <= i, over the query block
+    lo = start_m - WINDOW + 1
+    lo = tl.maximum(lo, 0)
+    lo = (lo // BLOCK_N) * BLOCK_N
+    hi = tl.minimum(start_m + BLOCK_M, N)
+
+    for start_n in range(lo, hi, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = base + offs_n[:, None] * stride_n + offs_d[None, :] * stride_d
+        n_mask = offs_n[:, None] < N
+        k = tl.load(K + k_ptrs, mask=n_mask, other=0.0)
+
+        qk = tl.dot(q, tl.trans(k)) * scale  # (BLOCK_M, BLOCK_N)
+
+        rel = offs_m[:, None] - offs_n[None, :]
+        valid = (rel >= 0) & (rel < WINDOW) & (offs_n[None, :] < N)
+        qk = tl.where(valid, qk, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        v = tl.load(V + k_ptrs, mask=n_mask, other=0.0)
+        acc += tl.dot(p.to(v.dtype), v)
+
+        m_i = m_new
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    out = acc / l_safe[:, None]
+
+    o_ptrs = base + offs_m[:, None] * stride_n + offs_d[None, :] * stride_d
+    tl.store(Out + o_ptrs, out.to(Out.dtype.element_ty), mask=q_mask)
+
+
+def sliding_window_attention(q, k, v, window, scale):
+    q = q if q.is_contiguous() else q.contiguous()
+    k = k if k.is_contiguous() else k.contiguous()
+    v = v if v.is_contiguous() else v.contiguous()
+
+    B, H, N, D = q.shape
+    BH = B * H
+    out = torch.empty_like(q)
+
+    qf = q.view(BH, N, D)
+    kf = k.view(BH, N, D)
+    vf = v.view(BH, N, D)
+    of = out.view(BH, N, D)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+
+    grid = (triton.cdiv(N, BLOCK_M), BH)
+    sliding_window_attn_kernel[grid](
+        qf, kf, vf, of,
+        N, window, scale,
+        qf.stride(0), qf.stride(1), qf.stride(2),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, D=D,
+        num_warps=4, num_stages=2,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    # Granularity (D): fully rewrite forward with one fused flash kernel.
+    def __init__(self, num_heads: int, head_dim: int, window_size: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.window_size = window_size
+        self.scale = head_dim ** -0.5
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return sliding_window_attention(q, k, v, self.window_size, self.scale)
+
+
+# ---- benchmark configuration ----
+batch_size = 4
+num_heads = 8
+seq_len = 1024
+head_dim = 64
+window_size = 256
+
+
+def get_inputs():
+    q = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    k = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    v = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    return [q, k, v]
+
+
+def get_init_inputs():
+    return [num_heads, head_dim, window_size]
+
+────────────────────────────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────────────────────────────
+critical_issue: Fully-masked key block yields -inf row causing inf-minus-inf NaN in online softmax
+evidence: max_abs_err=nan, mean_abs_err=nan, max_err_index=(0, 0, 319, 0), ref_val=0.5063812732696533, cand_val=nan
+root_cause: For rows like query 319, an early key block (start_n=0) has NO valid keys (rel>=WINDOW), so qk is entirely float('-inf'). Then m_new=max(m_i=-inf, -inf)=-inf, making alpha=exp(-inf-(-inf))=exp(NaN)=NaN and p=exp(-inf-(-inf))=NaN, which propagates into acc/l_i and the final stored output.
+trigger_condition: Any query row whose iterated key block contains no in-window keys (rel outside [0,WINDOW)), producing an all -inf score row before a valid block is seen.
+must_hold_invariants: Masked score entries must not create inf-minus-inf; use finite guard or tl.where on p/alpha, alpha must be 0 (not NaN) when accumulator is still empty (m_i=-inf), p must be 0 for invalid positions regardless of m_new
+minimal_fix: Guard softmax: set alpha = tl.where(m_new == float('-inf'), 0.0, tl.exp(m_i - m_new)) and p = tl.where(valid, tl.exp(qk - m_new[:, None]), 0.0) to avoid inf-inf NaN.
+patch_anchor: alpha = tl.exp(m_i - m_new)
+confidence: high
+
+```python
+# <your corrected code>
+```
+# ==========================================================

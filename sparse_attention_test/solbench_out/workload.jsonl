@@ -1,0 +1,8 @@
+{"uuid": "317d8939-3ce2-40a0-8112-0b17d17b5670", "axes": {"batch_size": 4, "seq_len": 1024}, "inputs": {"q": {"type": "random"}, "k": {"type": "random"}, "v": {"type": "random"}}}
+{"uuid": "5074f164-66c9-4860-8af2-39f9ad512f90", "axes": {"batch_size": 1, "seq_len": 512}, "inputs": {"q": {"type": "random"}, "k": {"type": "random"}, "v": {"type": "random"}}}
+{"uuid": "1b473d40-4c38-446e-9858-702f0d6b62da", "axes": {"batch_size": 2, "seq_len": 512}, "inputs": {"q": {"type": "random"}, "k": {"type": "random"}, "v": {"type": "random"}}}
+{"uuid": "96ab8de8-2711-40f5-9066-b56969380b5e", "axes": {"batch_size": 2, "seq_len": 1024}, "inputs": {"q": {"type": "random"}, "k": {"type": "random"}, "v": {"type": "random"}}}
+{"uuid": "d9e5a222-b383-4a67-9465-889bf304d5fa", "axes": {"batch_size": 8, "seq_len": 1024}, "inputs": {"q": {"type": "random"}, "k": {"type": "random"}, "v": {"type": "random"}}}
+{"uuid": "afcf4369-b94d-4910-a3c5-4e2e3a1fc1a1", "axes": {"batch_size": 4, "seq_len": 512}, "inputs": {"q": {"type": "random"}, "k": {"type": "random"}, "v": {"type": "random"}}}
+{"uuid": "f27edd21-6754-485a-9151-dacf70ddba71", "axes": {"batch_size": 4, "seq_len": 2048}, "inputs": {"q": {"type": "random"}, "k": {"type": "random"}, "v": {"type": "random"}}}
+{"uuid": "6a438343-6b5e-484e-9f6c-d72da7e2be6a", "axes": {"batch_size": 1, "seq_len": 2048}, "inputs": {"q": {"type": "random"}, "k": {"type": "random"}, "v": {"type": "random"}}}

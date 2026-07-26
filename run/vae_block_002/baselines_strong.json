@@ -1,0 +1,102 @@
+{
+  "7b00c2c8-1eaa-55ec-a575-64639d605881": {
+    "t_b_ms": 2.037600040435791,
+    "t_sol_ms": 1.47537,
+    "baseline": "reference"
+  },
+  "a4c930bb-4694-570b-8d51-97ba053f74ac": {
+    "t_b_ms": 0.5814559757709503,
+    "t_sol_ms": 0.368843,
+    "baseline": "pytorch_optimized"
+  },
+  "f1b799bf-831f-5434-98be-68e897f6a219": {
+    "t_b_ms": 0.5875840187072754,
+    "t_sol_ms": 0.386335,
+    "baseline": "pytorch_optimized"
+  },
+  "b7c12247-9822-5484-b556-12272c60c95b": {
+    "t_b_ms": 16.982831954956055,
+    "t_sol_ms": 11.802964,
+    "baseline": "reference"
+  },
+  "697db7ab-bed6-5b19-a6d9-ee56785b0031": {
+    "t_b_ms": 0.9388160109519958,
+    "t_sol_ms": 0.737685,
+    "baseline": "pytorch_optimized"
+  },
+  "c27f80fd-cda1-5e21-9a89-61e03f7fab92": {
+    "t_b_ms": 1.9239039421081543,
+    "t_sol_ms": 1.47537,
+    "baseline": "pytorch_optimized"
+  },
+  "d6d0256b-9fcc-58e1-b170-418468a285ff": {
+    "t_b_ms": 3.931936025619507,
+    "t_sol_ms": 2.950741,
+    "baseline": "pytorch_optimized"
+  },
+  "69ceed6e-126b-5583-8bba-fabb3a09f4db": {
+    "t_b_ms": 0.5527199804782867,
+    "t_sol_ms": 0.368843,
+    "baseline": "pytorch_optimized"
+  },
+  "144fdf2b-0296-5d64-819b-eab16d18c752": {
+    "t_b_ms": 8.485712051391602,
+    "t_sol_ms": 5.901482,
+    "baseline": "pytorch_optimized"
+  },
+  "8d631edd-1bc9-5142-9253-b0378a890e67": {
+    "t_b_ms": 0.31516799330711365,
+    "t_sol_ms": 0.184421,
+    "baseline": "pytorch_optimized"
+  },
+  "38357eec-a997-567f-a5e4-07cb993c02f9": {
+    "t_b_ms": 41.7774715423584,
+    "t_sol_ms": 23.605927,
+    "baseline": "pytorch_optimized"
+  },
+  "102b9359-8f90-5a29-a5a5-dd7bce9f32c3": {
+    "t_b_ms": 2.777999997138977,
+    "t_sol_ms": 1.932664,
+    "baseline": "pytorch_optimized"
+  },
+  "952fec71-f323-5dab-9340-dad59ad7a3f1": {
+    "t_b_ms": 7.934784173965454,
+    "t_sol_ms": 5.901482,
+    "baseline": "pytorch_optimized"
+  },
+  "6284bbd2-bc2e-5002-856a-c4f2c7582254": {
+    "t_b_ms": 3.8398079872131348,
+    "t_sol_ms": 2.950741,
+    "baseline": "pytorch_optimized"
+  },
+  "99881f0c-5281-5728-a4fa-de56d6c2bbe0": {
+    "t_b_ms": 0.9705600142478943,
+    "t_sol_ms": 0.737685,
+    "baseline": "pytorch_optimized"
+  },
+  "8de1dc63-b34a-5618-ba36-abaa79de54cf": {
+    "t_b_ms": 23.59492778778076,
+    "t_sol_ms": 13.278334,
+    "baseline": "pytorch_optimized"
+  },
+  "d6339761-5f71-58dc-b823-4b5caf913838": {
+    "t_b_ms": 1.3718559741973877,
+    "t_sol_ms": 1.106528,
+    "baseline": "pytorch_optimized"
+  },
+  "7a72b3ef-ddf9-5788-bcda-d4e310ffbc2a": {
+    "t_b_ms": 1.3915039896965027,
+    "t_sol_ms": 1.106528,
+    "baseline": "pytorch_optimized"
+  },
+  "cdb231f0-8b76-5b89-a93b-21af0627e037": {
+    "t_b_ms": 1.8747199773788452,
+    "t_sol_ms": 1.47537,
+    "baseline": "pytorch_optimized"
+  },
+  "c318e734-9c16-5ca9-8379-1ebdd11da8c0": {
+    "t_b_ms": 2.942784070968628,
+    "t_sol_ms": 2.213056,
+    "baseline": "pytorch_optimized"
+  }
+}

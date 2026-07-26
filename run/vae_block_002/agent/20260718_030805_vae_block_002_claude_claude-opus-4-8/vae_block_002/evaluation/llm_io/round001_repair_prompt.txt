@@ -1,0 +1,289 @@
+You are a senior CUDA-extension developer.
+Your job is to FIX the Python script shown below so that it successfully passes the benchmark.
+
+IMPORTANT CONTEXT
+- The failure may come from build issues, CUDA execution crashes, numerical mismatch, or timeout.
+- Do NOT rely on error_type names; infer the failure cause from ERROR_LOG and Main Critical Problem.
+
+MANDATORY
+- ModelNew MUST include an equivalent PyTorch module ONLY as a PARAMETER HOLDER
+  (for initialization / state_dict parity with the reference).
+- ModelNew MUST source weights/bias from that module.
+- ModelNew MUST NOT call the holder module’s forward for replaced operators.
+- Do NOT create independent parameters for replaced operators (no torch.randn for weights/bias).
+- The code MUST contain at least one custom CUDA kernel (defined in the `source` CUDA string) that optimizes the computation process. Do NOT remove all CUDA kernels or replace them with pure PyTorch operations.
+
+REPAIR STRATEGY (FOLLOW STRICTLY)
+- Apply the SMALLEST change necessary to address the Main Critical Problem.
+- Do NOT refactor unrelated code or redesign the kernel unless strictly required.
+- You MUST choose exactly ONE repair path below based on observable evidence in ERROR_LOG.
+- Follow ONLY the chosen path. Do NOT apply rules from other paths.
+
+PATCH BUDGET (STRICT)
+- You may modify up to 3 code regions if and only if they are inseparable to fix the SAME root cause.
+- If WMMA is used (wmma:: appears), fixing a crash may require 2-3 coupled edits; this is allowed and still counts as "smallest change".
+
+DECISION FLOW (evaluate in order; stop at the first matching case)
+
+(1) Build / compilation failure detected in ERROR_LOG:
+    - Fix includes, function signatures, bindings, load_inline usage, or C++/CUDA syntax.
+    - Do NOT modify kernel math, indexing, or algorithmic semantics.
+
+(2) CUDA execution crash detected (e.g., illegal memory access, launch failure):
+    - Focus on bounds checks, grid/block configuration, and indexing of input/weight/output.
+    - Ensure all indices are within allocated tensor ranges.
+    - Do NOT change algorithmic semantics or introduce new optimizations.
+    - If CUDA_CODE contains "wmma::", you MUST enforce ALL of the following (otherwise the fix is invalid):
+        a) Exactly one warp participates in wmma::load_matrix_sync / wmma::mma_sync / wmma::store_matrix_sync for each tile.
+        b) The full 16x16 tiles read by load_matrix_sync are initialized (32-thread blocks must load multiple elements per thread, or use 256-thread staging with only warp0 doing WMMA).
+        c) store_matrix_sync is called warp-collectively with a warp-uniform base pointer (shared/global). DO NOT call store from a single thread. DO NOT store into per-thread local arrays.
+
+(3) Numerical mismatch detected (e.g., outputs not close, max_abs_err reported):
+    - Fix issues in the following strict priority order:
+        a) Output coverage / indexing (full tiling of all output dimensions).
+        b) Parameter parity (use parameter-holder weight/bias correctly).
+        c) Output shape formula (stride / padding / output_padding / groups / dilation / bias).
+        d) Unsupported reference arguments without explicit asserts.
+        e) dtype / layout / contiguity assumptions.
+    - Do NOT introduce new optimizations while fixing correctness.
+
+(4) Timeout or hang detected:
+    - Reduce pathological behavior (e.g., excessive kernel launches, missing parallelism).
+    - Keep semantics unchanged.
+
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple-quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────────────────────────────
+Traceback (most recent call last):
+  File "/home/elek/KernelMem/utils/compile_and_run.py", line 650, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/elek/KernelMem/utils/compile_and_run.py", line 180, in _run_once
+    out = model(*inp)
+  File "/home/elek/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/elek/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/elek/KernelMem/run/vae_block_002/agent/20260718_030805_vae_block_002_claude_claude-opus-4-8/vae_block_002/code/kernel_20260718_030924.py", line 178, in forward
+    out = self._ext.gn_silu_cuda(out, norm1_weight, norm1_bias, eps, self.num_groups)
+torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device
+Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+────────────────────────────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────────────────────────────
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# ============================================================================
+# ModelNew — granularity (B): replace several ops + schedule multiple kernels
+#   1) Chosen granularity: (B)
+#   2) Ops replaced by CUSTOM CUDA kernels:
+#        - GroupNorm(num_groups=32) + SiLU  (fused into ONE kernel)
+#        - GroupNorm + SiLU + residual-add  (fused into ONE kernel)
+#   3) Fusion mapping:
+#        - kernel `gn_silu_kernel` fuses per-group reduction (mean/var),
+#          normalization, affine (weight/bias) and SiLU into a single pass.
+#        - the second GroupNorm+SiLU also fuses the final residual add
+#          (out + x) into the same kernel (residual pointer path).
+#   4) Kept in PyTorch (cuDNN):
+#        - F.conv2d (two 3x3 convs) — cuDNN is already near-optimal for this
+#          256->256 conv shape and is hard to beat with a hand kernel.
+#   Note: group data (channels_per_group * H * W) is contiguous in NCHW,
+#         so each (batch, group) maps to one contiguous block -> one CTA.
+# ============================================================================
+
+_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+
+// One block handles one (batch, group). Group data is contiguous: cpg*HW floats.
+template<bool HAS_RES>
+__global__ void gn_silu_kernel(
+        const float* __restrict__ in,
+        const float* __restrict__ weight,
+        const float* __restrict__ bias,
+        const float* __restrict__ residual,
+        float* __restrict__ out,
+        int cpg, int HW, int num_groups, float eps) {
+
+    const int block = blockIdx.x;
+    const int tid   = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int g = block % num_groups;
+    const int N = cpg * HW;
+
+    const long base = (long)block * N;
+    const float* inp = in + base;
+    float* outp = out + base;
+
+    float lsum = 0.f, lsq = 0.f;
+    for (int i = tid; i < N; i += nthreads) {
+        float v = inp[i];
+        lsum += v;
+        lsq  += v * v;
+    }
+
+    __shared__ float ssum[256];
+    __shared__ float ssq[256];
+    ssum[tid] = lsum;
+    ssq[tid]  = lsq;
+    __syncthreads();
+    for (int s = nthreads >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            ssum[tid] += ssum[tid + s];
+            ssq[tid]  += ssq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float s_mean, s_inv;
+    if (tid == 0) {
+        float mean = ssum[0] / (float)N;
+        float var  = ssq[0] / (float)N - mean * mean;
+        s_mean = mean;
+        s_inv  = rsqrtf(var + eps);
+    }
+    __syncthreads();
+
+    const float mean = s_mean;
+    const float inv  = s_inv;
+    const int cbase = g * cpg;
+
+    for (int i = tid; i < N; i += nthreads) {
+        int local_c = i / HW;
+        int c = cbase + local_c;
+        float w = weight[c];
+        float b = bias[c];
+        float v = inp[i];
+        float norm = (v - mean) * inv * w + b;
+        float sil = norm / (1.f + __expf(-norm));
+        if (HAS_RES) {
+            sil += residual[base + i];
+        }
+        outp[i] = sil;
+    }
+}
+
+torch::Tensor gn_silu_cuda(torch::Tensor x, torch::Tensor weight,
+                           torch::Tensor bias, double eps, int64_t num_groups) {
+    auto xc = x.is_contiguous() ? x : x.contiguous();
+    int B = xc.size(0);
+    int C = xc.size(1);
+    int H = xc.size(2);
+    int W = xc.size(3);
+    int cpg = C / (int)num_groups;
+    int HW = H * W;
+
+    auto out = torch::empty_like(xc);
+    int blocks = B * (int)num_groups;
+    int threads = 256;
+
+    auto stream = at::cuda::getDefaultCUDAStream();
+    gn_silu_kernel<false><<<blocks, threads, 0, stream>>>(
+        xc.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
+        nullptr, out.data_ptr<float>(), cpg, HW, (int)num_groups, (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor gn_silu_res_cuda(torch::Tensor x, torch::Tensor weight,
+                               torch::Tensor bias, torch::Tensor residual,
+                               double eps, int64_t num_groups) {
+    auto xc = x.is_contiguous() ? x : x.contiguous();
+    auto rc = residual.is_contiguous() ? residual : residual.contiguous();
+    int B = xc.size(0);
+    int C = xc.size(1);
+    int H = xc.size(2);
+    int W = xc.size(3);
+    int cpg = C / (int)num_groups;
+    int HW = H * W;
+
+    auto out = torch::empty_like(xc);
+    int blocks = B * (int)num_groups;
+    int threads = 256;
+
+    auto stream = at::cuda::getDefaultCUDAStream();
+    gn_silu_kernel<true><<<blocks, threads, 0, stream>>>(
+        xc.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
+        rc.data_ptr<float>(), out.data_ptr<float>(), cpg, HW, (int)num_groups, (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+"""
+
+_cpp = (
+    "torch::Tensor gn_silu_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps, int64_t num_groups);\n"
+    "torch::Tensor gn_silu_res_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, torch::Tensor residual, double eps, int64_t num_groups);\n"
+)
+
+_mod = load_inline(
+    name="gn_silu_fused_ext",
+    cpp_sources=_cpp,
+    cuda_sources=_src,
+    functions=["gn_silu_cuda", "gn_silu_res_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++17"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++17",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_80,code=sm_80",
+    ],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_groups = 32
+        self._ext = _mod
+
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        eps = float(eps)
+        # First path: Conv3x3 (cuDNN) -> fused GroupNorm+SiLU
+        out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)
+        out = self._ext.gn_silu_cuda(out, norm1_weight, norm1_bias, eps, self.num_groups)
+
+        # Second path: Conv3x3 (cuDNN) -> fused GroupNorm+SiLU+residual
+        out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)
+        out = self._ext.gn_silu_res_cuda(out, norm2_weight, norm2_bias, x, eps, self.num_groups)
+        return out
+
+────────────────────────────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────────────────────────────
+critical_issue: Kernel compiled only for sm_80; device architecture mismatch prevents launch
+evidence: CUDA error: no kernel image is available for execution on the device, cudaErrorNoKernelImageForDevice
+root_cause: extra_cuda_cflags hardcodes `-gencode=arch=compute_80,code=sm_80`, so the fatbin contains only SM80 SASS. The actual GPU is not sm_80, so no matching kernel image exists and every launch (first at gn_silu_cuda) fails with cudaErrorNoKernelImageForDevice.
+trigger_condition: Running on a GPU whose compute capability differs from 8.0 while the extension is built exclusively with -gencode arch=compute_80,code=sm_80.
+must_hold_invariants: Compiled SASS/PTX must cover the running device's compute capability
+minimal_fix: Remove the hardcoded `-gencode=arch=compute_80,code=sm_80` line from extra_cuda_cflags so PyTorch auto-selects TORCH_CUDA_ARCH_LIST, or replace with the device's actual arch (e.g. compute_XX/sm_XX plus PTX).
+patch_anchor: "-gencode=arch=compute_80,code=sm_80",
+confidence: high
+
+```python
+# <your corrected code>
+```
+# ==========================================================

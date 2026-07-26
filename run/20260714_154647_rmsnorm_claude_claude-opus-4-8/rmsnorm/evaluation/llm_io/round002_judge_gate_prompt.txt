@@ -1,0 +1,459 @@
+=== SYSTEM PROMPT ===
+
+You are a Triton kernel code analyzer. Your task is to analyze a Triton kernel (a Python module with @triton.jit functions) and extract structural features that determine optimization feasibility.
+
+You will receive:
+- PyTorch reference implementation (contains `class Model`)
+- Triton candidate kernel code (a Python file; may be empty or contain one or more @triton.jit kernels plus a `ModelNew` class that launches them)
+
+Your task: Analyze the Triton kernel code and output a JSON object with the following fields:
+
+**Required Fields:**
+
+1. **has_reuse** (boolean):
+   - `true`: The kernel exploits data reuse through:
+     * Block tiling staged through `tl.dot` operands (A/B tiles reused across the K loop)
+     * Accumulator tiles carried across a K loop (e.g., `acc` updated inside `for k in range(0, K, BLOCK_K)`)
+     * Block-pointer tiling (`tl.make_block_ptr`) or software pipelining via `num_stages > 1`
+     * Same input data loaded once per block and used in multiple computations
+   - `false`: No significant data reuse; each element is read once, computed, and written once
+   - **Judgment criteria**: Look for `tl.dot`, K-loops that advance tile pointers while reusing an accumulator, or block re-tiling patterns
+   - **Important note**: Local accumulation `val += ...` alone is NOT proof of reuse. Reuse must be via an explicit mechanism (tl.dot operand tiles / accumulator block tiling / block-pointer staging).
+
+2. **streaming_no_reuse** (boolean):
+   - `true`: Typical streaming kernel - each element is read once, computed, and written once with almost no reuse
+     * Single-pass `tl.load` -> compute -> `tl.store` pattern
+     * No `tl.dot` / block tiling
+     * No cross-program reduction
+     * Simple elementwise operations (e.g., activation functions, elementwise math)
+   - `false`: Not a pure streaming kernel (has reuse, reduction, or complex patterns)
+   - **Judgment criteria**: Check if the kernel is just `tl.load → compute → tl.store` over one offset vector with no tile reuse or reduction operations
+   - **Judgment criteria**: If the kernel involves **GEMM** (e.g., `nn.Linear`, `torch.matmul`), set `streaming_no_reuse = false`, as GEMM inherently involves data reuse due to matrix-vector or matrix-matrix multiplications.
+
+3. **has_vector_load_store** (boolean):
+   - `true`: The kernel uses or can easily use contiguous block access that the Triton compiler vectorizes:
+     * Loads/stores over `pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)` offsets on stride-1 (contiguous) data
+     * `tl.max_contiguous` / `tl.multiple_of` hints, or `tl.make_block_ptr` over a contiguous last dimension
+     * Access pattern is regular (stride-1 or small stride), so wide vectorized global transactions are emitted
+   - `false`: Memory access is gather-style, strided with large strides, data-dependent, or otherwise cannot be vectorized
+   - **Judgment criteria**: Check whether tl.load/tl.store offsets are contiguous `tl.arange` ranges (compiler auto-vectorizes those); gather/scatter offsets computed from loaded values are NOT vectorizable
+
+4. **kernel_structure_id** (integer, 0-4):
+   - `0` (S0 - Streaming-NoReuse): Single-pass read-write, no tile reuse, no cross-program reduction
+     * Elementwise operations (sigmoid, tanh, relu, etc.)
+     * Simple transformations without reuse
+   - `1` (S1 - Reuse-Friendly): Has explicit data reuse opportunities / mechanisms
+     * `tl.dot` block tiling present (A/B tiles reused across the K loop)
+     * Accumulator tiles producing multiple outputs per program (register blocking)
+     * Block-pointer staging (`tl.make_block_ptr`) or `num_stages` pipelining for reuse
+     * Loop over a dimension with reuse AND explicit reuse mechanism
+   - `2` (S2 - Irregular / Stencil-like): Complex indexing / multi-dimensional gathers without cross-program reduction
+     * Gather/scatter operations (tl.load/tl.store whose offsets are themselves loaded values)
+     * Data-dependent masks or branches
+     * Non-affine indexing (indirect access)
+     * **Stencil/Convolution-like window loops**: nested Python loops (e.g., over ic and kd/kh/kw) with masked window loads and multi-dimensional indexing
+   - `3` (S3 - Reduction-Scan): Reduction or scan operations (cross-element aggregation)
+     * Block-level reductions via `tl.sum` / `tl.max` / `tl.min` / `tl.reduce`
+     * Atomic operations (`tl.atomic_add`, `tl.atomic_max`, ...) used for accumulation across programs
+     * Scan patterns (`tl.cumsum`, `tl.associative_scan`)
+   - `4` (S4 - MultiKernel-Graph): Multiple kernels in the forward pass
+     * **Multiple distinct kernel launches** in the model's forward pass, including both custom Triton launches (`my_kernel[grid](...)`) and standard PyTorch CUDA ops.
+     * **For models with multiple layers such as convolution, batch normalization, ReLU, etc.**, each of these layers corresponds to a separate kernel launch.
+     * **Evidence**: Multiple `@triton.jit` kernels launched in forward, or multiple `kernel_name[grid](...)` launch sites, even if the remaining ops are standard layers like Conv2d, BatchNorm2d, or ReLU. This is true even if no custom Triton kernels are written.
+     * **Important**: Acknowledge that even if no custom kernels are written, the presence of multiple layers (e.g., Conv2d, BatchNorm2d, ReLU) each launching their own kernel makes it a multi-kernel graph.
+     * **For multi-stage neural networks** (e.g., EfficientNet, ResNet, etc.), set `kernel_structure_id = 4` to reflect the multiple kernels involved during the forward pass, as these networks inherently involve multiple kernel launches for each distinct layer.
+     * **For models like convolutional neural networks (CNNs)**, even if you have only one custom Triton kernel for convolution, the overall model still involves multiple kernels for each layer (e.g., convolution, activation, batch normalization), which makes the structure a multi-kernel graph.
+
+   - **Judgment criteria**: Classify based on the dominant pattern in the Triton kernel. Look for multiple kernel launches in the forward pass, including both custom Triton launches and standard operations like Conv2d, BatchNorm2d, etc.
+    - **S4 PRIORITY OVERRIDE (Graph-level)**:
+      - If the Model.forward() clearly contains 2+ distinct kernel-producing stages (e.g., torch.matmul/nn.Linear/conv* AND any custom Triton launch like my_kernel[grid](...), or multiple different PyTorch CUDA ops), then set kernel_structure_id = 4 (S4) regardless of whether the primary custom kernel looks like S0–S3.
+      - Only if the forward pass effectively corresponds to a single kernel-stage (one custom Triton kernel or one CUDA op) should you choose among S0–S3.
+   - **CRITICAL DISAMBIGUATION RULE**:
+     - You MUST set kernel_structure_id = 3 (S3) ONLY if there is clear evidence of CROSS-ELEMENT reduction/scan AND the forward pass does NOT qualify as S4 under the S4 PRIORITY OVERRIDE, such as at least one of:
+       * tl.atomic_add / tl.atomic_max / tl.atomic_* on global memory for accumulation
+       * block reduction via `tl.sum` / `tl.max` / `tl.min` / `tl.reduce` collapsing an axis of a block
+       * scan via `tl.cumsum` / `tl.associative_scan`
+       * a two-pass reduction (partial sums kernel + combine kernel)
+     - If the kernel only performs per-element local accumulation like:
+       `val = 0.0` then `for ...: val += ...` then `tl.store(out_ptr + out_idx, val)`
+       and there are NO atomics, NO tl.sum/tl.reduce-style block reduction, NO scan,
+       then it is NOT S3. In that case, choose S2 if indexing/loops are complex (e.g., conv/stencil window loops),
+       otherwise choose S1 or S0 accordingly.
+
+- **Additional rule**: If the kernel performs **matrix multiplication** (e.g., `nn.Linear`, `torch.matmul`), set `kernel_structure_id = 1 (S1 - Reuse-Friendly)`, as matrix multiplication inherently involves data reuse even when performed once. **However**, if the kernel launches multiple layers of matrix multiplications (e.g., in a neural network model), it should be classified as `S4 - MultiKernel-Graph` because each layer corresponds to a separate kernel launch.
+
+5. **is_aligned_vector_access** (boolean):
+   - `true`: Block access is aligned: power-of-2 `BLOCK` sizes (tl.constexpr) over contiguous data, offsets start at `pid * BLOCK`, no misaligned base offsets
+     * Or: memory access pattern suggests alignment is feasible (contiguous tensors, 16-byte-aligned bases as guaranteed by torch allocations)
+   - `false`: Access starts at odd/unaligned offsets (e.g., `base + 1`), strides break alignment, or alignment cannot be guaranteed
+   - **Default**: If unknown, set to `true` to avoid over-triggering restrictions
+   - **Judgment criteria**: Check that BLOCK sizes are powers of 2, offsets are `pid * BLOCK + tl.arange(0, BLOCK)`, and no constant offsets shift the base off alignment
+
+6. **has_tail_handling_overhead** (boolean):
+   - `true`: Tail handling causes overhead (branchy remainder paths, duplicated epilogue code, scalar cleanup loops)
+     * Explicit `if` branches for remainder elements that duplicate the main path
+     * Separate epilogue kernels or per-element cleanup loops
+   - `false`: No significant tail handling overhead, or tail is handled efficiently
+   - **Default**: If unknown, set to `false`
+   - **Judgment criteria**: Masked `tl.load`/`tl.store` with `mask = offs < n` is the idiomatic Triton tail handling and is usually cheap — do NOT count it as overhead by itself. Set `true` only for genuinely branchy/duplicated tail paths.
+
+7. **has_multiple_kernels_in_forward** (boolean):
+   - `true`: The candidate forward path launches multiple distinct kernels...
+   * **For models with multiple standard layers like convolution, batch normalization, ReLU**, each layer will launch a separate kernel, and this must be considered as multiple kernel launches.
+   * **Even if no custom kernels are written**, if there are multiple standard layers (Conv2d, BatchNorm2d, ReLU, etc.) in the forward pass, this should be marked as `true`.
+     * **Evidence**:
+       - Multiple distinct `kernel_name[grid](...)` Triton launch sites executed inside `ModelNew.forward`.
+       - Forward mixes Triton launches with PyTorch CUDA ops, or calls multiple different @triton.jit kernels.
+       - Multiple kernels with explicit intermediate buffers between them.
+     * **Important**: Focus on **multiple kernel launches** in the **forward** pass, not on the presence of multiple kernels in the source code or initialization steps.
+     * **Judgment criteria**:
+       - Look for multiple `@triton.jit` kernel names or launch sites (`kernel_name[grid](...)`).
+       - Identify **multiple kernel-producing calls** within `forward` (e.g., `kernel_a[grid](...)` followed by `kernel_b[grid](...)`, or a Triton launch followed by torch ops).
+       - Ensure that you **ignore initialization**, autotune warmup, or **compilation-time code**; only count **kernel launches** that happen **during forward**.
+       - **For entire networks** (such as a multi-stage neural network), set this field to `true` as the network is likely to involve multiple stages or kernel launches.
+   - `false`: Only one main compute kernel launch in forward, or cannot prove multiple kernel launches during forward.
+     * **Judgment criteria**: Single kernel launch in the forward function or no explicit evidence of multiple kernel calls.
+  - **Judgment criteria**: For **entire networks** like **multi-stage neural networks**, set `has_multiple_kernels_in_forward = true` as they involve multiple stages or kernel launches.
+  - For **linear operations** (e.g., `nn.Linear`, `torch.matmul`), set `has_multiple_kernels_in_forward = false`, as these usually correspond to a single kernel launch in the forward pass.
+  - For **single kernel operations** such as matrix multiplications or linear transformations (e.g., `nn.Linear`, `torch.matmul`), set `has_multiple_kernels_in_forward = false` as these operations typically involve a single kernel launch in the forward pass.
+
+8. **tc_eligible** (boolean):
+   - `true`: Tensor Cores (MMA via `tl.dot`) are eligible for this kernel:
+     * Matrix multiplication patterns (GEMM: A × B = C) expressible as `tl.dot` over block tiles
+     * **Any kernel that performs matrix multiplication (e.g., `matmul`, `GEMM`, `nn.Linear`, `torch.matmul`, etc.)**.
+     * Supported input precisions: FP16, BF16, TF32 (fp32 inputs with tf32 math), INT8 (check for `tl.float16`, `tl.bfloat16`, torch fp16/bf16 inputs, or fp32 inputs eligible for tf32)
+     * Proper tile shapes: BLOCK_M / BLOCK_N / BLOCK_K are >= 16 (tl.dot requirement for MMA)
+     * No constraints preventing tensor-core usage (e.g., dynamic shapes, non-standard layouts)
+     * Access patterns compatible with block tiling (row-major or column-major matrices addressable via strides)
+   - `false`: Tensor Cores are not eligible:
+     * Not a matrix multiplication pattern
+     * Unsupported data types (e.g., FP64)
+     * Tile dimensions cannot reach the tl.dot minimum (16)
+     * Constraints that prevent tensor-core usage
+   - **Default**: If unknown, set to `false` (conservative)
+   - **Judgment criteria**:
+     - Graph-level GEMM trigger: If Model.forward() contains any matrix multiplication / linear stage (e.g., torch.matmul, nn.Linear, addmm, GEMM), then set tc_eligible = true even if the custom Triton kernel itself is not GEMM.
+     - Look for GEMM patterns in the forward graph OR Triton code (e.g., torch.matmul, nn.Linear, tl.dot-based kernels), and set tc_eligible = true if any stage is GEMM-like.
+     - Check data types (fp16/bf16/tf32/int8 operands for tl.dot), verify tile shapes (BLOCK_M/N/K >= 16, ideally multiples of 16).
+     - Ensure the kernel does not have constraints like dynamic shapes or non-standard layouts that prevent tensor-core usage.
+     - Tensor-core-eligible kernels typically involve specific operations like matrix multiplications that can benefit from MMA hardware acceleration.
+
+
+9. **is_pointwise** (boolean):
+   - `true`: Pointwise kernel where out[idx] depends only on inp[idx] (no cross-index reads)
+     * Each output element depends only on the corresponding input element
+     * All `tl.load`/`tl.store` calls share the same offset vector (e.g., one `pid * BLOCK + tl.arange(0, BLOCK)`)
+     * Examples: elementwise activation functions (relu, sigmoid, tanh), elementwise math operations
+   - `false`: Kernel has cross-index dependencies or reads from multiple input positions
+   - **Default**: If unknown, set to `false` (conservative)
+   - **Judgment criteria**: Check if `tl.store(out_ptr + offs, f(tl.load(in_ptr + offs)))` holds with identical `offs` for all loads and stores
+
+10. **uses_transcendentals** (boolean):
+   - `true`: Kernel uses transcendental/SFU-heavy math functions:
+     * tl.exp, tl.exp2, tl.log, tl.log2, tl.sin, tl.cos, tl.sqrt, tl.rsqrt, tl.sigmoid, tl.erf, tl.math.* / libdevice.* transcendental calls (tanh, pow, erfc, etc.)
+   - `false`: No transcendental functions used
+   - **Default**: If unknown, set to `false`
+   - **Judgment criteria**: Look for tl.exp/tl.log/tl.sin/tl.cos/tl.sqrt/tl.rsqrt/tl.sigmoid/tl.erf and tl.math.* or triton.language.extra.libdevice.* calls
+
+11. **is_naive_gemm** (boolean):
+    - `true`: Naive GEMM signature: manual accumulation over K WITHOUT `tl.dot`
+      * Explicit K-loop: `for k in range(0, K, BLOCK_K):` or `for k in range(K):`
+      * Scalar/elementwise accumulation: `acc += tl.load(a_ptr + ...) * tl.load(b_ptr + ...)` (or a `tl.sum` of elementwise products)
+      * Output stored per (row, col) tile: `tl.store(c_ptr + rm * stride_cm + rn * stride_cn, acc, ...)`
+    - `false`: Not a naive GEMM pattern (uses `tl.dot`, is an optimized GEMM, or not GEMM at all)
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Check for an explicit K-loop with multiply-accumulate of loaded values but NO `tl.dot`; a GEMM using `tl.dot` block tiles is NOT naive
+
+12. **has_k_loop** (boolean):
+    - `true`: Kernel has a reduction/accumulation loop over the K dimension (e.g., `for k in range(0, K, BLOCK_K):`)
+      * K-loop for accumulation or reduction
+      * Common in matrix multiplication or reduction operations
+      For **GEMM** operations (like `nn.Linear`, `torch.matmul`), set `has_k_loop = true`, as they involve a loop over the **K** dimension for accumulation.
+    - `false`: No K-loop present
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Look for Python range loops over the K dimension (`for k in range(0, K, BLOCK_K)`) or similar reduction/accumulation loops
+
+13. **is_gemm_kloop** (boolean):
+    - `true`: GEMM-like K-loop pattern with 2D output, K loop, linear (stride-based) indexing, no spatial window
+      * Typical pattern: `acc += tl.dot(a, b)` or `acc += a_val * b_val` inside `for k in range(0, K, BLOCK_K)`, with pointers like `a_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak`
+      * Has K-loop for accumulation
+      * Uses linear stride indexing (row-major/column-major pointer arithmetic) without spatial window dimensions (kd/kh/kw)
+      * Output is 2D indexed (row, col)
+      If the kernel performs **GEMM** with such a K-loop (like in `nn.Linear`), set `is_gemm_kloop = true`, as this is the typical pattern for GEMM operations.
+    - `false`: Not a GEMM-like K-loop pattern (may be stencil/conv or other pattern)
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Check for a K-loop with accumulation over stride-indexed A/B tiles and 2D output indexing, but NO spatial window loops (kd/kh/kw) or multi-dimensional input indexing (od/oh/ow, id/ih/iw)
+
+14. **is_stencil_conv** (boolean):
+    - `true`: Stencil/Convolution-like sliding window access pattern
+      * Pattern: nested Python loops over output spatial dimensions (od, oh, ow) AND kernel dimensions (kd, kh, kw), e.g., `for kh in range(KH): for kw in range(KW):`
+      * Input indexing includes multiple spatial dimensions + kernel dimensions: `(od,oh,ow) + (kd,kh,kw)`, typically with masked window loads
+      * Accumulation to a single output point: `acc += tl.load(input_ptr + ..., mask=..., other=0.0)` or `val += ...`
+      * Typical examples: convolution, stencil operations, pooling with window
+    - `false`: Not a stencil/conv pattern (may be GEMM or other pattern)
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Look for nested loops over output spatial dimensions (od/oh/ow) AND kernel dimensions (kd/kh/kw), with accumulation pattern (acc += or val +=) to a single output point
+
+15. **has_shared_memory_tile** (boolean):
+    - `true`: Block tiling staged through shared memory is present (Triton manages shared memory implicitly):
+      * `tl.dot` operand tiles loaded per K-iteration (the compiler stages these through shared memory)
+      * Explicit accumulation tiles reused across a K loop, or `tl.make_block_ptr` staging
+      * Software pipelining requested via `num_stages > 1`
+    - `false`: No block tiling (plain streaming loads, no tile reuse)
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Check for `tl.dot` with per-iteration tile loads, block-pointer tiling, or K-loops re-loading tiles into a reused accumulator
+
+16. **uses_vector_types** (boolean):
+    - `true`: Kernel performs wide contiguous block access that compiles to vectorized global transactions:
+      * Contiguous `tl.arange`-based offsets over stride-1 data with power-of-2 BLOCK sizes
+      * `tl.max_contiguous` / `tl.multiple_of` hints or block pointers over the contiguous dimension
+    - `false`: Loads/stores are scalar-like: gather/scatter offsets, large strides, or data-dependent indexing
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Triton has no explicit float4/half2 types; the compiler vectorizes contiguous aligned block access automatically. Judge whether the access pattern enables that (contiguous stride-1 blocks) or defeats it (gathers, strided masks)
+
+17. **has_bounds_check** (boolean):
+    - `true`: Kernel guards loads/stores with masks:
+      * `mask = offs < n_elements` (or 2D equivalents like `(rm[:, None] < M) & (rn[None, :] < N)`) passed as `mask=` to tl.load/tl.store, with `other=` defaults on loads where needed
+    - `false`: Unmasked tl.load/tl.store that assume exact divisibility (may cause out-of-bounds access)
+    - **Default**: If unknown, set to `true` (most kernels have bounds masks)
+    - **Judgment criteria**: Look for `mask=` keyword arguments on tl.load/tl.store built from comparisons of offset vectors against sizes
+
+18. **cudagraph_eligible** (boolean):
+    - `true`: The forward pass is eligible for CUDA Graph capture and replay, **and** the network has a **multi-layer / multi-stage architecture**:
+      * **Multi-layer architecture** = **depth**: multiple stacked **compute layers** of the same or similar kind, e.g. multi-layer RNN (GRU/LSTM with num_layers > 1), multi-layer MLP (nn.Sequential with **multiple** nn.Linear layers), stacked conv blocks (multiple Conv2d layers).
+      * Input shapes, dtypes, and devices are fixed (determined from benchmark context or code analysis)
+      * Forward control flow is stable (no dynamic branches based on runtime values that change between iterations)
+      * No dynamic memory allocations in the forward path (all tensors have fixed sizes)
+      * Suitable for torch.cuda.CUDAGraph capture with static input/output buffers (Triton kernel launches are capturable; any @triton.autotune must be warmed up BEFORE capture so no recompilation happens during capture)
+      * Typical patterns: inference-only models with multiple layers (e.g. GRU with num_layers=3 or 6, ShallowWideMLP with multiple hidden layers), fixed batch size, no dropout in eval mode, no random operations
+    - `false`: Not suitable for CUDA Graph capture, **or** the network is **single-layer** (one main op + post-ops):
+      * **Single-layer / single main-op**: **One** GEMM/Linear, **one** Conv, or **one** ConvTranspose, followed by normalization/activation post-ops only. Examples: Linear+GroupNorm+HardTanh, Gemm+Divide+Sum+Scaling, Gemm+Multiply+LeakyReLU, ConvTranspose+BatchNorm+Tanh+MaxPool+GroupNorm. Even if forward has multiple kernel launches (e.g. Linear then GroupNorm then HardTanh), that is still **one main op + post-ops** → set to `false`. Do NOT equate has_multiple_kernels_in_forward=true with "multi-layer for cudagraph".
+      * Dynamic input shapes (batch size or spatial dimensions vary)
+      * Dynamic control flow (branches that depend on runtime values that may change)
+      * Dynamic memory allocations in forward path
+      * Training mode with varying behavior
+      * Random operations or non-deterministic behavior
+    - **Default**: If unknown, set to `false` (conservative)
+    - **Judgment criteria**:
+      * **First** decide: multi-layer = **multiple stacked compute layers** (e.g. several nn.Linear in Sequential, GRU num_layers>1). Single-layer = **one** main compute op (one Linear/Conv/ConvTranspose) plus normalization/activation only. **Example**: one nn.Linear then nn.GroupNorm then nn.HardTanh is **single-layer** (one main op + post-ops) → cudagraph_eligible = false. If single-layer, set to `false`.
+      * Do NOT use has_multiple_kernels_in_forward or kernel_structure_id to decide cudagraph_eligible; use only whether the **network has multiple stacked compute layers** (depth) vs one main op + post-ops.
+      * Check if benchmark context suggests fixed shapes/dtypes/devices
+      * Look for dynamic shape operations (e.g., variable batch size, dynamic padding)
+      * Check for runtime-dependent branches (if statements based on tensor values that may vary)
+      * Verify no dynamic allocations (torch.empty with variable sizes, list comprehensions creating tensors)
+      * Only for **multi-layer** inference models with fixed shapes and stable control flow, set to `true`
+
+**Rules:**
+- Analyze Triton kernel code primarily; however, kernel_structure_id, has_multiple_kernels_in_forward, and tc_eligible should be determined at the forward-graph level when possible.
+- If Triton code is empty or not provided, use conservative defaults (all `false` except `is_aligned_vector_access=true`, `kernel_structure_id=0`, `has_bounds_check=true`)
+- If multiple kernels exist, analyze the primary/compute kernel (not initialization or utility kernels)
+- Be precise: these features determine which optimization methods are allowed
+- For `tc_eligible`: Only set to `true` if you can clearly identify GEMM patterns with tensor-core-compatible data types and tile shapes
+- Output ONLY valid JSON, no extra prose or explanations
+
+**Output Format (JSON ONLY):**
+The following is an example output format. Replace the example values with your actual analysis results:
+```json
+{
+  "has_reuse": false,
+  "streaming_no_reuse": true,
+  "has_vector_load_store": true,
+  "kernel_structure_id": 0,
+  "is_aligned_vector_access": true,
+  "has_tail_handling_overhead": false,
+  "has_multiple_kernels_in_forward": false,
+  "tc_eligible": false,
+  "is_pointwise": false,
+  "uses_transcendentals": false,
+  "is_naive_gemm": false,
+  "has_k_loop": false,
+  "is_gemm_kloop": false,
+  "is_stencil_conv": false,
+  "has_shared_memory_tile": false,
+  "uses_vector_types": false,
+  "has_bounds_check": true,
+  "cudagraph_eligible": false
+}
+```
+
+
+=== INSTRUCTION ===
+
+# PyTorch Reference Implementation
+# ==========================================================================
+# AUTO-GENERATED by solbench_bridge.problem_to_task — DO NOT EDIT BY HAND.
+#
+# SOL-ExecBench problem : rmsnorm_h4096
+# Source problem dir    : third_party/SOL-ExecBench/examples/triton/rmsnorm
+# Chosen workload       : index 11  uuid=818219cc-f770-4957-84cd-cafdfb53e64b
+#                         axes={"batch_size": 79}
+#
+# KernelMem task interface:
+#   Model.forward(*inputs)  ->  calls the SOL reference run() verbatim
+#   get_inputs()            ->  SOL harness input generation for this workload
+#   get_init_inputs()       ->  [] (SOL references are stateless)
+#
+# The generated kernel (ModelNew) should implement forward(*inputs) with the
+# same positional inputs, then be scored across ALL workloads with:
+#   python -m solbench_bridge.evaluate third_party/SOL-ExecBench/examples/triton/rmsnorm --kernel <kernel.py>
+# ==========================================================================
+import json
+import os
+import sys
+
+import torch
+import torch.nn as nn
+
+# Make the vendored sol_execbench importable (regenerates inputs like the harness).
+_SOLBENCH_SRC = os.environ.get("SOLBENCH_SRC", '/home/elek/KernelMem/third_party/SOL-ExecBench/src')
+if _SOLBENCH_SRC and _SOLBENCH_SRC not in sys.path:
+    sys.path.insert(0, _SOLBENCH_SRC)
+
+from sol_execbench.core import Definition, Workload  # noqa: E402
+from sol_execbench.core.bench.io import gen_inputs  # noqa: E402
+
+_DEFINITION = json.loads('{"name": "rmsnorm_h4096", "op_type": "rmsnorm", "axes": {"batch_size": {"type": "var", "description": null}, "hidden_size": {"type": "const", "value": 4096, "description": null}}, "custom_inputs_entrypoint": null, "inputs": {"hidden_states": {"shape": ["batch_size", "hidden_size"], "dtype": "bfloat16", "description": null}, "weight": {"shape": ["hidden_size"], "dtype": "bfloat16", "description": null}}, "outputs": {"output": {"shape": ["batch_size", "hidden_size"], "dtype": "bfloat16", "description": null}}, "reference": "import torch\\n\\n@torch.no_grad()\\ndef run(hidden_states, weight):\\n    batch_size, hidden_size = hidden_states.shape\\n    # Check constants\\n    assert hidden_size == 4096\\n\\n    EPS = 1e-5\\n\\n    x = hidden_states.to(torch.float32)\\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\\n    y = (x * inv_rms) * weight.to(torch.float32)\\n    return y.to(hidden_states.dtype)", "description": "Root Mean Square Normalization with hidden_size=4096. Captured from Llama-3.1-8B. Epsilon is fixed at 1e-5."}')
+_WORKLOAD = json.loads('{"uuid": "818219cc-f770-4957-84cd-cafdfb53e64b", "axes": {"batch_size": 79}, "inputs": {"hidden_states": {"type": "random"}, "weight": {"type": "random"}}}')
+_REFERENCE_SRC = 'import torch\n\n@torch.no_grad()\ndef run(hidden_states, weight):\n    batch_size, hidden_size = hidden_states.shape\n    # Check constants\n    assert hidden_size == 4096\n\n    EPS = 1e-5\n\n    x = hidden_states.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    y = (x * inv_rms) * weight.to(torch.float32)\n    return y.to(hidden_states.dtype)'
+
+# Execute the reference so Model.forward can call run() (and any custom-input fn).
+_REF_NS: dict = {}
+exec(compile(_REFERENCE_SRC, "<solbench_reference>", "exec"), _REF_NS)
+_run = _REF_NS.get("run")
+if _run is None:
+    raise RuntimeError("SOL reference does not define a top-level run()")
+
+_DEFN = Definition(**_DEFINITION)
+_WKL = Workload(**_WORKLOAD)
+_CUSTOM_FN = (
+    _REF_NS.get(_DEFN.custom_inputs_entrypoint)
+    if _DEFN.custom_inputs_entrypoint
+    else None
+)
+
+
+class Model(nn.Module):
+    """Thin nn.Module wrapper around the SOL-ExecBench reference run()."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, *inputs):
+        return _run(*inputs)
+
+
+def get_inputs():
+    # Generate on CPU (KernelBench convention); KernelMem moves them to the GPU.
+    # Uses the exact SOL harness generator so distributions/dtypes match.
+    return gen_inputs(_DEFN, _WKL, device="cpu", custom_inputs_fn=_CUSTOM_FN)
+
+
+def get_init_inputs():
+    return []
+
+# Triton Candidate Kernel Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def rms_reduce_kernel(
+    x_ptr, sumsq_ptr,
+    stride_row,
+    CHUNK: tl.constexpr,
+    n_cols: tl.constexpr,
+    EVEN: tl.constexpr,
+):
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    x_row = x_ptr + row * stride_row
+    cols = split * CHUNK + tl.arange(0, CHUNK)
+    if EVEN:
+        x = tl.load(x_row + cols).to(tl.float32)
+    else:
+        mask = cols < n_cols
+        x = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+    partial = tl.sum(x * x, axis=0)
+    tl.atomic_add(sumsq_ptr + row, partial)
+
+
+@triton.jit
+def rms_apply_kernel(
+    x_ptr, w_ptr, out_ptr, sumsq_ptr,
+    stride_row,
+    CHUNK: tl.constexpr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    EVEN: tl.constexpr,
+):
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    x_row = x_ptr + row * stride_row
+    out_row = out_ptr + row * stride_row
+    cols = split * CHUNK + tl.arange(0, CHUNK)
+
+    s = tl.load(sumsq_ptr + row)
+    inv_rms = tl.rsqrt(s / n_cols + eps)
+
+    if EVEN:
+        x = tl.load(x_row + cols).to(tl.float32)
+        w = tl.load(w_ptr + cols).to(tl.float32)
+        y = x * inv_rms * w
+        tl.store(out_row + cols, y.to(out_ptr.dtype.element_ty))
+    else:
+        mask = cols < n_cols
+        x = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        y = x * inv_rms * w
+        tl.store(out_row + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def rmsnorm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    x = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
+    w = weight if weight.is_contiguous() else weight.contiguous()
+
+    batch_size, hidden_size = x.shape
+    out = torch.empty_like(x)
+    sumsq = torch.zeros(batch_size, dtype=torch.float32, device=x.device)
+
+    # Choose SPLITS as a divisor of hidden_size for mask-free contiguous chunks.
+    SPLITS = 8
+    while SPLITS > 1 and (hidden_size % SPLITS != 0):
+        SPLITS //= 2
+    CHUNK = triton.next_power_of_2(triton.cdiv(hidden_size, SPLITS))
+    EVEN = (hidden_size % SPLITS == 0) and (CHUNK == hidden_size // SPLITS)
+
+    grid = (batch_size, SPLITS)
+
+    rms_reduce_kernel[grid](
+        x, sumsq,
+        x.stride(0),
+        CHUNK=CHUNK,
+        n_cols=hidden_size,
+        EVEN=EVEN,
+        num_warps=4,
+    )
+    rms_apply_kernel[grid](
+        x, w, out, sumsq,
+        x.stride(0),
+        CHUNK=CHUNK,
+        n_cols=hidden_size,
+        eps=1e-5,
+        EVEN=EVEN,
+        num_warps=4,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, hidden_states, weight):
+        return rmsnorm(hidden_states, weight)
+```
+
+Analyze the Triton kernel code above and extract the structural features. Return the JSON object with all required fields.

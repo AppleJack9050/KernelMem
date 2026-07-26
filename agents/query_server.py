@@ -1,22 +1,39 @@
-from agents.llm_local import get_llm, GenerationConfig
+"""LLM backend for KernelMem, routed through the Claude Agent SDK.
+
+All calls spawn the locally logged-in Claude Code CLI (`claude auth login`,
+claude.ai account) so usage bills against the user's Claude subscription
+credit — never a pay-per-token API key.
+"""
+
+import asyncio
+import datetime
 import os
 import time
+from typing import Any, Callable, Optional
 
-from utils.print_utils import print_bold
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    CLIConnectionError,
+    CLIJSONDecodeError,
+    ResultMessage,
+    TextBlock,
+    query,
+)
 
-TOGETHER_KEY = os.environ.get("TOGETHER_API_KEY")
-DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")
-OPENAI_KEY =os.getenv("AZURE_OPENAI_API_KEY")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-SGLANG_KEY = os.environ.get("SGLANG_API_KEY")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
-SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY")
-FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
+DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_EFFORT = "high"
 
-endpoint = os.getenv("AZURE_API_ENDPOINT")
-deployment_name = os.getenv("DEPLOYMENT_NAME")
-
-from typing import Optional, Callable, Any
+# The Agent SDK builds the child env as {**os.environ, **options.env} at spawn
+# time, so omitting a key does NOT remove it — an inherited ANTHROPIC_API_KEY
+# would silently switch billing to the API. Empty-string overrides behave like
+# unset vars and force claude.ai subscription auth.
+_SUBSCRIPTION_ENV = {
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_AUTH_TOKEN": "",
+    "CLAUDE_CODE_USE_BEDROCK": "",
+    "CLAUDE_CODE_USE_VERTEX": "",
+}
 
 
 def retry_with_backoff(
@@ -25,20 +42,11 @@ def retry_with_backoff(
     initial_delay: float = 1.0,
     max_delay: float = 300.0,  # 5 minutes
     backoff_factor: float = 2.0,
-    retryable_exceptions: tuple = None,
+    retryable_exceptions: tuple = (CLIConnectionError, CLIJSONDecodeError),
 ) -> Any:
-
-    if retryable_exceptions is None:
-        try:
-            from openai import APIConnectionError, APITimeoutError, RateLimitError
-            retryable_exceptions = (APIConnectionError, APITimeoutError, RateLimitError)
-        except ImportError:
-            # 如果无法导入，使用通用异常
-            retryable_exceptions = (Exception,)
-    
     delay = initial_delay
     attempt = 0
-    
+
     while True:
         try:
             return func()
@@ -47,7 +55,7 @@ def retry_with_backoff(
             if max_retries is not None and attempt > max_retries:
                 print(f"❌ Failed after {max_retries} attempts. Last error: {type(e).__name__}: {e}")
                 raise
-            
+
             error_name = type(e).__name__
             if max_retries is not None:
                 print(f"⚠️  {error_name} occurred (attempt {attempt}/{max_retries}). Retrying in {delay:.1f}s...")
@@ -61,10 +69,12 @@ def colorize_finish_reason(reason: Optional[str]) -> str:
     colors = {
         "stop": "\033[92m",  # Green
         "end_turn": "\033[92m",
+        "success": "\033[92m",
         "length": "\033[93m",  # Yellow
         "max_tokens": "\033[93m",
         "content_filter": "\033[91m",  # Red
         "stop_sequence": "\033[91m",
+        "refusal": "\033[91m",
         "tool_calls": "\033[94m",  # Blue
         "function_call": "\033[94m",
         "tool_use": "\033[94m",
@@ -76,6 +86,61 @@ def colorize_finish_reason(reason: Optional[str]) -> str:
     color = colors.get(reason, "\033[90m")  # Default to grey
     return f"{color}Finish reason: {reason}{reset_color}"
 
+
+def _resolve_model(model_name: str) -> str:
+    if model_name and model_name.lower().startswith("claude"):
+        return model_name
+    return DEFAULT_MODEL
+
+
+def _flatten_prompt(prompt: str | list[dict]) -> str:
+    if isinstance(prompt, str):
+        return prompt
+    parts = []
+    for msg in prompt:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        parts.append(f"[{role}]\n{content}")
+    return "\n\n".join(parts)
+
+
+def _write_usage_row(
+    log_path: Optional[str],
+    round_idx: int,
+    call_type: str,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+) -> None:
+    if not log_path:
+        return
+    try:
+        file_exists = os.path.exists(log_path)
+        with open(log_path, "a", encoding="utf-8") as f:
+            if not file_exists:
+                f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
+    except Exception as e:
+        print(f"Warning: Failed to write usage log to {log_path}: {e}")
+
+
+async def _run_query(prompt_text: str, options: ClaudeAgentOptions) -> tuple[list[str], Optional[ResultMessage]]:
+    texts: list[str] = []
+    result: Optional[ResultMessage] = None
+    async for message in query(prompt=prompt_text, options=options):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    texts.append(block.text)
+                else:
+                    block_type = getattr(block, "type", type(block).__name__)
+                    print(f"Skipping non-text content block of type '{block_type}'")
+        elif isinstance(message, ResultMessage):
+            result = message
+    return texts, result
+
+
 def query_server(
     prompt: str | list[dict],
     system_prompt: str = "You are a helpful assistant",
@@ -86,7 +151,7 @@ def query_server(
     num_completions: int = 1,
     server_port: int = 30000,
     server_address: str = "localhost",
-    server_type: str = "sglang",
+    server_type: str = "claude",
     model_name: str = "default",
     is_reasoning_model: bool = True,
     budget_tokens: int = 0,
@@ -95,260 +160,49 @@ def query_server(
     call_type: str = "unknown",
     round_idx: int = -1,
 ):
-    match server_type:
-        case "local":
-            llm = get_llm(model_name)  # legacy fallback
-            model = model_name
+    # temperature/top_p/top_k, budget_tokens, num_completions, and the server_*
+    # params are accepted for caller compatibility but have no Agent SDK
+    # equivalent; the CLI controls sampling and output length itself.
+    model = _resolve_model(model_name)
+    effort = os.environ.get("KERNELMEM_CLAUDE_EFFORT", DEFAULT_EFFORT)
 
-        case "vllm":
-            llm = get_llm(model_name, server_url=f"http://{server_address}:{server_port}/v1")
-            model = model_name
+    options = ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        model=model,
+        effort=effort,
+        tools=[],
+        max_turns=1,
+        env=dict(_SUBSCRIPTION_ENV),
+    )
+    prompt_text = _flatten_prompt(prompt)
 
-        case "sglang":
-            from openai import OpenAI
-            url = f"http://{server_address}:{server_port}"
-            client = OpenAI(api_key=SGLANG_KEY, base_url=f"{url}/v1", timeout=None, max_retries=0)
-            model = "default"
+    texts, result = retry_with_backoff(
+        lambda: asyncio.run(_run_query(prompt_text, options)),
+        max_retries=3,
+    )
 
-        case "deepseek":
-            from openai import OpenAI
-            client = OpenAI(
-                api_key=DEEPSEEK_KEY,
-                base_url="https://api.deepseek.com",
-                timeout=10000000,
-                max_retries=3,
-            )
-            model = model_name
+    if result is not None and result.is_error:
+        raise RuntimeError(f"Claude Agent SDK call failed ({result.subtype}): {result.result}")
 
-        case "fireworks":
-            from openai import OpenAI
-            client = OpenAI(
-                api_key=FIREWORKS_API_KEY,
-                base_url="https://api.fireworks.ai/inference/v1",
-                timeout=10000000,
-                max_retries=3,
-            )
-            model = model_name
-
-        case "anthropic":
-            import anthropic
-            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-            model = model_name
-
-        case "google":
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_KEY)
-            model = model_name
-
-        case "together":
-            from together import Together
-            client = Together(api_key=TOGETHER_KEY)
-            model = model_name
-
-        case "sambanova":
-            from openai import OpenAI
-            client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
-            model = model_name
-
-        case "openai":
-            from openai import OpenAI
-            client = OpenAI(
-                api_key=OPENAI_KEY,
-                base_url=endpoint,
-            )
-            # model = model_name
-            model = deployment_name
-
-        case _:
-            raise NotImplementedError(f"Unsupported server_type: {server_type}")
-
-    # ------------------ Local / vLLM --------------------
-    if server_type in {"local", "vllm"}:
-        assert isinstance(prompt, str), "Only string prompt supported for local/vllm model"
-        cfg = GenerationConfig(
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
+    # Usage logging (usage.csv row format consumed by main_memory_latest.py)
+    if result is not None and result.usage:
+        usage = result.usage
+        input_tokens = (
+            usage.get("input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
         )
+        output_tokens = usage.get("output_tokens", 0)
+        total_tokens = input_tokens + output_tokens
+        print(f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}")
+        _write_usage_row(log_path, round_idx, call_type, input_tokens, output_tokens, total_tokens)
 
-        output = llm.chat(
-            system_prompt,         
-            prompt,
-            cfg,
-        )
-        return output
+    finish_reason = getattr(result, "stop_reason", None) or getattr(result, "subtype", None)
+    print(colorize_finish_reason(finish_reason))
+    if finish_reason in {"length", "max_tokens"}:
+        print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
 
-    # ------------------ Cloud APIs ---------------------
-    outputs = []
-
-    if server_type == "google":
-        generation_config = {
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "max_output_tokens": max_tokens,
-            "response_mime_type": "text/plain",
-        }
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=system_prompt,
-            generation_config=generation_config,
-        )
-        response = model.generate_content(prompt)
-
-        # Usage logging
-        usage_metadata = getattr(response, 'usage_metadata', None)
-        if usage_metadata:
-            input_tokens = getattr(usage_metadata, 'prompt_token_count', 0)
-            output_tokens = getattr(usage_metadata, 'candidates_token_count', 0)
-            total_tokens = getattr(usage_metadata, 'total_token_count', 0)
-            usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
-            print(usage_str)
-            if log_path and log_path != "":
-                try:
-                    import os
-                    import datetime
-                    file_exists = os.path.exists(log_path)
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        if not file_exists:
-                            f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
-                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
-                except Exception as e:
-                    print(f"Warning: Failed to write usage log to {log_path}: {e}")
-
-        # Finish reason
-        try:
-            candidates = getattr(response, 'candidates', [])
-            if candidates:
-                candidate = candidates[0]
-                finish_reason_obj = getattr(candidate, 'finish_reason', None)
-                finish_reason = getattr(finish_reason_obj, 'name', str(finish_reason_obj))
-                print(colorize_finish_reason(finish_reason))
-                if finish_reason in {"MAX_TOKENS", "length", "max_tokens"}:
-                    print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
-        except Exception:
-            pass
-
-        return response.text
-
-    elif server_type == "anthropic":
-        assert isinstance(prompt, str)
-        if is_reasoning_model:
-            response = client.beta.messages.create(
-                model=model,
-                system=system_prompt,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                thinking={"type": "enabled", "budget_tokens": budget_tokens},
-                betas=["output-128k-2025-02-19"],
-            )
-        else:
-            response = client.messages.create(
-                model=model,
-                system=system_prompt,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                max_tokens=max_tokens,
-            )
-        # Usage Logging
-        if hasattr(response, 'usage'):
-            input_tokens = getattr(response.usage, "input_tokens", None)
-            output_tokens = getattr(response.usage, "output_tokens", None)
-            total_tokens = getattr(response.usage, 'total_tokens', input_tokens + output_tokens
-                                   if input_tokens is not None and output_tokens is not None
-                                   else input_tokens if output_tokens is None
-                                   else output_tokens if input_tokens is None
-                                   else None)
-            usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
-            print(usage_str)
-            if log_path and log_path != "":
-                try:
-                    import os
-                    import datetime
-                    file_exists = os.path.exists(log_path)
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        if not file_exists:
-                            f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
-                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
-                except Exception as e:
-                    print(f"Warning: Failed to write usage log to {log_path}: {e}")
-
-        outputs = []
-        for block in response.content:
-            text = getattr(block, "text", None)
-            if text is not None:
-                outputs.append(text)
-                continue
-
-            block_type = getattr(block, "type", "unknown")
-            block_name = getattr(block, "name", "")
-            extra = f" ({block_name})" if block_name else ""
-            print(f"Skipping non-text {server_type} content block of type '{block_type}'{extra}")
-
-        finish_reason = getattr(response, "stop_reason", None)
-        print(colorize_finish_reason(finish_reason))
-        if finish_reason in {"length", "max_tokens"}:
-            print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
-
-    else:
-        if isinstance(prompt, str):
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ]
-        else:
-            messages = prompt
-
-        if is_reasoning_model and server_type == "openai":
-            response = retry_with_backoff(
-                lambda: client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    reasoning_effort=reasoning_effort,
-                )
-            )
-        else:
-            response = retry_with_backoff(
-                lambda: client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    n=num_completions,
-                    max_tokens=max_tokens,
-                    top_p=top_p,
-                )
-            )
-        outputs = []
-        for choice in response.choices:
-            print(colorize_finish_reason(choice.finish_reason))
-
-            if choice.finish_reason == "length":
-                print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
-            outputs.append(choice.message.content)
-
-        if hasattr(response, 'usage') and response.usage:
-            input_tokens = getattr(response.usage, "prompt_tokens", getattr(response.usage, "input_tokens", 0))
-            output_tokens = getattr(response.usage, "completion_tokens", getattr(response.usage, "output_tokens", 0))
-            total_tokens = getattr(response.usage, 'total_tokens', input_tokens + output_tokens)
-
-            usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
-            print(usage_str)
-            if log_path and log_path != "":
-                try:
-                    import os
-                    import datetime
-                    file_exists = os.path.exists(log_path)
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        if not file_exists:
-                            f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
-                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
-                except Exception as e:
-                    print(f"Warning: Failed to write usage log to {log_path}: {e}")
-
-    return outputs[0] if len(outputs) == 1 else outputs
+    if not texts:
+        raise RuntimeError("Claude Agent SDK returned no text output")
+    output = "\n".join(texts)
+    return output

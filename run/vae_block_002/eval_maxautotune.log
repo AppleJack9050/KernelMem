@@ -1,0 +1,28 @@
+Problem:   002_vae_conv3x3_groupnorm_silu_residual_fused
+Workloads: 20/20 passed (100%)
+Statuses:  PASSED=20
+Latency:   median 1.9454 ms (mean 5.7262 ms)
+Speedup:   median 1.09x vs reference
+SOL Score: 0.631 (mean over passed)
+
+  #  status                  lat(ms)  speedup    SOL  axes
+  0  PASSED                   1.8952    1.08x  0.661  {"batch_size": 16, "height": 64, "width": 64}
+  1  PASSED                   0.5732    1.11x  0.563  {"batch_size": 1, "height": 128, "width": 128}
+  2  PASSED                   0.5783    1.12x  0.576  {"batch_size": 1, "height": 131, "width": 131}
+  3  PASSED                  16.6470    0.99x  0.581  {"batch_size": 32, "height": 128, "width": 128}
+  4  PASSED                   0.9398    1.22x  0.668  {"batch_size": 2, "height": 128, "width": 128}
+  5  PASSED                   1.9670    1.10x  0.669  {"batch_size": 4, "height": 128, "width": 128}
+  6  PASSED                   4.2013    1.13x  0.648  {"batch_size": 2, "height": 256, "width": 256}
+  7  PASSED                   0.5446    1.08x  0.554  {"batch_size": 4, "height": 64, "width": 64}
+  8  PASSED                   8.4038    0.99x  0.591  {"batch_size": 64, "height": 64, "width": 64}
+  9  PASSED                   0.3275    1.08x  0.514  {"batch_size": 2, "height": 64, "width": 64}
+ 10  PASSED                  35.1993    1.28x  0.664  {"batch_size": 1, "height": 1024, "width": 1024}
+ 11  PASSED                   2.6141    1.26x  0.706  {"batch_size": 1, "height": 293, "width": 293}
+ 12  PASSED                   8.5702    1.09x  0.587  {"batch_size": 4, "height": 256, "width": 256}
+ 13  PASSED                   3.9176    1.08x  0.674  {"batch_size": 32, "height": 64, "width": 64}
+ 14  PASSED                   0.9689    1.04x  0.536  {"batch_size": 8, "height": 64, "width": 64}
+ 15  PASSED                  19.5451    1.31x  0.684  {"batch_size": 1, "height": 768, "width": 768}
+ 16  PASSED                   1.3924    1.19x  0.681  {"batch_size": 4, "height": 128, "width": 96}
+ 17  PASSED                   1.4048    1.07x  0.664  {"batch_size": 4, "height": 96, "width": 128}
+ 18  PASSED                   1.9239    1.08x  0.661  {"batch_size": 8, "height": 64, "width": 128}
+ 19  PASSED                   2.9110    1.24x  0.730  {"batch_size": 2, "height": 256, "width": 192}

@@ -1,0 +1,67 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ==========================================================================
+# Granularity: (C) fuse many ops into one Triton kernel.
+# Replaced ops: the entire RMSNorm — cast-to-fp32, pow(2).mean, rsqrt(+eps),
+#               multiply by inv_rms, multiply by weight, cast-back-to-bf16.
+# Fusion: all of the above fused into rmsnorm_fwd_kernel (one program per row).
+# Remaining PyTorch: none of the math; only tensor allocation/launch glue.
+# Why: RMSNorm is memory-bound; a single fused per-row kernel reads x once,
+#      reduces in registers, and writes the normalized output once.
+# ==========================================================================
+@triton.jit
+def rmsnorm_fwd_kernel(
+    x_ptr, w_ptr, out_ptr,
+    stride_row,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    x_row = x_ptr + row * stride_row
+    out_row = out_ptr + row * stride_row
+
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < n_cols
+
+    x = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+    # mean of squares over the row
+    sumsq = tl.sum(x * x, axis=0)
+    inv_rms = tl.rsqrt(sumsq / n_cols + eps)
+
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = x * inv_rms * w
+
+    tl.store(out_row + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def rmsnorm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    x = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
+    w = weight if weight.is_contiguous() else weight.contiguous()
+
+    batch_size, hidden_size = x.shape
+    out = torch.empty_like(x)
+
+    BLOCK_SIZE = triton.next_power_of_2(hidden_size)
+    grid = (batch_size,)
+    rmsnorm_fwd_kernel[grid](
+        x, w, out,
+        x.stride(0),
+        n_cols=hidden_size,
+        eps=1e-5,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, hidden_states, weight):
+        return rmsnorm(hidden_states, weight)

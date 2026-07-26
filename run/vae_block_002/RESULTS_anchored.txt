@@ -1,0 +1,21 @@
+Anchor comparison — speedup and SOL vs stored t_b (cross-session) and vs same-session reference
+
+candidate             pass   geo spd (stored)  geo spd (same-sess)  SOL (stored)  SOL (same-sess)
+-------------------------------------------------------------------------------------------------
+nhwc_eager            20/20             0.795x               0.741x         0.483            0.483
+nhwc_triton_fused     20/20             1.163x               1.089x         0.697            0.697
+compile_default       20/20             0.919x               0.858x         0.571            0.571
+compile_cudagraph     20/20             0.915x               0.861x         0.567            0.567
+compile_unlimited     20/20             1.194x               1.096x         0.719            0.719
+agent_best            20/20             1.005x               0.935x         0.616            0.616
+
+Note: SOL columns share a numerator (analytic t_sol) so they coincide; the meaningful
+correction is the speedup anchor. Stored-anchor speedups are inflated where drift > 0.
+
+Workloads where same-session reference deviates >5% from stored t_b: 75
+  nhwc_eager           12 workloads, median drift -10.7%
+  nhwc_triton_fused    12 workloads, median drift -10.1%
+  compile_default      12 workloads, median drift -10.7%
+  compile_cudagraph    11 workloads, median drift -10.3%
+  compile_unlimited    14 workloads, median drift -11.5%
+  agent_best           14 workloads, median drift -9.9%

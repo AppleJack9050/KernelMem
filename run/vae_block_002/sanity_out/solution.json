@@ -1,0 +1,26 @@
+{
+  "name": "002_vae_conv3x3_groupnorm_silu_residual_fused__kernelmem",
+  "definition": "002_vae_conv3x3_groupnorm_silu_residual_fused",
+  "author": "kernelmem",
+  "description": "KernelMem-generated pytorch kernel for 002_vae_conv3x3_groupnorm_silu_residual_fused",
+  "spec": {
+    "languages": [
+      "pytorch"
+    ],
+    "target_hardware": [
+      "LOCAL"
+    ],
+    "entry_point": "kernel.py::run",
+    "dependencies": [
+      "torch"
+    ],
+    "destination_passing_style": false,
+    "binding": null
+  },
+  "sources": [
+    {
+      "path": "kernel.py",
+      "content": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass ModelNew(nn.Module):\n    \"\"\"Sanity candidate: identical math to the SOL reference (expects speedup ~1.0).\"\"\"\n\n    def forward(\n        self,\n        x: torch.Tensor,\n        conv1_weight: torch.Tensor,\n        norm1_weight: torch.Tensor,\n        norm1_bias: torch.Tensor,\n        conv2_weight: torch.Tensor,\n        norm2_weight: torch.Tensor,\n        norm2_bias: torch.Tensor,\n        eps: float,\n    ):\n        num_groups = 32\n        residual = x\n        out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)\n        out = F.group_norm(out, num_groups, weight=norm1_weight, bias=norm1_bias, eps=eps)\n        out = F.silu(out)\n        out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)\n        out = F.group_norm(out, num_groups, weight=norm2_weight, bias=norm2_bias, eps=eps)\n        out = F.silu(out)\n        return out + residual\n\n\n# ===== appended by solbench_bridge.kernel_to_solution (SOL entry point) =====\nimport torch as _sb_torch  # noqa: E402\n\n_SB_MODEL = None\n_SB_INIT_ARGS = []\n\n\ndef run(*args):\n    \"\"\"SOL-ExecBench entry point (value-returning; destination_passing_style=false).\"\"\"\n    global _SB_MODEL\n    if _SB_MODEL is None:\n        _m = ModelNew(*_SB_INIT_ARGS)\n        if isinstance(_m, _sb_torch.nn.Module):\n            if _sb_torch.cuda.is_available():\n                _m = _m.cuda()\n            _m.eval()\n        _SB_MODEL = _m\n    with _sb_torch.no_grad():\n        return _SB_MODEL(*args)\n"
+    }
+  ]
+}

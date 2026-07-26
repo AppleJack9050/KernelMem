@@ -1,0 +1,12 @@
+```json
+{
+  "critical_issue": "Kernel compiled only for sm_80; device architecture mismatch prevents launch",
+  "evidence": ["CUDA error: no kernel image is available for execution on the device", "cudaErrorNoKernelImageForDevice"],
+  "root_cause": "extra_cuda_cflags hardcodes `-gencode=arch=compute_80,code=sm_80`, so the fatbin contains only SM80 SASS. The actual GPU is not sm_80, so no matching kernel image exists and every launch (first at gn_silu_cuda) fails with cudaErrorNoKernelImageForDevice.",
+  "trigger_condition": "Running on a GPU whose compute capability differs from 8.0 while the extension is built exclusively with -gencode arch=compute_80,code=sm_80.",
+  "must_hold_invariants": ["Compiled SASS/PTX must cover the running device's compute capability"],
+  "minimal_fix": "Remove the hardcoded `-gencode=arch=compute_80,code=sm_80` line from extra_cuda_cflags so PyTorch auto-selects TORCH_CUDA_ARCH_LIST, or replace with the device's actual arch (e.g. compute_XX/sm_XX plus PTX).",
+  "patch_anchor": "\"-gencode=arch=compute_80,code=sm_80\",",
+  "confidence": "high"
+}
+```

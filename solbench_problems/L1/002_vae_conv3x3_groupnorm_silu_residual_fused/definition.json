@@ -1,0 +1,113 @@
+{
+    "name": "002_vae_conv3x3_groupnorm_silu_residual_fused",
+    "hf_id": "Efficient-Large-Model/Sana-Sprint-1.6B-1024px",
+    "description": "Complete fused residual block combining two sequential Conv3x3->GroupNorm->SiLU operations with residual addition. This is the fundamental building block of Sana's VAE encoder/decoder: input -> Conv3x3 -> GroupNorm -> SiLU -> Conv3x3 -> GroupNorm -> SiLU -> add(input). Processes feature maps with 256 channels and 32 groups for GroupNorm.",
+    "axes": {
+        "batch_size": {
+            "type": "var",
+            "description": "Batch size"
+        },
+        "channels": {
+            "type": "const",
+            "value": 256,
+            "description": "Number of input/output channels"
+        },
+        "height": {
+            "type": "var",
+            "description": "Spatial height"
+        },
+        "width": {
+            "type": "var",
+            "description": "Spatial width"
+        },
+        "num_groups": {
+            "type": "const",
+            "value": 32,
+            "description": "Number of groups for GroupNorm"
+        },
+        "kernel_size": {
+            "type": "const",
+            "value": 3,
+            "description": "Convolution kernel size"
+        }
+    },
+    "custom_inputs_entrypoint": null,
+    "inputs": {
+        "x": {
+            "shape": [
+                "batch_size",
+                "channels",
+                "height",
+                "width"
+            ],
+            "dtype": "float32",
+            "description": "Input feature map"
+        },
+        "conv1_weight": {
+            "shape": [
+                "channels",
+                "channels",
+                "kernel_size",
+                "kernel_size"
+            ],
+            "dtype": "float32",
+            "description": "First convolution weights"
+        },
+        "norm1_weight": {
+            "shape": [
+                "channels"
+            ],
+            "dtype": "float32",
+            "description": "First GroupNorm scale parameter"
+        },
+        "norm1_bias": {
+            "shape": [
+                "channels"
+            ],
+            "dtype": "float32",
+            "description": "First GroupNorm bias parameter"
+        },
+        "conv2_weight": {
+            "shape": [
+                "channels",
+                "channels",
+                "kernel_size",
+                "kernel_size"
+            ],
+            "dtype": "float32",
+            "description": "Second convolution weights"
+        },
+        "norm2_weight": {
+            "shape": [
+                "channels"
+            ],
+            "dtype": "float32",
+            "description": "Second GroupNorm scale parameter"
+        },
+        "norm2_bias": {
+            "shape": [
+                "channels"
+            ],
+            "dtype": "float32",
+            "description": "Second GroupNorm bias parameter"
+        },
+        "eps": {
+            "shape": null,
+            "dtype": "float32",
+            "description": "Epsilon for numerical stability in GroupNorm"
+        }
+    },
+    "outputs": {
+        "output": {
+            "shape": [
+                "batch_size",
+                "channels",
+                "height",
+                "width"
+            ],
+            "dtype": "float32",
+            "description": "Output feature map after residual block"
+        }
+    },
+    "reference": "import torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef run(\n    x: torch.Tensor,\n    conv1_weight: torch.Tensor,\n    norm1_weight: torch.Tensor,\n    norm1_bias: torch.Tensor,\n    conv2_weight: torch.Tensor,\n    norm2_weight: torch.Tensor,\n    norm2_bias: torch.Tensor,\n    eps: float,\n):\n    \"\"\"\n    Fused residual block: Conv3x3 -> GroupNorm -> SiLU -> Conv3x3 -> GroupNorm -> SiLU -> Add\n    \n    Args:\n        x: Input tensor of shape (B, C, H, W)\n        conv1_weight: First conv weights (C, C, 3, 3)\n        norm1_weight: First GroupNorm scale (C,)\n        norm1_bias: First GroupNorm bias (C,)\n        conv2_weight: Second conv weights (C, C, 3, 3)\n        norm2_weight: Second GroupNorm scale (C,)\n        norm2_bias: Second GroupNorm bias (C,)\n        eps: Epsilon for GroupNorm numerical stability\n        \n    Returns:\n        Output tensor of shape (B, C, H, W)\n    \"\"\"\n    num_groups = 32\n    \n    # Save residual\n    residual = x\n    \n    # First path: Conv3x3 -> GroupNorm -> SiLU\n    out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)\n    out = F.group_norm(out, num_groups, weight=norm1_weight, bias=norm1_bias, eps=eps)\n    out = F.silu(out)\n    \n    # Second path: Conv3x3 -> GroupNorm -> SiLU\n    out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)\n    out = F.group_norm(out, num_groups, weight=norm2_weight, bias=norm2_bias, eps=eps)\n    out = F.silu(out)\n    \n    # Residual connection\n    out = out + residual\n    \n    return out\n"
+}

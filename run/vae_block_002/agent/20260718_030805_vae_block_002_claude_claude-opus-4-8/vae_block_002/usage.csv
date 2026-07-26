@@ -1,0 +1,5 @@
+timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens
+2026-07-18 03:09:24,0,seed,8889,6729,15618
+2026-07-18 03:10:16,1,problem_identify,9720,669,10389
+2026-07-18 03:10:40,1,repair,6378,2409,8787
+,,,24987,9807,34794

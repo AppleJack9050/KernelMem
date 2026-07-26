@@ -1,0 +1,264 @@
+
+
+You are a Triton kernel optimization implementation specialist. You will receive:
+- Target GPU specifications
+- A **base Triton kernel file** (a Python file defining @triton.jit kernels and `ModelNew`) containing the current `ModelNew` implementation and its custom Triton kernels.
+- A previously generated optimisation_suggestion containing:
+  - **modification_plan** (or "modification plan"): numbered checklist with primary optimization method steps
+  - bottleneck, primary_optimisation_method (or "optimisation method"), method_name, evidence, expected_metric_change, headroom
+
+Your MOST IMPORTANT goal is:
+- To implement the given **modification plan** completely and faithfully in the Triton kernels, producing a new kernel that:
+  - Applies the primary optimization method to the hottest kernel
+  - Preserves correctness within the harness tolerance (atol=1e-3 and rtol=1e-3),
+  - Preserves the public Python API (same inputs/outputs, shapes, dtypes),
+  - And improves performance on the target GPU as much as possible.
+
+PARAMETER PARITY (STRICT)
+- You MUST preserve parameter parity with the base kernel's parameter structure.
+- The base kernel file already contains a `ModelNew` class with parameter handling. You MUST maintain the same parameter structure.
+- If the base kernel uses a PyTorch module as a PARAMETER HOLDER (for initialization / state_dict parity), you MUST keep the same pattern.
+- Do NOT create independent parameters with torch.randn / random init. Source weights/bias from the existing parameter-holder module (e.g., self.op.weight / self.op.bias) as the base kernel does.
+
+NO ATen FOR REPLACED OPS (STRICT)
+- For op-chains explicitly marked as replaced/fused in the modification_plan, you MUST NOT call PyTorch/ATen implementations for those chains. Ops explicitly kept as vendor mainloops (e.g., torch.matmul / F.conv2d dispatching to cuBLAS/cuDNN) may remain as in the base kernel.
+- The replaced computation must execute only in your custom @triton.jit kernel(s), plus minimal checks.
+
+CUDA GRAPH METHOD (ONLY IF REQUIRED BY PLAN)
+- If method_name (or primary_optimisation_method) is cuda_graph_capture, you MAY implement torch.cuda.CUDAGraph capture/replay in ModelNew (Python) using static CUDA tensors.
+- Do not use CUDA graphs otherwise.
+- Run every Triton kernel at least once (warmup) BEFORE capture so JIT compilation/autotuning happens outside the captured region.
+
+You MUST follow these implementation and explanation rules:
+
+(0) IMPLEMENTATION ORDER (CRITICAL - STRICT SEQUENCE)
+- **Primary Optimization Method**
+  - Apply the primary optimization method to the hottest kernel as specified in the modification_plan.
+  - The modification_plan lists the optimization steps (e.g., "1. Apply vectorized memory access to kernel X").
+  - Implement each step in the modification_plan completely and faithfully.
+
+(0.1) MODIFICATION PLAN EXECUTION (CRITICAL)
+- Treat the `modification_plan` (or "modification plan") in optimisation_suggestion as a **checklist** of required changes.
+- For each numbered item in the plan (1., 2., 3., ...), you MUST:
+  - Implement the corresponding change in the Triton / Python code; and
+  - Be able to point to the exact code region(s) (functions / loops / kernels / kernel launches) that realize this item.
+- You MUST NOT silently drop plan items. If a plan item (or a sub-step) is impossible/unsafe, state it in Section A in ONE short sentence and implement the closest safe subset + a concrete TODO.
+
+(1) OUTPUT STRUCTURE (TWO SECTIONS WITH EXPLICIT DELIMITERS)
+Your answer MUST consist of **two sections in order**, separated by explicit delimiters:
+
+- **Section A – Checklist evidence (plan-to-code mapping)**  
+  - For **each** numbered item in the modification plan, write a **very brief** mapping:
+    - `Plan item N:` the exact text (or a concise paraphrase) of that item;
+    - `Implemented in code:` **one short phrase** naming the key code location(s) (e.g., "new in-kernel tile loop in main kernel", "widened contiguous tl.load path in kernel X", "grid lambda / num_warps in ModelNew.forward").
+  - Keep Section A compact: do **not** explain low-level details here; it is only a checklist for where each item was implemented.
+  - If you deviated from the literal wording of the plan, mention this in **one short sentence**.
+  - Section A must NOT include rationale, performance claims, or metric discussion; only plan-item-to-code-location mapping.
+
+- **Section B – Kernel implementation**
+  - Start this section with the delimiter line: `=== KERNEL CODE STARTS BELOW ===`
+  - Then output a complete Triton implementation following the `@triton.jit + ModelNew` structure described in OUTPUT RULES below.
+  - This kernel should fully implement all items from the modification plan as explained in Section A.
+  - The kernel code must be wrapped in ```python ... ``` code block.
+
+(2) MINIMAL-DIFF PRINCIPLE (RELATIVE TO BASE KERNEL)
+- Keep the overall structure and public interface of the base kernel stable. Do not redesign unrelated parts.
+- Focus your edits on the parts of the code that are directly related to the modification plan.
+
+(3) SEMANTIC ALIGNMENT
+- Your optimized kernel must produce the same outputs as the base kernel for the same inputs (within tolerance).
+
+(4) BENCH HARNESS INVARIANTS (STRICT)
+- Follow the same device handling pattern as the base kernel. Assume inputs are already on the correct device. In ModelNew.forward, do NOT call .to("cuda"), .cuda(), .cpu(), or .to(x.device).
+- Allocate outputs on the SAME device as the input tensors.
+- If a tensor is non-contiguous, call contiguous() only when the Triton kernel uses linear offset indexing that assumes contiguous layout; otherwise pass the tensor strides as kernel arguments and index stride-aware.
+- Do NOT propose or implement changes to the benchmark workflow, external caching, or evaluation settings; only kernel code and launch configuration may change.
+- Recommended pattern: in Python `x = x if x.is_contiguous() else x.contiguous()` only when the corresponding Triton kernel uses linear indexing.
+
+- If headroom is provided in optimisation_suggestion, consider it when choosing implementation details:
+  - High headroom: more aggressive optimizations may be appropriate;
+  - Medium headroom: balanced approach;
+  - Low headroom: focus on small, safe efficiency tweaks; expect modest speedup
+
+
+# Target GPU
+GPU Name: RTX5090
+Architecture: Blackwell (GB202, sm_120)
+Details:
+• GPU Memory: 32GB GDDR7
+• Memory Bandwidth: 1.79 TB/s
+• Streaming Multiprocessors: 170 SMs
+• FP32 TFLOPS: 104.8
+• TF32 Tensor Core TFLOPS: 104.8 (209.7 with sparsity)
+• BFLOAT16 Tensor Core TFLOPS: 209.7 (419 with sparsity); FP32 accumulate
+• FP16 Tensor Core TFLOPS: 419 (838 with sparsity) with FP16 accumulate; 209.7 (419) with FP32 accumulate
+• FP8 Tensor Core TFLOPS: 838 (1676 with sparsity) with FP16 accumulate; 419 (838) with FP32 accumulate
+• INT8 Tensor Core TOPS: 838 (1676 with sparsity)
+• FP4 Tensor Core TFLOPS: 1676 (3352 with sparsity)
+• L2 Cache: 96 MB
+• Register File Size: 64K 32-bit registers per SM
+• Maximum number of registers per thread: 255
+• Maximum number of thread blocks per SM: 32
+• Shared memory capacity per SM: 228 KB
+• Maximum shared memory per thread block: 227 KB
+
+[BASE KERNEL FILE]
+This is the current Triton kernel implementation that you must optimize. Study its structure, parameter handling, and kernel implementations before making changes.
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def rms_reduce_kernel(
+    x_ptr, sumsq_ptr,
+    stride_row,
+    CHUNK: tl.constexpr,
+    n_cols: tl.constexpr,
+    EVEN: tl.constexpr,
+):
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    x_row = x_ptr + row * stride_row
+    cols = split * CHUNK + tl.arange(0, CHUNK)
+    if EVEN:
+        x = tl.load(x_row + cols).to(tl.float32)
+    else:
+        mask = cols < n_cols
+        x = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+    partial = tl.sum(x * x, axis=0)
+    tl.atomic_add(sumsq_ptr + row, partial)
+
+
+@triton.jit
+def rms_apply_kernel(
+    x_ptr, w_ptr, out_ptr, sumsq_ptr,
+    stride_row,
+    CHUNK: tl.constexpr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    EVEN: tl.constexpr,
+):
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    x_row = x_ptr + row * stride_row
+    out_row = out_ptr + row * stride_row
+    cols = split * CHUNK + tl.arange(0, CHUNK)
+
+    s = tl.load(sumsq_ptr + row)
+    inv_rms = tl.rsqrt(s / n_cols + eps)
+
+    if EVEN:
+        x = tl.load(x_row + cols).to(tl.float32)
+        w = tl.load(w_ptr + cols).to(tl.float32)
+        y = x * inv_rms * w
+        tl.store(out_row + cols, y.to(out_ptr.dtype.element_ty))
+    else:
+        mask = cols < n_cols
+        x = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        y = x * inv_rms * w
+        tl.store(out_row + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def rmsnorm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    x = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
+    w = weight if weight.is_contiguous() else weight.contiguous()
+
+    batch_size, hidden_size = x.shape
+    out = torch.empty_like(x)
+    sumsq = torch.zeros(batch_size, dtype=torch.float32, device=x.device)
+
+    # Choose SPLITS as a divisor of hidden_size for mask-free contiguous chunks.
+    SPLITS = 8
+    while SPLITS > 1 and (hidden_size % SPLITS != 0):
+        SPLITS //= 2
+    CHUNK = triton.next_power_of_2(triton.cdiv(hidden_size, SPLITS))
+    EVEN = (hidden_size % SPLITS == 0) and (CHUNK == hidden_size // SPLITS)
+
+    grid = (batch_size, SPLITS)
+
+    rms_reduce_kernel[grid](
+        x, sumsq,
+        x.stride(0),
+        CHUNK=CHUNK,
+        n_cols=hidden_size,
+        EVEN=EVEN,
+        num_warps=4,
+    )
+    rms_apply_kernel[grid](
+        x, w, out, sumsq,
+        x.stride(0),
+        CHUNK=CHUNK,
+        n_cols=hidden_size,
+        eps=1e-5,
+        EVEN=EVEN,
+        num_warps=4,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, hidden_states, weight):
+        return rmsnorm(hidden_states, weight)
+```
+
+[optimization instructions]
+{
+  "bottleneck": "Two separate kernel launches per rmsnorm (reduce+apply, 24 launches total) with a global sumsq round-trip and atomics. Grid is tiny (0.31 waves), each kernel ~3µs and DRAM-bound at only ~10-13% of peak — dominated by launch/round-trip overhead, not compute or bandwidth.",
+  "optimisation method": "Fuse rms_reduce_kernel and rms_apply_kernel into a single @triton.jit kernel where each program handles one full 4096-element row: load the row once, compute inv_rms in-register, then scale and store. Eliminates the second launch, the atomic_add, and the sumsq global buffer round-trip.",
+  "method_name": "KernelFusion",
+  "modification plan": "1. Replace the two kernels with one fused `@triton.jit rmsnorm_kernel(x_ptr, w_ptr, out_ptr, stride_row, BLOCK_SIZE: tl.constexpr, n_cols: tl.constexpr, eps: tl.constexpr)`.\n2. Launch shape: `grid = (batch_size,)` i.e. one program per row (79 programs). Remove the second grid dimension (SPLITS) entirely.\n3. Set `BLOCK_SIZE = 4096` (equal to hidden_size, already a power of 2) as a `tl.constexpr`, so a single contiguous block covers the whole row and NO mask is needed (EVEN case).\n4. Indexing: `row = tl.program_id(0)`; `cols = tl.arange(0, BLOCK_SIZE)`; `x_row = x_ptr + row * stride_row`. Add `cols = tl.max_contiguous(tl.multiple_of(cols, BLOCK_SIZE), BLOCK_SIZE)` to hint contiguity.\n5. In-kernel body (single pass, no atomics, no intermediate buffer): `x = tl.load(x_row + cols).to(tl.float32)`; `sumsq = tl.sum(x * x, axis=0)`; `inv_rms = tl.rsqrt(sumsq / n_cols + eps)`; `w = tl.load(w_ptr + cols).to(tl.float32)`; `y = x * inv_rms * w`; `tl.store(out_ptr + row * stride_row + cols, y.to(out_ptr.dtype.element_ty))`.\n6. Delete the `sumsq = torch.zeros(...)` allocation and the `rms_reduce_kernel`/`rms_apply_kernel` launches; issue only the single fused launch.\n7. Launch config: `num_warps=8` (4096 elems / 256 lanes = 16 elems/thread; keeps registers low like the current 16 regs/thread, avoids spilling), `num_stages=2`. Do NOT raise BLOCK_SIZE beyond 4096 or num_warps beyond 8 to avoid register/occupancy regression.\n8. Keep the `.contiguous()` guards on hidden_states and weight; allocate `out = torch.empty_like(x)` on the same device; return `out`.\n9. Preserve semantics exactly: fp32 accumulation for sumsq, eps=1e-5, output cast back to bfloat16.",
+  "evidence": "kernel_launch_count=24 (12 reduce + 12 apply) with each kernel DRAM-bound at only gpu__dram_throughput=10.44%/12.91% of peak and sm__throughput=4.61%/4.26%; waves_per_multiprocessor=0.31 and achieved_occupancy=22.65% confirm the grid is too small to hide per-launch cost. Section text: 'This kernel grid is too small to fill the available resources... only 0.31 full waves'. This is launch/round-trip overhead. I rule out a memory-bandwidth bottleneck: DRAM at 10-13% of 1.79TB/s means bandwidth is not saturated, so widening transactions alone would not help; the fix is removing the extra launch and the sumsq global round-trip via fusion.",
+  "expected_metric_change": "kernel_launch_count 24→12 (single fused kernel), dram_throughput_pct up per-kernel (fewer but larger passes, one row read instead of read-for-sumsq + re-read-for-apply, so total DRAM traffic down ~1/3), end-to-end kernel_duration_us down (removes second launch + atomic_add + sumsq buffer). Anti-regression: keep BLOCK_SIZE=4096 and num_warps=8 so registers_per_thread stays ~16 (no spilling, launch__occupancy_limit_registers unchanged); do not reduce load contiguity (full-row contiguous block preserved).",
+  "headroom": "high"
+}
+
+COMPLETE OUTPUT FORMAT ────────────────────────────────────────────────
+Your complete response MUST include BOTH sections:
+
+**Section A – Checklist evidence (plan-to-code mapping)**
+- Write this section FIRST, before any code.
+- For each numbered item in the modification plan, provide a **very concise** mapping:
+  - `Plan item N:` [exact text or paraphrase, one line]
+  - `Implemented in code:` [one short phrase naming the key code location(s)]
+- Do not write long explanations here; this section is a compact checklist only.
+
+**Section B – Kernel implementation**
+- After Section A, write the delimiter: `=== KERNEL CODE STARTS BELOW ===`
+- Then output the kernel code block following OUTPUT RULES below.
+
+OUTPUT RULES FOR KERNEL CODE (Section B only) ──────────────────────────
+The kernel code block in Section B must follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `triton`, `triton.language as tl`.
+   2. `@triton.jit` kernel definition(s) – block sizes as `tl.constexpr` parameters (powers of 2),
+      boundary handling via masks on `tl.load`/`tl.store`; optionally `@triton.autotune` with a
+      SMALL config set keyed to the fixed shapes.
+   3. Launch code – a grid over `triton.cdiv` (e.g., `grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)`)
+      and the `kernel[grid](...)` call(s), passing `num_warps`/`num_stages` where tuned.
+   4. `class ModelNew(nn.Module)` – mirrors the base kernel's inputs/outputs and API, but calls
+      your optimized Triton kernels. At least ONE `@triton.jit` kernel must be invoked in `ModelNew.forward`.
+**Do NOT use** `torch.utils.cpp_extension` / `load_inline` / raw CUDA C++ anywhere.
+**Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose in the code block.
+
+Example complete output structure:
+```
+[Section A: Checklist evidence]
+Plan item 1: ...
+Implemented in code: ...
+
+Plan item 2: ...
+Implemented in code: ...
+
+=== KERNEL CODE STARTS BELOW ===
+```python
+import torch
+import triton
+import triton.language as tl
+...
+```

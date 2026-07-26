@@ -5,6 +5,28 @@ A List of GPU Specs to include in the prompt
 
 
 GPU_SPEC_INFO = {
+    # Measured on this host: 170 SMs, 2.42 GHz boost, sm_120.
+    # Tensor-core figures are dense; NVIDIA's marketing numbers for this part are
+    # quoted with 2:4 sparsity (2x) and, for FP16/FP8, with FP16 accumulate (2x).
+    "RTX 5090": {
+        "GPU Architecture": "Blackwell (sm_120)",
+        "GPU Memory": "32GB GDDR7",
+        "Memory Bandwidth": "1792 GB/s",
+        "Streaming Multiprocessors": "170",
+        "FP32 TFLOPS": "104.8",
+        "TF32 Tensor Core TFLOPS": "104.8 (209.5 with sparsity)",
+        "FP16 Tensor Core TFLOPS": "209.5 with FP32 accumulate (419 with FP16 accumulate)",
+        "BFLOAT16 Tensor Core TFLOPS": "209.5 with FP32 accumulate",
+        "FP8 Tensor Core TFLOPS": "419 (838 with sparsity)",
+        "FP4 Tensor Core TFLOPS": "838 (1676 with sparsity)",
+        "Peak INT8 Tensor TOPS": "419 (838 with sparsity)",
+        "Register File Size": "64K 32-bit registers per SM",
+        "Maximum number of registers per thread": "255",
+        "Maximum number of thread blocks per SM": "24",
+        "Shared memory capacity per SM": "100 KB",
+        "Maximum shared memory per thread block": "99 KB",
+    },
+
     "L40S": {
         "GPU Architecture": "Ada",
         "GPU Memory": "48GB GDDR6 with ECC",

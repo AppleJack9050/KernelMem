@@ -1,0 +1,50 @@
+{
+  "task": "tasks/vae_block_002.py",
+  "base_kernel": "kernel_20260718_031040",
+  "base_score": 1.0804415077692309,
+  "best_kernel": "kernel_20260718_031040",
+  "best_score": 1.0804415077692309,
+  "kernels": {
+    "kernel_20260718_030924": {
+      "parent": null,
+      "kernel_name": "kernel_20260718_030924",
+      "kernel_path": "/home/elek/KernelMem/run/vae_block_002/agent/20260718_030805_vae_block_002_claude_claude-opus-4-8/vae_block_002/code/kernel_20260718_030924.py",
+      "speedup": null,
+      "runnable": false,
+      "ncu_passed": false,
+      "phase": "seed",
+      "round": 0,
+      "strategy": null,
+      "method_matched": false,
+      "timestamp": "2026-07-18T03:10:02.336940"
+    },
+    "kernel_20260718_031040": {
+      "parent": "kernel_20260718_030924",
+      "kernel_name": "kernel_20260718_031040",
+      "kernel_path": "/home/elek/KernelMem/run/vae_block_002/agent/20260718_030805_vae_block_002_claude_claude-opus-4-8/vae_block_002/code/kernel_20260718_031040.py",
+      "speedup": 1.0804415077692309,
+      "runnable": true,
+      "ncu_passed": false,
+      "phase": "repair",
+      "round": 1,
+      "strategy": {
+        "critical_issue": "Kernel compiled only for sm_80; device architecture mismatch prevents launch",
+        "evidence": [
+          "CUDA error: no kernel image is available for execution on the device",
+          "cudaErrorNoKernelImageForDevice"
+        ],
+        "root_cause": "extra_cuda_cflags hardcodes `-gencode=arch=compute_80,code=sm_80`, so the fatbin contains only SM80 SASS. The actual GPU is not sm_80, so no matching kernel image exists and every launch (first at gn_silu_cuda) fails with cudaErrorNoKernelImageForDevice.",
+        "trigger_condition": "Running on a GPU whose compute capability differs from 8.0 while the extension is built exclusively with -gencode arch=compute_80,code=sm_80.",
+        "must_hold_invariants": [
+          "Compiled SASS/PTX must cover the running device's compute capability"
+        ],
+        "minimal_fix": "Remove the hardcoded `-gencode=arch=compute_80,code=sm_80` line from extra_cuda_cflags so PyTorch auto-selects TORCH_CUDA_ARCH_LIST, or replace with the device's actual arch (e.g. compute_XX/sm_XX plus PTX).",
+        "patch_anchor": "\"-gencode=arch=compute_80,code=sm_80\",",
+        "confidence": "high"
+      },
+      "method_matched": false,
+      "timestamp": "2026-07-18T03:11:18.260635"
+    }
+  },
+  "timestamp": "2026-07-18T03:11:25.283579"
+}

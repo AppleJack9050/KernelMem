@@ -1,0 +1,117 @@
+=== nhwc_eager ===
+Problem:   002_vae_conv3x3_groupnorm_silu_residual_fused
+Workloads: 20/20 passed (100%)
+Statuses:  PASSED=20
+Latency:   median 2.7595 ms (mean 11.1926 ms)
+Speedup:   median 0.76x vs reference
+SOL Score: 0.382 (mean over passed)
+
+  #  status                  lat(ms)  speedup    SOL  axes
+  0  PASSED                   2.6136    0.78x  0.418  {"batch_size": 16, "height": 64, "width": 64}
+  1  PASSED                   0.8128    0.78x  0.373  {"batch_size": 1, "height": 128, "width": 128}
+  2  PASSED                   0.8380    0.77x  0.366  {"batch_size": 1, "height": 131, "width": 131}
+  3  PASSED                  22.8805    0.76x  0.377  {"batch_size": 32, "height": 128, "width": 128}
+  4  PASSED                   1.3699    0.84x  0.392  {"batch_size": 2, "height": 128, "width": 128}
+  5  PASSED                   2.8368    0.76x  0.422  {"batch_size": 4, "height": 128, "width": 128}
+  6  PASSED                   6.2303    0.81x  0.413  {"batch_size": 2, "height": 256, "width": 256}
+  7  PASSED                   0.7551    0.78x  0.361  {"batch_size": 4, "height": 64, "width": 64}
+  8  PASSED                  11.8826    0.72x  0.377  {"batch_size": 64, "height": 64, "width": 64}
+  9  PASSED                   0.4401    0.76x  0.372  {"batch_size": 2, "height": 64, "width": 64}
+ 10  PASSED                 102.7650    0.43x  0.225  {"batch_size": 1, "height": 1024, "width": 1024}
+ 11  PASSED                   4.5053    0.73x  0.388  {"batch_size": 1, "height": 293, "width": 293}
+ 12  PASSED                  12.0435    0.73x  0.381  {"batch_size": 4, "height": 256, "width": 256}
+ 13  PASSED                   5.5928    0.77x  0.430  {"batch_size": 32, "height": 64, "width": 64}
+ 14  PASSED                   1.3126    0.77x  0.318  {"batch_size": 8, "height": 64, "width": 64}
+ 15  PASSED                  35.5600    0.71x  0.379  {"batch_size": 1, "height": 768, "width": 768}
+ 16  PASSED                   1.9952    0.73x  0.407  {"batch_size": 4, "height": 128, "width": 96}
+ 17  PASSED                   2.0175    0.75x  0.393  {"batch_size": 4, "height": 96, "width": 128}
+ 18  PASSED                   2.6822    0.78x  0.420  {"batch_size": 8, "height": 64, "width": 128}
+ 19  PASSED                   4.7193    0.77x  0.430  {"batch_size": 2, "height": 256, "width": 192}
+=== nhwc_triton_fused ===
+Problem:   002_vae_conv3x3_groupnorm_silu_residual_fused
+Workloads: 20/20 passed (100%)
+Statuses:  PASSED=20
+Latency:   median 2.0377 ms (mean 5.8772 ms)
+Speedup:   median 1.06x vs reference
+SOL Score: 0.605 (mean over passed)
+
+  #  status                  lat(ms)  speedup    SOL  axes
+  0  PASSED                   1.9821    1.04x  0.617  {"batch_size": 16, "height": 64, "width": 64}
+  1  PASSED                   0.5854    1.09x  0.549  {"batch_size": 1, "height": 128, "width": 128}
+  2  PASSED                   0.5927    1.09x  0.558  {"batch_size": 1, "height": 131, "width": 131}
+  3  PASSED                  16.8698    1.06x  0.570  {"batch_size": 32, "height": 128, "width": 128}
+  4  PASSED                   1.0156    1.13x  0.594  {"batch_size": 2, "height": 128, "width": 128}
+  5  PASSED                   2.0659    1.05x  0.628  {"batch_size": 4, "height": 128, "width": 128}
+  6  PASSED                   4.0673    1.17x  0.674  {"batch_size": 2, "height": 256, "width": 256}
+  7  PASSED                   0.5798    1.02x  0.508  {"batch_size": 4, "height": 64, "width": 64}
+  8  PASSED                   8.4105    1.04x  0.591  {"batch_size": 64, "height": 64, "width": 64}
+  9  PASSED                   0.3336    1.01x  0.503  {"batch_size": 2, "height": 64, "width": 64}
+ 10  PASSED                  37.1167    1.21x  0.629  {"batch_size": 1, "height": 1024, "width": 1024}
+ 11  PASSED                   2.6248    1.26x  0.702  {"batch_size": 1, "height": 293, "width": 293}
+ 12  PASSED                   8.1201    1.10x  0.631  {"batch_size": 4, "height": 256, "width": 256}
+ 13  PASSED                   4.0978    1.05x  0.635  {"batch_size": 32, "height": 64, "width": 64}
+ 14  PASSED                   1.0033    1.00x  0.502  {"batch_size": 8, "height": 64, "width": 64}
+ 15  PASSED                  20.0036    1.26x  0.669  {"batch_size": 1, "height": 768, "width": 768}
+ 16  PASSED                   1.4631    1.02x  0.631  {"batch_size": 4, "height": 128, "width": 96}
+ 17  PASSED                   1.4877    1.03x  0.607  {"batch_size": 4, "height": 96, "width": 128}
+ 18  PASSED                   2.0096    1.04x  0.621  {"batch_size": 8, "height": 64, "width": 128}
+ 19  PASSED                   3.1148    1.16x  0.677  {"batch_size": 2, "height": 256, "width": 192}
+=== compile_default ===
+Problem:   002_vae_conv3x3_groupnorm_silu_residual_fused
+Workloads: 20/20 passed (100%)
+Statuses:  PASSED=20
+Latency:   median 2.3639 ms (mean 10.6260 ms)
+Speedup:   median 0.78x vs reference
+SOL Score: 0.476 (mean over passed)
+
+  #  status                  lat(ms)  speedup    SOL  axes
+  0  PASSED                   1.8584    1.10x  0.681  {"batch_size": 16, "height": 64, "width": 64}
+  1  PASSED                   0.5805    1.09x  0.555  {"batch_size": 1, "height": 128, "width": 128}
+  2  PASSED                   0.5874    1.10x  0.564  {"batch_size": 1, "height": 131, "width": 131}
+  3  PASSED                  16.3120    1.06x  0.598  {"batch_size": 32, "height": 128, "width": 128}
+  4  PASSED                   0.9428    1.22x  0.665  {"batch_size": 2, "height": 128, "width": 128}
+  5  PASSED                   1.9280    1.13x  0.687  {"batch_size": 4, "height": 128, "width": 128}
+  6  PASSED                   3.9114    1.22x  0.706  {"batch_size": 2, "height": 256, "width": 256}
+  7  PASSED                   0.5525    1.06x  0.543  {"batch_size": 4, "height": 64, "width": 64}
+  8  PASSED                  11.6913    0.74x  0.385  {"batch_size": 64, "height": 64, "width": 64}
+  9  PASSED                   0.4441    0.76x  0.368  {"batch_size": 2, "height": 64, "width": 64}
+ 10  PASSED                 103.6680    0.43x  0.223  {"batch_size": 1, "height": 1024, "width": 1024}
+ 11  PASSED                   4.5125    0.73x  0.388  {"batch_size": 1, "height": 293, "width": 293}
+ 12  PASSED                  11.9052    0.78x  0.387  {"batch_size": 4, "height": 256, "width": 256}
+ 13  PASSED                   5.4822    0.78x  0.441  {"batch_size": 32, "height": 64, "width": 64}
+ 14  PASSED                   1.3187    0.76x  0.315  {"batch_size": 8, "height": 64, "width": 64}
+ 15  PASSED                  35.3362    0.72x  0.381  {"batch_size": 1, "height": 768, "width": 768}
+ 16  PASSED                   2.0386    0.72x  0.396  {"batch_size": 4, "height": 128, "width": 96}
+ 17  PASSED                   2.0401    0.74x  0.387  {"batch_size": 4, "height": 96, "width": 128}
+ 18  PASSED                   2.6878    0.78x  0.419  {"batch_size": 8, "height": 64, "width": 128}
+ 19  PASSED                   4.7230    0.77x  0.429  {"batch_size": 2, "height": 256, "width": 192}
+=== compile_cudagraph ===
+Problem:   002_vae_conv3x3_groupnorm_silu_residual_fused
+Workloads: 20/20 passed (100%)
+Statuses:  PASSED=20
+Latency:   median 2.3656 ms (mean 10.3458 ms)
+Speedup:   median 0.79x vs reference
+SOL Score: 0.471 (mean over passed)
+
+  #  status                  lat(ms)  speedup    SOL  axes
+  0  PASSED                   1.8973    1.09x  0.660  {"batch_size": 16, "height": 64, "width": 64}
+  1  PASSED                   0.5732    1.11x  0.563  {"batch_size": 1, "height": 128, "width": 128}
+  2  PASSED                   0.5795    1.11x  0.574  {"batch_size": 1, "height": 131, "width": 131}
+  3  PASSED                  16.8479    0.99x  0.571  {"batch_size": 32, "height": 128, "width": 128}
+  4  PASSED                   0.9482    1.21x  0.659  {"batch_size": 2, "height": 128, "width": 128}
+  5  PASSED                   1.9866    1.09x  0.661  {"batch_size": 4, "height": 128, "width": 128}
+  6  PASSED                   4.0446    1.18x  0.678  {"batch_size": 2, "height": 256, "width": 256}
+  7  PASSED                   0.5428    1.09x  0.556  {"batch_size": 4, "height": 64, "width": 64}
+  8  PASSED                  11.4031    0.73x  0.397  {"batch_size": 64, "height": 64, "width": 64}
+  9  PASSED                   0.4462    0.75x  0.366  {"batch_size": 2, "height": 64, "width": 64}
+ 10  PASSED                  97.6223    0.45x  0.236  {"batch_size": 1, "height": 1024, "width": 1024}
+ 11  PASSED                   4.5054    0.73x  0.388  {"batch_size": 1, "height": 293, "width": 293}
+ 12  PASSED                  11.6410    0.75x  0.398  {"batch_size": 4, "height": 256, "width": 256}
+ 13  PASSED                   6.1500    0.80x  0.384  {"batch_size": 32, "height": 64, "width": 64}
+ 14  PASSED                   1.3187    0.76x  0.315  {"batch_size": 8, "height": 64, "width": 64}
+ 15  PASSED                  34.9154    0.75x  0.386  {"batch_size": 1, "height": 768, "width": 768}
+ 16  PASSED                   2.0386    0.73x  0.396  {"batch_size": 4, "height": 128, "width": 96}
+ 17  PASSED                   2.0507    0.74x  0.384  {"batch_size": 4, "height": 96, "width": 128}
+ 18  PASSED                   2.6806    0.78x  0.421  {"batch_size": 8, "height": 64, "width": 128}
+ 19  PASSED                   4.7240    0.85x  0.429  {"batch_size": 2, "height": 256, "width": 192}
+DONE

@@ -1,0 +1,6 @@
+task,best_score,best_runnable,task_dir,figure
+tasks/rmsnorm.py,10.431766,1,/home/elek/KernelMem/run/20260714_154647_rmsnorm_claude_claude-opus-4-8/rmsnorm,/home/elek/KernelMem/run/20260714_154647_rmsnorm_claude_claude-opus-4-8/rmsnorm/figures/rmsnorm_score.png
+
+avg_speedup,10.431766
+accuracy,1.000000
+total_tokens_sum,122646

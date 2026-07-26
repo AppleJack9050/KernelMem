@@ -1,0 +1,38 @@
+Geometric-mean speedup over 20 workloads (same-session reference anchor)
+
+candidate               pass   geo speedup   min shape   max shape
+------------------------------------------------------------------
+agent_best              20/20        0.935x      0.699x      1.147x
+compile_maxautotune     20/20        1.122x      0.988x      1.306x
+compile_unlimited       20/20        1.096x      0.901x      1.222x
+nhwc_triton_fused       20/20        1.089x      1.002x      1.264x
+compile_default         20/20        0.858x      0.427x      1.220x
+compile_cudagraph       20/20        0.861x      0.452x      1.214x
+nhwc_eager              20/20        0.741x      0.432x      0.836x
+
+Per-shape head-to-head:  agent_best  vs  compile_maxautotune   (speedup = ref/lat)
+
+ batch     H     W   agent_best   max-autotune        winner
+------------------------------------------------------------
+     1   128   128       0.837x         1.105x max-autotune +32%
+     1   131   131       0.824x         1.118x max-autotune +36%
+     1   293   293       0.699x         1.262x max-autotune +81%
+     1   768   768       0.736x         1.306x max-autotune +77%
+     1  1024  1024       0.735x         1.276x max-autotune +74%
+     2    64    64       0.983x         1.081x max-autotune +10%
+     2   128   128       0.870x         1.217x max-autotune +40%
+     2   256   192       0.876x         1.238x max-autotune +41%
+     2   256   256       0.865x         1.131x max-autotune +31%
+     4    64    64       1.015x         1.080x  max-autotune +6%
+     4    96   128       0.938x         1.073x max-autotune +14%
+     4   128    96       0.956x         1.188x max-autotune +24%
+     4   128   128       0.962x         1.096x max-autotune +14%
+     4   256   256       1.009x         1.087x  max-autotune +8%
+     8    64    64       1.024x         1.035x  max-autotune +1%
+     8    64   128       1.052x         1.081x  max-autotune +3%
+    16    64    64       1.072x         1.076x  max-autotune +0%
+    32    64    64       1.147x         1.084x    agent_best +6%
+    32   128   128       1.140x         0.988x   agent_best +15%
+    64    64    64       1.145x         0.994x   agent_best +15%
+
+Geomean: agent_best 0.935x  vs  max-autotune 1.122x  -> max-autotune wins by 20.1%

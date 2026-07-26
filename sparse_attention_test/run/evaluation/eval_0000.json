@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "seed",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/elek/KernelMem/utils/compile_and_run.py\", line 740, in compare_and_bench\n    raise ValueError(_build_mismatch_debug_msg(\n    ...<9 lines>...\n    ))\nValueError: Outputs are not close (atol=0.01, rtol=0.01). max_abs_err=nan, mean_abs_err=nan\nin[0]: shape=(4, 8, 1024, 64), dtype=torch.float32, contiguous=True, device=cpu\nin[1]: shape=(4, 8, 1024, 64), dtype=torch.float32, contiguous=True, device=cpu\nin[2]: shape=(4, 8, 1024, 64), dtype=torch.float32, contiguous=True, device=cpu\nref_out: shape=(4, 8, 1024, 64), dtype=torch.float32, device=cuda:0\ntest_out: shape=(4, 8, 1024, 64), dtype=torch.float32, device=cuda:0\nmax_err_index=(0, 0, 319, 0), ref_val=0.5063812732696533, cand_val=nan\n"
+}

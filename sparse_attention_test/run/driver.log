@@ -1,0 +1,79 @@
+
+======================================================================
+[round 0] starting
+======================================================================
+Usage: In=6005, Out=3455, Total=9460
+[92mFinish reason: success[0m
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/elek/KernelMem/utils/compile_and_run.py", line 740, in compare_and_bench
+    raise ValueError(_build_mismatch_debug_msg(
+    ...<9 lines>...
+    ))
+ValueError: Outputs are not close (atol=0.01, rtol=0.01). max_abs_err=nan, mean_abs_err=nan
+in[0]: shape=(4, 8, 1024, 64), dtype=torch.float32, contiguous=True, device=cpu
+in[1]: shape=(4, 8, 1024, 64), dtype=torch.float32, contiguous=True, device=cpu
+in[2]: shape=(4, 8, 1024, 64), dtype=torch.float32, contiguous=True, device=cpu
+ref_out: shape=(4, 8, 1024, 64), dtype=torch.float32, device=cuda:0
+test_out: shape=(4, 8, 1024, 64), dtype=torch.float32, device=cuda:0
+max_err_index=(0, 0, 319, 0), ref_val=0.5063812732696533, cand_val=nan
+
+[seed] failed. See metrics.message for details.
+[seed] metrics saved to: /home/elek/KernelMem/sparse_attention_test/run/evaluation/eval_0000.json
+[round 0] phase=seed runnable=False speedup=FAIL
+
+======================================================================
+[round 1] starting
+======================================================================
+Usage: In=5742, Out=2779, Total=8521
+[92mFinish reason: success[0m
+Usage: In=5712, Out=2046, Total=7758
+[92mFinish reason: success[0m
+[repair] score=8.8733
+[repair] metrics saved to: /home/elek/KernelMem/sparse_attention_test/run/evaluation/eval_0001.json
+[round 1] phase=repair runnable=True speedup=8.873271904757255
+
+======================================================================
+[round 2] starting
+======================================================================
+Usage: In=6595, Out=3060, Total=9655
+[92mFinish reason: success[0m
+[opt] score=15.2417
+[opt] metrics saved to: /home/elek/KernelMem/sparse_attention_test/run/evaluation/eval_0002.json
+[round 2] phase=opt runnable=True speedup=15.241716287144403
+
+======================================================================
+[round 3] starting
+======================================================================
+Usage: In=6841, Out=13823, Total=20664
+[92mFinish reason: success[0m
+[opt] score=18.4239
+[opt] metrics saved to: /home/elek/KernelMem/sparse_attention_test/run/evaluation/eval_0003.json
+[round 3] phase=opt runnable=True speedup=18.423878689187358
+
+======================================================================
+[round 4] starting
+======================================================================
+Usage: In=8104, Out=4915, Total=13019
+[92mFinish reason: success[0m
+[opt] score=10.8736
+[opt] metrics saved to: /home/elek/KernelMem/sparse_attention_test/run/evaluation/eval_0004.json
+[round 4] phase=opt runnable=True speedup=10.873615978691346
+
+======================================================================
+[round 5] starting
+======================================================================
+Usage: In=8104, Out=4290, Total=12394
+[92mFinish reason: success[0m
+[opt] score=17.8094
+[opt] metrics saved to: /home/elek/KernelMem/sparse_attention_test/run/evaluation/eval_0005.json
+[round 5] phase=opt runnable=True speedup=17.809404881929527
+
+======================================================================
+DONE. best speedup = 18.423878689187358
+======================================================================
+  round  0 [  seed]      FAIL  (RuntimeError)
+  round  1 [repair]    8.873x  (ref 1.129253752231598, test 0.12726463973522187)
+  round  2 [   opt]   15.242x  (ref 1.1169324827194214, test 0.07328128024935722)
+  round  3 [   opt]   18.424x  (ref 1.1228012752532959, test 0.06094271972775459)
+  round  4 [   opt]   10.874x  (ref 1.1709753608703612, test 0.10768960051238537)
+  round  5 [   opt]   17.809x  (ref 1.1137574338912963, test 0.06253759972751141)

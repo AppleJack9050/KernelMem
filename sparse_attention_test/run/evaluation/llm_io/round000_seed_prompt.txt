@@ -1,0 +1,251 @@
+
+You write custom Triton kernels to accelerate the given architecture by replacing ANY subset of PyTorch ops with custom Triton kernels (partial replacement is allowed), and you MAY also replace the entire forward computation if beneficial (full forward-level replacement).
+You may decide to replace some operators with custom Triton kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or apply algorithmic changes.
+You MAY restructure the computation graph conservatively: fuse or reorder steps ONLY when the benefit is clear and semantics are straightforward.
+For the parts you replace, you are NOT required to preserve intermediate tensors or per-op boundaries; ONLY the final ModelNew.forward output must match.
+
+Primary objective: maximize speedup under the correctness contract.
+This ModelNew will be evaluated in a standalone benchmark harness (kernelbench-style): end-to-end forward correctness + latency. Intermediate boundaries may change ONLY for replaced parts, but reference semantics must hold.
+
+SEED BENCHMARK ASSUMPTIONS
+- Assume inputs may be reused across runs and must remain unmodified.
+- Do NOT rely on single-use, hidden aliasing, or undefined lifetime assumptions.
+- Do NOT introduce hidden global state or randomness; ModelNew.forward must be deterministic given inputs and parameters.
+
+SEED GRANULARITY SELECTION (STRICT)
+- For this SEED generation, you MUST choose EXACTLY ONE granularity level:
+  (A) optimize a single hotspot op,
+  (B) replace several ops + schedule multiple kernels,
+  (C) fuse many ops into one/few kernels,
+  (D) fully rewrite forward.
+- All modifications MUST be consistent with the chosen granularity.
+- Do NOT mix multiple granularity strategies in this seed implementation.
+- In the output code, include a short header comment in ModelNew describing:
+  1) chosen granularity (A/B/C/D),
+  2) which ops are replaced,
+  3) which ops are fused into which Triton kernel(s),
+  4) what remains in PyTorch and why (one line each).
+  All planning notes MUST be inside Python code comments; do not output any extra prose.
+  If this header comment is missing or incomplete, the output is invalid.
+
+CRITICAL CONSTRAINT
+- You MUST preserve parameter parity with the reference PyTorch module(s).
+- You MAY keep an equivalent PyTorch module ONLY as a PARAMETER HOLDER (for initialization / state_dict parity).
+- You MUST NOT call the parameter-holder module’s forward for replaced operators.
+- Replaced computations MUST be performed by your @triton.jit kernel(s), launched from ModelNew.forward (directly or via small Python wrapper functions).
+- Do NOT create independent parameters with torch.randn / random init for replaced operators.
+  Instead, source weights/bias from the parameter-holder module (e.g., self.op.weight / self.op.bias).
+
+ALLOWED ACCELERATION TOOLBOX (IMPORTANT)
+All custom kernels MUST be written in Triton (`@triton.jit`) and launched from Python. You MAY:
+1) Write any number of @triton.jit kernels (custom kernels, fused post-ops, reductions, etc.).
+2) Use tl.dot for matmul-like tiles inside kernels (it maps to tensor cores); accumulate in fp32 (e.g., acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)) and cast on store.
+3) Leave ops you do not replace as plain PyTorch calls (they dispatch to cuBLAS/cuDNN); calling torch.matmul / F.conv2d etc. for unreplaced parts is allowed.
+4) Specialize for fixed shapes when the harness uses fixed shapes: bake sizes into tl.constexpr meta-parameters, hardcode strides, and choose tuned BLOCK sizes (constexpr specialization replaces C++ templates / manual unrolling).
+You MUST NOT use torch.utils.cpp_extension / load_inline or write raw CUDA C++ anywhere.
+
+SCHEDULING / FUSION / FISSION (OPTIONAL, WHEN BENEFICIAL)
+- You MAY introduce multiple custom Triton kernels and schedule them inside ModelNew.forward.
+- If fusion/reorder provides little benefit, it is acceptable to optimize only one or a few hotspot operators.
+- You MAY fuse multiple ops into one kernel OR split one op into multiple kernels (fission), if it improves performance.
+- Intermediate buffers may be allocated as needed, but final output must match the reference.
+
+CUSTOM TRITON KERNEL REQUIREMENT
+- At least ONE @triton.jit kernel MUST be defined in the file AND actually invoked from ModelNew.forward (directly or via a wrapper function it calls).
+- If you do not otherwise replace any ops with a custom Triton kernel, include a tiny semantically-neutral @triton.jit kernel (e.g., identity/copy) and call it outside critical paths to satisfy this requirement.
+- If you already replaced/fused meaningful ops, no extra dummy kernel is needed.
+
+INPUTS / BENCH HARNESS INVARIANTS (STRICT)
+- You MUST NOT change or redefine get_inputs() or get_init_inputs() from the reference file.
+- Assume tensors returned by get_inputs() are already on the correct device.
+- In ModelNew.forward, you MUST NOT move tensors across devices:
+  Do NOT call .to("cuda"), .cuda(), .cpu(), or .to(x.device).
+- Allocate outputs on the SAME device as the input tensors.
+
+CORRECTNESS CONTRACT (NON-NEGOTIABLE)
+1) Output semantics MUST match the reference Model exactly for the same inputs and parameters.
+2) Output shape MUST match PyTorch reference.
+3) Full output coverage is REQUIRED (the launch grid must tile ALL output elements via tl.program_id, with boundary masks on tl.load/tl.store; no partial writes, no out-of-bounds accesses).
+4) Dtype/layout safety:
+   - You MUST either support the input dtype(s) you use, or assert and convert explicitly.
+
+CONTIGUITY (STRICT, PERFORMANCE-SAFE)
+- Do NOT call contiguous() blindly. contiguous() may allocate and copy.
+- Call contiguous() ONLY when required:
+  - In Python: x = x if x.is_contiguous() else x.contiguous()
+- Alternatively, Triton kernels can consume non-contiguous tensors directly: pass the strides (x.stride(0), x.stride(1), ...) as kernel arguments and fold them into the offset arithmetic.
+- Do not create extra contiguous copies for tensors that are already contiguous.
+- Do not call view() on non-contiguous tensors; either ensure contiguous first (only if needed) or use reshape() carefully.
+
+IN-PLACE MUTATION (SEED STAGE: DISALLOWED BY DEFAULT)
+- Default: implement out-of-place outputs.
+- In-place is allowed ONLY if the reference forward explicitly performs in-place.
+
+TRITON KERNEL REQUIREMENTS
+- Write kernels with @triton.jit and launch them as kernel[grid](...) with a grid lambda over triton.cdiv, e.g. grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),).
+- Every block size (BLOCK_SIZE, BLOCK_M/BLOCK_N/BLOCK_K, ...) MUST be a tl.constexpr parameter and a power of 2.
+- Guard every tl.load / tl.store that can go out of range with a mask; give masked loads an explicit other= fill value whenever the loaded value feeds a reduction or tl.dot.
+- Kernels launch on the current PyTorch CUDA stream automatically; do NOT call torch.cuda.synchronize() inside forward.
+- Give every kernel a stable, descriptive snake_case name ending in `_kernel` (e.g., fused_matmul_relu_kernel). Profiler name-matching relies on these function names; name variants with suffixes like _v2 / _vec4 instead of renaming.
+
+LAUNCH CONFIGURATION (IMPORTANT)
+There are no compiler flags to set; performance comes from launch configuration:
+- Size BLOCK constants to the problem: e.g., 128–1024 for 1D elementwise kernels; 32–128 per dimension for tl.dot tiles.
+- Tune num_warps (typically 4–8) and num_stages (typically 2–4, for software-pipelined tl.dot loops) as launch kwargs: kernel[grid](..., num_warps=8, num_stages=3).
+- @triton.autotune is allowed, but keep the config set SMALL (a handful of configs): every config is a separate JIT compilation and counts against the compile/first-run time budget.
+- Triton auto-vectorizes contiguous, aligned accesses; build offsets from tl.arange over contiguous ranges and avoid gather-style indexing where possible.
+- Use the target GPU spec below as hardware context when sizing tiles (shared memory per SM, tensor cores reachable via tl.dot).
+
+Here are examples to show you the syntax of writing custom Triton kernels in torch modules:
+Example 1:
+The example given architecture is:
+'''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128)
+    b = torch.randn(1, 128)
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+'''
+The example new arch with custom Triton kernels looks like this:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# Define the custom Triton kernel for element-wise addition
+@triton.jit
+def elementwise_add_kernel(a_ptr, b_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    a = tl.load(a_ptr + offsets, mask=mask)
+    b = tl.load(b_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, a + b, mask=mask)
+
+
+def elementwise_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # Ensure contiguity only when needed (contiguous() may allocate and copy)
+    a = a if a.is_contiguous() else a.contiguous()
+    b = b if b.is_contiguous() else b.contiguous()
+    out = torch.empty_like(a)  # allocated on the same device as the inputs
+    n_elements = out.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    elementwise_add_kernel[grid](a, b, out, n_elements, BLOCK_SIZE=1024)
+    return out
+
+
+class ModelNew(nn.Module):
+    # Granularity: (A) single hotspot op.
+    # Replaced ops: element-wise add -> elementwise_add_kernel (@triton.jit).
+    # Fusion: none (single op).
+    # Remaining PyTorch ops: none.
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return elementwise_add(a, b)
+'''
+
+
+Target GPU specification:
+• GPU Memory: 32GB GDDR7
+• Memory Bandwidth: 1.79 TB/s
+• Streaming Multiprocessors: 170 SMs
+• FP32 TFLOPS: 104.8
+• TF32 Tensor Core TFLOPS: 419 (838 with sparsity)
+• BFLOAT16 Tensor Core TFLOPS: 419 (838 with sparsity)
+• FP16 Tensor Core TFLOPS: 419 (838 with sparsity)
+• FP8 Tensor Core TFLOPS: 838 (1676 with sparsity)
+• INT8 Tensor Core TOPS: 838 (1676 with sparsity)
+• FP4 Tensor Core TFLOPS: 1676 (3352 with sparsity)
+• L2 Cache: 96 MB
+• Register File Size: 64K 32-bit registers per SM
+• Maximum number of registers per thread: 255
+• Maximum number of thread blocks per SM: 32
+• Shared memory capacity per SM: 228 KB
+• Maximum shared memory per thread block: 227 KB
+
+The PyTorch architecture you need to optimize is:
+```python
+import torch
+import torch.nn as nn
+
+# Sliding-window (local) causal self-attention.
+#
+# Each query position i attends only to key positions j with
+# (i - window_size) < j <= i  -- i.e. a causal band of width `window_size`.
+# This is the sparse-attention pattern used by e.g. Mistral / Longformer.
+#
+# This reference is the "obvious" dense PyTorch implementation: it materializes
+# the full (B, H, N, N) score matrix, masks out everything outside the causal
+# window, softmaxes, and multiplies by V. It is deliberately the naive baseline
+# -- it does O(N^2) work and memory even though only an O(N * window) band is
+# ever used. A good custom kernel (FlashAttention-style, iterating only over the
+# key blocks inside each query's window) can skip the masked region entirely.
+
+
+class Model(nn.Module):
+    def __init__(self, num_heads: int, head_dim: int, window_size: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.window_size = window_size
+        self.scale = head_dim ** -0.5
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # q, k, v: (B, H, N, D)
+        B, H, N, D = q.shape
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, N, N)
+
+        idx = torch.arange(N, device=q.device)
+        rel = idx[:, None] - idx[None, :]            # i - j
+        mask = (rel >= 0) & (rel < self.window_size)  # causal AND inside the window
+        scores = scores.masked_fill(~mask[None, None, :, :], float("-inf"))
+
+        attn = torch.softmax(scores, dim=-1)          # (B, H, N, N)
+        out = torch.matmul(attn, v)                   # (B, H, N, D)
+        return out
+
+
+# ---- benchmark configuration ----
+batch_size = 4
+num_heads = 8
+seq_len = 1024
+head_dim = 64
+window_size = 256
+
+
+def get_inputs():
+    q = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    k = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    v = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    return [q, k, v]
+
+
+def get_init_inputs():
+    return [num_heads, head_dim, window_size]
+```
+
+Optimize the architecture named Model with custom Triton kernels! Name your optimized output architecture ModelNew.
+Output the new model code in ONE python codeblock. Real code only (no pseudocode), must compile and run, no tests, no extra text.

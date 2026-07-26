@@ -1,0 +1,27 @@
+{
+  "name": "002_vae_conv3x3_groupnorm_silu_residual_fused__kernelmem",
+  "definition": "002_vae_conv3x3_groupnorm_silu_residual_fused",
+  "author": "kernelmem",
+  "description": "KernelMem-generated triton kernel for 002_vae_conv3x3_groupnorm_silu_residual_fused",
+  "spec": {
+    "languages": [
+      "triton"
+    ],
+    "target_hardware": [
+      "LOCAL"
+    ],
+    "entry_point": "kernel.py::run",
+    "dependencies": [
+      "torch",
+      "triton"
+    ],
+    "destination_passing_style": false,
+    "binding": null
+  },
+  "sources": [
+    {
+      "path": "kernel.py",
+      "content": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _gn_partial(\n    y_ptr, sum_ptr, sqsum_ptr,\n    HW, C: tl.constexpr, CPG: tl.constexpr, BLOCK: tl.constexpr,\n):\n    pid_bg = tl.program_id(0)\n    pid_chunk = tl.program_id(1)\n    G: tl.constexpr = C // CPG\n    b = pid_bg // G\n    g = pid_bg % G\n    offs_p = pid_chunk * BLOCK + tl.arange(0, BLOCK)\n    mask_p = offs_p < HW\n    offs_c = tl.arange(0, CPG)\n    ptrs = y_ptr + b * HW * C + offs_p[:, None] * C + g * CPG + offs_c[None, :]\n    v = tl.load(ptrs, mask=mask_p[:, None], other=0.0)\n    tl.atomic_add(sum_ptr + pid_bg, tl.sum(v))\n    tl.atomic_add(sqsum_ptr + pid_bg, tl.sum(v * v))\n\n\n@triton.jit\ndef _gn_silu_apply(\n    y_ptr, out_ptr, res_ptr, sum_ptr, sqsum_ptr, w_ptr, b_ptr,\n    HW, eps,\n    C: tl.constexpr, CPG: tl.constexpr, HAS_RES: tl.constexpr, BLOCK: tl.constexpr,\n):\n    pid_bg = tl.program_id(0)\n    pid_chunk = tl.program_id(1)\n    G: tl.constexpr = C // CPG\n    b = pid_bg // G\n    g = pid_bg % G\n    n = HW * CPG\n    s = tl.load(sum_ptr + pid_bg)\n    sq = tl.load(sqsum_ptr + pid_bg)\n    mean = s / n\n    var = sq / n - mean * mean\n    rstd = 1.0 / tl.sqrt(var + eps)\n    offs_p = pid_chunk * BLOCK + tl.arange(0, BLOCK)\n    mask_p = offs_p < HW\n    offs_c = tl.arange(0, CPG)\n    gamma = tl.load(w_ptr + g * CPG + offs_c)\n    beta = tl.load(b_ptr + g * CPG + offs_c)\n    idx = b * HW * C + offs_p[:, None] * C + g * CPG + offs_c[None, :]\n    v = tl.load(y_ptr + idx, mask=mask_p[:, None], other=0.0)\n    vn = (v - mean) * rstd * gamma[None, :] + beta[None, :]\n    out = vn * tl.sigmoid(vn)\n    if HAS_RES:\n        out = out + tl.load(res_ptr + idx, mask=mask_p[:, None], other=0.0)\n    tl.store(out_ptr + idx, out, mask=mask_p[:, None])\n\n\ndef _fused_gn_silu(y, gamma, beta, eps, residual=None):\n    B, C, H, W = y.shape\n    G = 32\n    CPG = C // G\n    HW = H * W\n    BLOCK = 128\n    y = y.contiguous(memory_format=torch.channels_last)\n    out = torch.empty_like(y)\n    sums = torch.zeros(B * G, device=y.device, dtype=torch.float32)\n    sqsums = torch.zeros(B * G, device=y.device, dtype=torch.float32)\n    grid = (B * G, triton.cdiv(HW, BLOCK))\n    _gn_partial[grid](y, sums, sqsums, HW, C=C, CPG=CPG, BLOCK=BLOCK)\n    _gn_silu_apply[grid](\n        y, out, residual if residual is not None else y,\n        sums, sqsums, gamma, beta, HW, eps,\n        C=C, CPG=CPG, HAS_RES=residual is not None, BLOCK=BLOCK,\n    )\n    return out\n\n\nclass ModelNew(nn.Module):\n    \"\"\"channels_last cuDNN convs + Triton-fused GroupNorm+SiLU(+residual).\"\"\"\n\n    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,\n                conv2_weight, norm2_weight, norm2_bias, eps):\n        xl = x.contiguous(memory_format=torch.channels_last)\n        w1 = conv1_weight.contiguous(memory_format=torch.channels_last)\n        w2 = conv2_weight.contiguous(memory_format=torch.channels_last)\n        y = F.conv2d(xl, w1, None, 1, 1)\n        y = _fused_gn_silu(y, norm1_weight, norm1_bias, eps)\n        y = F.conv2d(y, w2, None, 1, 1)\n        return _fused_gn_silu(y, norm2_weight, norm2_bias, eps, residual=xl)\n\n\n# ===== appended by solbench_bridge.kernel_to_solution (SOL entry point) =====\nimport torch as _sb_torch  # noqa: E402\n\n_SB_MODEL = None\n_SB_INIT_ARGS = []\n\n\ndef run(*args):\n    \"\"\"SOL-ExecBench entry point (value-returning; destination_passing_style=false).\"\"\"\n    global _SB_MODEL\n    if _SB_MODEL is None:\n        _m = ModelNew(*_SB_INIT_ARGS)\n        if isinstance(_m, _sb_torch.nn.Module):\n            if _sb_torch.cuda.is_available():\n                _m = _m.cuda()\n            _m.eval()\n        _SB_MODEL = _m\n    with _sb_torch.no_grad():\n        return _SB_MODEL(*args)\n"
+    }
+  ]
+}

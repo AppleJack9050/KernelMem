@@ -1,0 +1,12 @@
+candidate              pass   SOL (stored t_b)   SOL (same-session)                 worst shape
+-----------------------------------------------------------------------------------------------
+nhwc_eager            20/20              0.382                0.337        0.208 @ b1 1024x1024
+nhwc_triton_fused     20/20              0.605                0.561            0.502 @ b8 64x64
+compile_default       20/20              0.476                0.432        0.205 @ b1 1024x1024
+compile_cudagraph     20/20              0.471                0.431        0.217 @ b1 1024x1024
+compile_unlimited     20/20              0.634                0.579            0.446 @ b2 64x64
+agent_best            20/20              0.523                0.475          0.329 @ b1 293x293
+
+S = 0.5 means 'matched the PyTorch reference'. Above 0.5 = faster, below = slower.
+Not leaderboard-comparable: real SOL scoring uses NVIDIA's private T_b and T_SOL
+on locked-clock B200, and the T_SOL here is a direct-convolution bound.

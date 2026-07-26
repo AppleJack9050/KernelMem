@@ -1,0 +1,102 @@
+{
+  "7b00c2c8-1eaa-55ec-a575-64639d605881": {
+    "t_b_ms": 2.293423891067505,
+    "t_sol_ms": 1.47537,
+    "baseline": "reference"
+  },
+  "a4c930bb-4694-570b-8d51-97ba053f74ac": {
+    "t_b_ms": 0.6326079964637756,
+    "t_sol_ms": 0.368843,
+    "baseline": "reference"
+  },
+  "f1b799bf-831f-5434-98be-68e897f6a219": {
+    "t_b_ms": 0.6467519998550415,
+    "t_sol_ms": 0.386335,
+    "baseline": "reference"
+  },
+  "b7c12247-9822-5484-b556-12272c60c95b": {
+    "t_b_ms": 18.520559310913086,
+    "t_sol_ms": 11.802964,
+    "baseline": "reference"
+  },
+  "697db7ab-bed6-5b19-a6d9-ee56785b0031": {
+    "t_b_ms": 1.144656002521515,
+    "t_sol_ms": 0.737685,
+    "baseline": "reference"
+  },
+  "c27f80fd-cda1-5e21-9a89-61e03f7fab92": {
+    "t_b_ms": 2.470479965209961,
+    "t_sol_ms": 1.47537,
+    "baseline": "reference"
+  },
+  "d6d0256b-9fcc-58e1-b170-418468a285ff": {
+    "t_b_ms": 5.25548791885376,
+    "t_sol_ms": 2.950741,
+    "baseline": "reference"
+  },
+  "69ceed6e-126b-5583-8bba-fabb3a09f4db": {
+    "t_b_ms": 0.5867519974708557,
+    "t_sol_ms": 0.368843,
+    "baseline": "reference"
+  },
+  "144fdf2b-0296-5d64-819b-eab16d18c752": {
+    "t_b_ms": 9.520959854125977,
+    "t_sol_ms": 5.901482,
+    "baseline": "reference"
+  },
+  "8d631edd-1bc9-5142-9253-b0378a890e67": {
+    "t_b_ms": 0.33563199639320374,
+    "t_sol_ms": 0.184421,
+    "baseline": "reference"
+  },
+  "38357eec-a997-567f-a5e4-07cb993c02f9": {
+    "t_b_ms": 46.5285758972168,
+    "t_sol_ms": 23.605927,
+    "baseline": "reference"
+  },
+  "102b9359-8f90-5a29-a5a5-dd7bce9f32c3": {
+    "t_b_ms": 3.566912055015564,
+    "t_sol_ms": 1.932664,
+    "baseline": "reference"
+  },
+  "952fec71-f323-5dab-9340-dad59ad7a3f1": {
+    "t_b_ms": 9.688752174377441,
+    "t_sol_ms": 5.901482,
+    "baseline": "reference"
+  },
+  "6284bbd2-bc2e-5002-856a-c4f2c7582254": {
+    "t_b_ms": 4.945727825164795,
+    "t_sol_ms": 2.950741,
+    "baseline": "reference"
+  },
+  "99881f0c-5281-5728-a4fa-de56d6c2bbe0": {
+    "t_b_ms": 1.0052800178527832,
+    "t_sol_ms": 0.737685,
+    "baseline": "reference"
+  },
+  "8de1dc63-b34a-5618-ba36-abaa79de54cf": {
+    "t_b_ms": 26.874048233032227,
+    "t_sol_ms": 13.278334,
+    "baseline": "reference"
+  },
+  "d6339761-5f71-58dc-b823-4b5caf913838": {
+    "t_b_ms": 1.7170560359954834,
+    "t_sol_ms": 1.106528,
+    "baseline": "reference"
+  },
+  "7a72b3ef-ddf9-5788-bcda-d4e310ffbc2a": {
+    "t_b_ms": 1.696287989616394,
+    "t_sol_ms": 1.106528,
+    "baseline": "reference"
+  },
+  "cdb231f0-8b76-5b89-a93b-21af0627e037": {
+    "t_b_ms": 2.3509280681610107,
+    "t_sol_ms": 1.47537,
+    "baseline": "reference"
+  },
+  "c318e734-9c16-5ca9-8379-1ebdd11da8c0": {
+    "t_b_ms": 4.100319862365723,
+    "t_sol_ms": 2.213056,
+    "baseline": "reference"
+  }
+}

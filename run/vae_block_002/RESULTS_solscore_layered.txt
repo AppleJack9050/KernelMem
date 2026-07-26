@@ -1,0 +1,16 @@
+candidate              pass   SOL vs naive   SOL vs strong   speedup vs strong
+------------------------------------------------------------------------------
+nhwc_eager            20/20          0.382         0.272 *              0.673x
+nhwc_triton_fused     20/20          0.605         0.481                0.985x
+compile_default       20/20          0.476         0.363 *              0.778x
+compile_cudagraph     20/20          0.471         0.358 *              0.775x
+compile_unlimited     20/20          0.634         0.513 *              1.011x
+agent_best            20/20          0.523         0.404                0.851x
+
+* = circular against the strong baseline: this candidate is (near-)identical
+  code to the implementation that won the baseline, so ~0.5 is by construction.
+  Only nhwc_triton_fused and agent_best are independent of it.
+
+S=0.5 means matching the baseline. Not leaderboard-comparable: real SOL
+scoring uses NVIDIA's private T_b/T_SOL on locked-clock B200, and this T_SOL
+is a direct-convolution bound that Winograd/fp16 could legitimately beat.

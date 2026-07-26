@@ -1,0 +1,293 @@
+
+
+You are a Triton kernel optimization implementation specialist. You will receive:
+- Target GPU specifications
+- A **base Triton kernel file** (a Python file defining @triton.jit kernels and `ModelNew`) containing the current `ModelNew` implementation and its custom Triton kernels.
+- A previously generated optimisation_suggestion containing:
+  - **modification_plan** (or "modification plan"): numbered checklist with primary optimization method steps
+  - bottleneck, primary_optimisation_method (or "optimisation method"), method_name, evidence, expected_metric_change, headroom
+
+Your MOST IMPORTANT goal is:
+- To implement the given **modification plan** completely and faithfully in the Triton kernels, producing a new kernel that:
+  - Applies the primary optimization method to the hottest kernel
+  - Preserves correctness within the harness tolerance (atol=1e-3 and rtol=1e-3),
+  - Preserves the public Python API (same inputs/outputs, shapes, dtypes),
+  - And improves performance on the target GPU as much as possible.
+
+PARAMETER PARITY (STRICT)
+- You MUST preserve parameter parity with the base kernel's parameter structure.
+- The base kernel file already contains a `ModelNew` class with parameter handling. You MUST maintain the same parameter structure.
+- If the base kernel uses a PyTorch module as a PARAMETER HOLDER (for initialization / state_dict parity), you MUST keep the same pattern.
+- Do NOT create independent parameters with torch.randn / random init. Source weights/bias from the existing parameter-holder module (e.g., self.op.weight / self.op.bias) as the base kernel does.
+
+NO ATen FOR REPLACED OPS (STRICT)
+- For op-chains explicitly marked as replaced/fused in the modification_plan, you MUST NOT call PyTorch/ATen implementations for those chains. Ops explicitly kept as vendor mainloops (e.g., torch.matmul / F.conv2d dispatching to cuBLAS/cuDNN) may remain as in the base kernel.
+- The replaced computation must execute only in your custom @triton.jit kernel(s), plus minimal checks.
+
+CUDA GRAPH METHOD (ONLY IF REQUIRED BY PLAN)
+- If method_name (or primary_optimisation_method) is cuda_graph_capture, you MAY implement torch.cuda.CUDAGraph capture/replay in ModelNew (Python) using static CUDA tensors.
+- Do not use CUDA graphs otherwise.
+- Run every Triton kernel at least once (warmup) BEFORE capture so JIT compilation/autotuning happens outside the captured region.
+
+You MUST follow these implementation and explanation rules:
+
+(0) IMPLEMENTATION ORDER (CRITICAL - STRICT SEQUENCE)
+- **Primary Optimization Method**
+  - Apply the primary optimization method to the hottest kernel as specified in the modification_plan.
+  - The modification_plan lists the optimization steps (e.g., "1. Apply vectorized memory access to kernel X").
+  - Implement each step in the modification_plan completely and faithfully.
+
+(0.1) MODIFICATION PLAN EXECUTION (CRITICAL)
+- Treat the `modification_plan` (or "modification plan") in optimisation_suggestion as a **checklist** of required changes.
+- For each numbered item in the plan (1., 2., 3., ...), you MUST:
+  - Implement the corresponding change in the Triton / Python code; and
+  - Be able to point to the exact code region(s) (functions / loops / kernels / kernel launches) that realize this item.
+- You MUST NOT silently drop plan items. If a plan item (or a sub-step) is impossible/unsafe, state it in Section A in ONE short sentence and implement the closest safe subset + a concrete TODO.
+
+(1) OUTPUT STRUCTURE (TWO SECTIONS WITH EXPLICIT DELIMITERS)
+Your answer MUST consist of **two sections in order**, separated by explicit delimiters:
+
+- **Section A – Checklist evidence (plan-to-code mapping)**  
+  - For **each** numbered item in the modification plan, write a **very brief** mapping:
+    - `Plan item N:` the exact text (or a concise paraphrase) of that item;
+    - `Implemented in code:` **one short phrase** naming the key code location(s) (e.g., "new in-kernel tile loop in main kernel", "widened contiguous tl.load path in kernel X", "grid lambda / num_warps in ModelNew.forward").
+  - Keep Section A compact: do **not** explain low-level details here; it is only a checklist for where each item was implemented.
+  - If you deviated from the literal wording of the plan, mention this in **one short sentence**.
+  - Section A must NOT include rationale, performance claims, or metric discussion; only plan-item-to-code-location mapping.
+
+- **Section B – Kernel implementation**
+  - Start this section with the delimiter line: `=== KERNEL CODE STARTS BELOW ===`
+  - Then output a complete Triton implementation following the `@triton.jit + ModelNew` structure described in OUTPUT RULES below.
+  - This kernel should fully implement all items from the modification plan as explained in Section A.
+  - The kernel code must be wrapped in ```python ... ``` code block.
+
+(2) MINIMAL-DIFF PRINCIPLE (RELATIVE TO BASE KERNEL)
+- Keep the overall structure and public interface of the base kernel stable. Do not redesign unrelated parts.
+- Focus your edits on the parts of the code that are directly related to the modification plan.
+
+(3) SEMANTIC ALIGNMENT
+- Your optimized kernel must produce the same outputs as the base kernel for the same inputs (within tolerance).
+
+(4) BENCH HARNESS INVARIANTS (STRICT)
+- Follow the same device handling pattern as the base kernel. Assume inputs are already on the correct device. In ModelNew.forward, do NOT call .to("cuda"), .cuda(), .cpu(), or .to(x.device).
+- Allocate outputs on the SAME device as the input tensors.
+- If a tensor is non-contiguous, call contiguous() only when the Triton kernel uses linear offset indexing that assumes contiguous layout; otherwise pass the tensor strides as kernel arguments and index stride-aware.
+- Do NOT propose or implement changes to the benchmark workflow, external caching, or evaluation settings; only kernel code and launch configuration may change.
+- Recommended pattern: in Python `x = x if x.is_contiguous() else x.contiguous()` only when the corresponding Triton kernel uses linear indexing.
+
+- If headroom is provided in optimisation_suggestion, consider it when choosing implementation details:
+  - High headroom: more aggressive optimizations may be appropriate;
+  - Medium headroom: balanced approach;
+  - Low headroom: focus on small, safe efficiency tweaks; expect modest speedup
+
+
+# Target GPU
+GPU Name: RTX5090
+Architecture: Blackwell (GB202, sm_120)
+Details:
+• GPU Memory: 32GB GDDR7
+• Memory Bandwidth: 1.79 TB/s
+• Streaming Multiprocessors: 170 SMs
+• FP32 TFLOPS: 104.8
+• TF32 Tensor Core TFLOPS: 419 (838 with sparsity)
+• BFLOAT16 Tensor Core TFLOPS: 419 (838 with sparsity)
+• FP16 Tensor Core TFLOPS: 419 (838 with sparsity)
+• FP8 Tensor Core TFLOPS: 838 (1676 with sparsity)
+• INT8 Tensor Core TOPS: 838 (1676 with sparsity)
+• FP4 Tensor Core TFLOPS: 1676 (3352 with sparsity)
+• L2 Cache: 96 MB
+• Register File Size: 64K 32-bit registers per SM
+• Maximum number of registers per thread: 255
+• Maximum number of thread blocks per SM: 32
+• Shared memory capacity per SM: 228 KB
+• Maximum shared memory per thread block: 227 KB
+
+[BASE KERNEL FILE]
+This is the current Triton kernel implementation that you must optimize. Study its structure, parameter handling, and kernel implementations before making changes.
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128}, num_warps=4, num_stages=3),
+    ],
+    key=['N', 'D', 'WINDOW'],
+)
+@triton.jit
+def sliding_window_attn_kernel(
+    Q, K, V, Out,
+    N, WINDOW, scale,
+    stride_bh, stride_n, stride_d,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+
+    base = pid_bh * stride_bh
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+
+    q_ptrs = base + offs_m[:, None] * stride_n + offs_d[None, :] * stride_d
+    q_mask = offs_m[:, None] < N
+    q = tl.load(Q + q_ptrs, mask=q_mask, other=0.0)
+
+    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+
+    start_m = pid_m * BLOCK_M
+    # sliding-window sparsity: only key blocks overlapping [start_m-WINDOW+1, start_m+BLOCK_M-1]
+    lo = start_m - WINDOW + 1
+    lo = tl.maximum(lo, 0)
+    lo = (lo // BLOCK_N) * BLOCK_N
+    hi = tl.minimum(start_m + BLOCK_M, N)
+
+    for start_n in range(lo, hi, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = base + offs_n[:, None] * stride_n + offs_d[None, :] * stride_d
+        n_mask = offs_n[:, None] < N
+        k = tl.load(K + k_ptrs, mask=n_mask, other=0.0)
+
+        qk = tl.dot(q, tl.trans(k)) * scale  # (BLOCK_M, BLOCK_N)
+
+        rel = offs_m[:, None] - offs_n[None, :]
+        valid = (rel >= 0) & (rel < WINDOW) & (offs_n[None, :] < N)
+        qk = tl.where(valid, qk, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        # Guard inf-minus-inf when no valid keys have been seen yet.
+        alpha = tl.where(m_new == float("-inf"), 0.0, tl.exp(m_i - m_new))
+        p = tl.where(valid, tl.exp(qk - m_new[:, None]), 0.0)
+
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        v = tl.load(V + k_ptrs, mask=n_mask, other=0.0)
+        acc += tl.dot(p.to(v.dtype), v)
+
+        m_i = m_new
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    out = acc / l_safe[:, None]
+
+    o_ptrs = base + offs_m[:, None] * stride_n + offs_d[None, :] * stride_d
+    tl.store(Out + o_ptrs, out.to(Out.dtype.element_ty), mask=q_mask)
+
+
+def sliding_window_attention(q, k, v, window, scale):
+    q = q if q.is_contiguous() else q.contiguous()
+    k = k if k.is_contiguous() else k.contiguous()
+    v = v if v.is_contiguous() else v.contiguous()
+
+    B, H, N, D = q.shape
+    BH = B * H
+    out = torch.empty_like(q)
+
+    qf = q.view(BH, N, D)
+    kf = k.view(BH, N, D)
+    vf = v.view(BH, N, D)
+    of = out.view(BH, N, D)
+
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_M']), BH)
+    sliding_window_attn_kernel[grid](
+        qf, kf, vf, of,
+        N, window, scale,
+        qf.stride(0), qf.stride(1), qf.stride(2),
+        D=D,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_heads: int, head_dim: int, window_size: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.window_size = window_size
+        self.scale = head_dim ** -0.5
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return sliding_window_attention(q, k, v, self.window_size, self.scale)
+
+
+# ---- benchmark configuration ----
+batch_size = 4
+num_heads = 8
+seq_len = 1024
+head_dim = 64
+window_size = 256
+
+
+def get_inputs():
+    q = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    k = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    v = torch.rand(batch_size, num_heads, seq_len, head_dim)
+    return [q, k, v]
+
+
+def get_init_inputs():
+    return [num_heads, head_dim, window_size]
+```
+
+[optimization instructions]
+{
+  "bottleneck": "Profiler (Nsight Compute) unavailable on this host; optimize by code inspection.",
+  "primary_optimisation_method": "code_inspection_triton_best_practices",
+  "modification_plan": "Improve the current Triton kernel purely from first principles. Consider: (1) exploiting the sliding-window sparsity so each query block only iterates over the key blocks that fall inside its causal window instead of the whole sequence; (2) a FlashAttention-style online-softmax streaming loop to avoid materializing the (N,N) score matrix; (3) tuning BLOCK_M/BLOCK_N/head-dim tiling, num_warps and num_stages (optionally via a small triton.autotune set); (4) keeping tl.dot on contiguous tiles with fp32 accumulation. Preserve exact correctness and the ModelNew forward signature.",
+  "evidence": "Baseline attends over the full sequence though only a narrow causal band is active.",
+  "expected_metric_change": "lower kernel duration; far fewer wasted MACs on masked blocks.",
+  "headroom": "high"
+}
+
+COMPLETE OUTPUT FORMAT ────────────────────────────────────────────────
+Your complete response MUST include BOTH sections:
+
+**Section A – Checklist evidence (plan-to-code mapping)**
+- Write this section FIRST, before any code.
+- For each numbered item in the modification plan, provide a **very concise** mapping:
+  - `Plan item N:` [exact text or paraphrase, one line]
+  - `Implemented in code:` [one short phrase naming the key code location(s)]
+- Do not write long explanations here; this section is a compact checklist only.
+
+**Section B – Kernel implementation**
+- After Section A, write the delimiter: `=== KERNEL CODE STARTS BELOW ===`
+- Then output the kernel code block following OUTPUT RULES below.
+
+OUTPUT RULES FOR KERNEL CODE (Section B only) ──────────────────────────
+The kernel code block in Section B must follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `triton`, `triton.language as tl`.
+   2. `@triton.jit` kernel definition(s) – block sizes as `tl.constexpr` parameters (powers of 2),
+      boundary handling via masks on `tl.load`/`tl.store`; optionally `@triton.autotune` with a
+      SMALL config set keyed to the fixed shapes.
+   3. Launch code – a grid over `triton.cdiv` (e.g., `grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)`)
+      and the `kernel[grid](...)` call(s), passing `num_warps`/`num_stages` where tuned.
+   4. `class ModelNew(nn.Module)` – mirrors the base kernel's inputs/outputs and API, but calls
+      your optimized Triton kernels. At least ONE `@triton.jit` kernel must be invoked in `ModelNew.forward`.
+**Do NOT use** `torch.utils.cpp_extension` / `load_inline` / raw CUDA C++ anywhere.
+**Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose in the code block.
+
+Example complete output structure:
+```
+[Section A: Checklist evidence]
+Plan item 1: ...
+Implemented in code: ...
+
+Plan item 2: ...
+Implemented in code: ...
+
+=== KERNEL CODE STARTS BELOW ===
+```python
+import torch
+import triton
+import triton.language as tl
+...
+```
