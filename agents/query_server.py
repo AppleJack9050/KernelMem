@@ -21,7 +21,7 @@ from claude_agent_sdk import (
     query,
 )
 
-DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_EFFORT = "high"
 
 # The Agent SDK builds the child env as {**os.environ, **options.env} at spawn

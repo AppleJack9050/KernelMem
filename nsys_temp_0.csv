@@ -1,2 +1,4 @@
 Kernel Name,kernel_launch_count
-rmsnorm_kernel,12
+gn_silu_kernel,24
+gstats_partial_kernel,24
+gstats_finalize_kernel,24

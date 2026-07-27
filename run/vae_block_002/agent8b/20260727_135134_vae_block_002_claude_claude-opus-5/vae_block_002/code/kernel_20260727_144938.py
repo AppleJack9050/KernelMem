@@ -1,0 +1,525 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <algorithm>
+#include <cstring>
+
+#define CDIV(a, b) (((a) + (b) - 1) / (b))
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1: partial sums / sums-of-squares per (n, group) chunk.
+// grid = (splits, num_groups_total), block = 256
+// ---------------------------------------------------------------------------
+template <bool VEC>
+__global__ void gn_stats_partial_kernel(const float* __restrict__ y,
+                                        float* __restrict__ partial,
+                                        long long group_size,
+                                        int splits) {
+    const long long g = blockIdx.y;
+    const int s = blockIdx.x;
+    const float* __restrict__ base = y + g * group_size;
+
+    float sum = 0.f, sq = 0.f;
+
+    if (VEC) {
+        const long long nvec = group_size >> 2;
+        const long long start = ((long long)s * nvec) / splits;
+        const long long end = ((long long)(s + 1) * nvec) / splits;
+        const float4* __restrict__ b4 = reinterpret_cast<const float4*>(base);
+        for (long long i = start + threadIdx.x; i < end; i += blockDim.x) {
+            float4 v = b4[i];
+            sum += v.x + v.y + v.z + v.w;
+            sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    } else {
+        const long long start = ((long long)s * group_size) / splits;
+        const long long end = ((long long)(s + 1) * group_size) / splits;
+        for (long long i = start + threadIdx.x; i < end; i += blockDim.x) {
+            float v = base[i];
+            sum += v;
+            sq += v * v;
+        }
+    }
+
+    __shared__ float ws[32];
+    __shared__ float wq[32];
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+
+    sum = warp_sum(sum);
+    sq = warp_sum(sq);
+    if (lane == 0) { ws[wid] = sum; wq[wid] = sq; }
+    __syncthreads();
+
+    if (wid == 0) {
+        const int nw = blockDim.x >> 5;
+        float a = (lane < nw) ? ws[lane] : 0.f;
+        float b = (lane < nw) ? wq[lane] : 0.f;
+        a = warp_sum(a);
+        b = warp_sum(b);
+        if (lane == 0) {
+            partial[(g * splits + s) * 2 + 0] = a;
+            partial[(g * splits + s) * 2 + 1] = b;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: finalize mean / rstd.  grid = (num_groups_total), block = 32
+// ---------------------------------------------------------------------------
+__global__ void gn_finalize_kernel(const float* __restrict__ partial,
+                                   float* __restrict__ ms,
+                                   int splits, float inv_n, float eps) {
+    const int g = blockIdx.x;
+    float s = 0.f, q = 0.f;
+    for (int i = threadIdx.x; i < splits; i += 32) {
+        s += partial[(long long)(g * splits + i) * 2 + 0];
+        q += partial[(long long)(g * splits + i) * 2 + 1];
+    }
+    s = warp_sum(s);
+    q = warp_sum(q);
+    if (threadIdx.x == 0) {
+        float m = s * inv_n;
+        float var = q * inv_n - m * m;
+        var = fmaxf(var, 0.f);
+        ms[2 * g + 0] = m;
+        ms[2 * g + 1] = rsqrtf(var + eps);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: y_hat = gamma*(y-mean)*rstd + beta ; out = silu(y_hat) (+ residual)
+// STREAM_OUT: use __stcs so the never-re-read output does not evict the
+//             L2-persisting input window.
+// grid = (chunks_over_HW, N*C), block = 256
+// ---------------------------------------------------------------------------
+template <bool VEC, bool RESID, bool STREAM_OUT>
+__global__ void gn_silu_apply_kernel(const float* __restrict__ y,
+                                     const float* __restrict__ res,
+                                     const float* __restrict__ gamma,
+                                     const float* __restrict__ beta,
+                                     const float* __restrict__ ms,
+                                     float* __restrict__ out,
+                                     int C, int cpg, int G, long long HW) {
+    const int nc = blockIdx.y;
+    const int c = nc % C;
+    const int n = nc / C;
+    const int gid = n * G + (c / cpg);
+
+    const float mean = ms[2 * gid + 0];
+    const float rstd = ms[2 * gid + 1];
+    const float gam = gamma[c];
+    const float bet = beta[c];
+    const float scale = gam * rstd;
+    const float bias = bet - mean * scale;
+
+    const long long off = (long long)nc * HW;
+
+    if (VEC) {
+        const long long nvec = HW >> 2;
+        const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < nvec) {
+            const float4* __restrict__ y4 = reinterpret_cast<const float4*>(y + off);
+            float4* __restrict__ o4 = reinterpret_cast<float4*>(out + off);
+            float4 v = y4[idx];
+            float a0 = v.x * scale + bias;
+            float a1 = v.y * scale + bias;
+            float a2 = v.z * scale + bias;
+            float a3 = v.w * scale + bias;
+            a0 = a0 / (1.f + expf(-a0));
+            a1 = a1 / (1.f + expf(-a1));
+            a2 = a2 / (1.f + expf(-a2));
+            a3 = a3 / (1.f + expf(-a3));
+            if (RESID) {
+                const float4* __restrict__ r4 = reinterpret_cast<const float4*>(res + off);
+                float4 r = r4[idx];
+                a0 += r.x; a1 += r.y; a2 += r.z; a3 += r.w;
+            }
+            float4 o;
+            o.x = a0; o.y = a1; o.z = a2; o.w = a3;
+            if (STREAM_OUT) {
+                __stcs(&o4[idx], o);
+            } else {
+                o4[idx] = o;
+            }
+        }
+    } else {
+        const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < HW) {
+            float a = y[off + idx] * scale + bias;
+            a = a / (1.f + expf(-a));
+            if (RESID) a += res[off + idx];
+            if (STREAM_OUT) {
+                __stcs(out + off + idx, a);
+            } else {
+                out[off + idx] = a;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L2 persisting-window helpers (plan items 2 & 3).  All errors are ignored:
+// if the driver refuses the window we simply run without it.
+// ---------------------------------------------------------------------------
+static int g_max_window = -1;
+
+void init_l2_persist(int64_t bytes) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return;
+    g_max_window = prop.accessPolicyMaxWindowSize;
+    size_t want = (size_t)bytes;
+    if (prop.persistingL2CacheMaxSize > 0 &&
+        want > (size_t)prop.persistingL2CacheMaxSize) {
+        want = (size_t)prop.persistingL2CacheMaxSize;
+    }
+    cudaError_t e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, want);
+    if (e != cudaSuccess) { cudaGetLastError(); }
+}
+
+void set_l2_window(torch::Tensor t, int64_t bytes) {
+    if (!t.is_cuda()) return;
+    init_l2_persist(16LL * 1024 * 1024);
+    size_t nb = (size_t)bytes;
+    size_t tb = (size_t)t.numel() * (size_t)t.element_size();
+    if (nb > tb) nb = tb;
+    if (g_max_window > 0 && nb > (size_t)g_max_window) nb = (size_t)g_max_window;
+    if (nb == 0) return;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamAttrValue av;
+    std::memset(&av, 0, sizeof(av));
+    av.accessPolicyWindow.base_ptr = t.data_ptr();
+    av.accessPolicyWindow.num_bytes = nb;
+    av.accessPolicyWindow.hitRatio = 1.0f;
+    av.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    av.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    cudaError_t e = cudaStreamSetAttribute(
+        stream, cudaStreamAttributeAccessPolicyWindow, &av);
+    if (e != cudaSuccess) { cudaGetLastError(); }
+}
+
+void reset_l2_window() {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamAttrValue av;
+    std::memset(&av, 0, sizeof(av));
+    av.accessPolicyWindow.base_ptr = nullptr;
+    av.accessPolicyWindow.num_bytes = 0;
+    av.accessPolicyWindow.hitRatio = 0.0f;
+    av.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+    av.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+    cudaError_t e = cudaStreamSetAttribute(
+        stream, cudaStreamAttributeAccessPolicyWindow, &av);
+    if (e != cudaSuccess) { cudaGetLastError(); }
+    e = cudaCtxResetPersistingL2Cache();
+    if (e != cudaSuccess) { cudaGetLastError(); }
+}
+
+// ---------------------------------------------------------------------------
+// Host launcher (writes into a caller-provided out tensor, reuses workspaces)
+// ---------------------------------------------------------------------------
+static void gn_silu_impl(const torch::Tensor& y,
+                         const torch::Tensor& gamma,
+                         const torch::Tensor& beta,
+                         const torch::Tensor* res,
+                         torch::Tensor& out,
+                         torch::Tensor& partial_ws,
+                         torch::Tensor& ms_ws,
+                         int64_t num_groups,
+                         double eps,
+                         bool stream_out) {
+    TORCH_CHECK(y.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(y.scalar_type() == at::kFloat, "input must be float32");
+    TORCH_CHECK(y.dim() == 4, "input must be 4D (N,C,H,W)");
+    TORCH_CHECK(y.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous(), "out must be contiguous CUDA");
+    TORCH_CHECK(out.numel() == y.numel(), "out numel mismatch");
+    TORCH_CHECK(gamma.is_cuda() && beta.is_cuda(), "affine params must be CUDA");
+    TORCH_CHECK(gamma.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat,
+                "affine params must be float32");
+
+    const int64_t N = y.size(0);
+    const int64_t C = y.size(1);
+    const int64_t HW = y.size(2) * y.size(3);
+    TORCH_CHECK(C % num_groups == 0, "C must be divisible by num_groups");
+    const int64_t cpg = C / num_groups;
+    const int64_t group_size = cpg * HW;
+    const int64_t NG = N * num_groups;
+
+    if (res != nullptr) {
+        TORCH_CHECK(res->is_cuda() && res->scalar_type() == at::kFloat, "residual dtype/device");
+        TORCH_CHECK(res->is_contiguous(), "residual must be contiguous");
+        TORCH_CHECK(res->numel() == y.numel(), "residual numel mismatch");
+    }
+
+    auto opts = y.options();
+
+    // ---- split heuristic (plan item 6) --------------------------------
+    int splits = (int)(4096 / std::max<int64_t>(NG, 1));
+    if (splits > 64) splits = 64;
+    if (splits < 1) splits = 1;
+    while (splits > 1 && group_size / splits < 4096) splits >>= 1;
+    if (splits < 1) splits = 1;
+
+    const int64_t need_partial = NG * (int64_t)splits * 2;
+    const int64_t need_ms = NG * 2;
+
+    torch::Tensor partial = partial_ws;
+    if (!partial.defined() || !partial.is_cuda() || partial.numel() < need_partial ||
+        partial.scalar_type() != at::kFloat || !partial.is_contiguous()) {
+        partial = torch::empty({need_partial}, opts);
+    }
+    torch::Tensor ms = ms_ws;
+    if (!ms.defined() || !ms.is_cuda() || ms.numel() < need_ms ||
+        ms.scalar_type() != at::kFloat || !ms.is_contiguous()) {
+        ms = torch::empty({need_ms}, opts);
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const bool vec_stats = (group_size % 4 == 0);
+    dim3 sgrid((unsigned)splits, (unsigned)NG);
+    if (vec_stats) {
+        gn_stats_partial_kernel<true><<<sgrid, 256, 0, stream>>>(
+            y.data_ptr<float>(), partial.data_ptr<float>(), (long long)group_size, splits);
+    } else {
+        gn_stats_partial_kernel<false><<<sgrid, 256, 0, stream>>>(
+            y.data_ptr<float>(), partial.data_ptr<float>(), (long long)group_size, splits);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    gn_finalize_kernel<<<(unsigned)NG, 32, 0, stream>>>(
+        partial.data_ptr<float>(), ms.data_ptr<float>(), splits,
+        (float)(1.0 / (double)group_size), (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const bool vec_apply = (HW % 4 == 0);
+    const int block = 256;
+    const int64_t units = vec_apply ? (HW / 4) : HW;
+    dim3 agrid((unsigned)CDIV(units, (int64_t)block), (unsigned)(N * C));
+
+    const float* yp = y.data_ptr<float>();
+    const float* rp = (res != nullptr) ? res->data_ptr<float>() : yp;
+    const float* gp = gamma.data_ptr<float>();
+    const float* bp = beta.data_ptr<float>();
+    const float* msp = ms.data_ptr<float>();
+    float* op = out.data_ptr<float>();
+    const int Ci = (int)C, cpgi = (int)cpg, Gi = (int)num_groups;
+    const long long HWl = (long long)HW;
+
+#define GN_LAUNCH(V, R, S)                                                    \
+    gn_silu_apply_kernel<V, R, S><<<agrid, block, 0, stream>>>(               \
+        yp, rp, gp, bp, msp, op, Ci, cpgi, Gi, HWl)
+
+    if (vec_apply) {
+        if (res != nullptr) {
+            if (stream_out) { GN_LAUNCH(true, true, true); }
+            else            { GN_LAUNCH(true, true, false); }
+        } else {
+            if (stream_out) { GN_LAUNCH(true, false, true); }
+            else            { GN_LAUNCH(true, false, false); }
+        }
+    } else {
+        if (res != nullptr) {
+            if (stream_out) { GN_LAUNCH(false, true, true); }
+            else            { GN_LAUNCH(false, true, false); }
+        } else {
+            if (stream_out) { GN_LAUNCH(false, false, true); }
+            else            { GN_LAUNCH(false, false, false); }
+        }
+    }
+#undef GN_LAUNCH
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gn_silu_ws(torch::Tensor y, torch::Tensor gamma, torch::Tensor beta,
+                torch::Tensor out, torch::Tensor partial, torch::Tensor ms,
+                int64_t num_groups, double eps) {
+    gn_silu_impl(y, gamma, beta, nullptr, out, partial, ms, num_groups, eps, false);
+}
+
+void gn_silu_add_into(torch::Tensor y, torch::Tensor residual, torch::Tensor gamma,
+                      torch::Tensor beta, torch::Tensor out, torch::Tensor partial,
+                      torch::Tensor ms, int64_t num_groups, double eps) {
+    gn_silu_impl(y, gamma, beta, &residual, out, partial, ms, num_groups, eps, true);
+}
+"""
+
+_CPP_SRC = r"""
+void gn_silu_ws(torch::Tensor y, torch::Tensor gamma, torch::Tensor beta,
+                torch::Tensor out, torch::Tensor partial, torch::Tensor ms,
+                int64_t num_groups, double eps);
+void gn_silu_add_into(torch::Tensor y, torch::Tensor residual, torch::Tensor gamma,
+                      torch::Tensor beta, torch::Tensor out, torch::Tensor partial,
+                      torch::Tensor ms, int64_t num_groups, double eps);
+void set_l2_window(torch::Tensor t, int64_t bytes);
+void reset_l2_window();
+void init_l2_persist(int64_t bytes);
+"""
+
+_ext = load_inline(
+    name="vae_gn_silu_res_l2_ext",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["gn_silu_ws", "gn_silu_add_into", "set_l2_window",
+               "reset_l2_window", "init_l2_persist"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+    ],
+)
+
+# shape -> (chunk_size, use_l2_window)
+_PLAN_CACHE = {}
+_L2_TARGET_BYTES = 16 * 1024 * 1024   # persisting window budget
+_L2_CHUNK_BYTES = 8 * 1024 * 1024     # live-intermediate footprint target
+
+
+class ModelNew(nn.Module):
+    """
+    Same public API as the base kernel; adds L2 cache blocking:
+      - batch-chunked scheduling so the conv output stays L2-resident,
+      - cudaStreamSetAttribute accessPolicyWindow (Persisting/Streaming),
+      - out-tensor GN+SiLU+residual variant with streaming (__stcs) stores.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+        self.num_groups = 32
+        self._last_win_ptr = 0
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------- helpers
+    def _chunk_size(self, x):
+        per_sample = x[0].numel() * x.element_size()
+        cs = int(_L2_CHUNK_BYTES // max(per_sample, 1))
+        if cs < 1:
+            cs = 1
+        if cs > x.size(0):
+            cs = x.size(0)
+        return cs
+
+    def _set_win(self, t):
+        p = t.data_ptr()
+        if p != self._last_win_ptr:
+            nb = min(t.numel() * t.element_size(), _L2_TARGET_BYTES)
+            self.ext.set_l2_window(t, nb)
+            self._last_win_ptr = p
+
+    def _run(self, x_c, w1, g1, b1, w2, g2, b2, eps_f, cs, use_window):
+        B = x_c.size(0)
+        G = self.num_groups
+        out_full = torch.empty_like(x_c)
+
+        # workspaces allocated once per forward (plan item 7)
+        ng_max = cs * G
+        partial = torch.empty(ng_max * 64 * 2, device=x_c.device, dtype=torch.float32)
+        ms = torch.empty(ng_max * 2, device=x_c.device, dtype=torch.float32)
+
+        n0 = 0
+        while n0 < B:
+            c = cs if (n0 + cs) <= B else (B - n0)
+            xc = x_c.narrow(0, n0, c)
+
+            t1 = F.conv2d(xc, w1, bias=None, stride=1, padding=1)
+            if not t1.is_contiguous():
+                t1 = t1.contiguous()
+            if use_window:
+                self._set_win(t1)
+            t2 = torch.empty_like(t1)
+            self.ext.gn_silu_ws(t1, g1, b1, t2, partial, ms, G, eps_f)
+
+            t3 = F.conv2d(t2, w2, bias=None, stride=1, padding=1)
+            if not t3.is_contiguous():
+                t3 = t3.contiguous()
+            if use_window:
+                self._set_win(t3)
+            self.ext.gn_silu_add_into(t3, xc, g2, b2,
+                                      out_full.narrow(0, n0, c),
+                                      partial, ms, G, eps_f)
+            n0 += c
+
+        if use_window:
+            self.ext.reset_l2_window()
+            self._last_win_ptr = 0
+        return out_full
+
+    def _time(self, args, cs, use_window, iters=10):
+        for _ in range(3):
+            self._run(*args, cs, use_window)
+        torch.cuda.synchronize()
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(iters):
+            self._run(*args, cs, use_window)
+        e.record()
+        torch.cuda.synchronize()
+        return s.elapsed_time(e) / iters
+
+    def _autotune(self, args, cs_chunk, B):
+        if cs_chunk >= B:
+            return (B, False)
+        try:
+            t_full = self._time(args, B, False)
+            t_chunk = self._time(args, cs_chunk, True)
+        except Exception:
+            return (B, False)
+        if t_chunk < t_full * 0.97:
+            return (cs_chunk, True)
+        return (B, False)
+
+    # -------------------------------------------------------------- forward
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        if isinstance(eps, torch.Tensor):
+            eps_f = float(eps.item())
+        else:
+            eps_f = float(eps)
+
+        x_c = x if x.is_contiguous() else x.contiguous()
+        w1 = conv1_weight if conv1_weight.is_contiguous() else conv1_weight.contiguous()
+        w2 = conv2_weight if conv2_weight.is_contiguous() else conv2_weight.contiguous()
+        g1 = norm1_weight if norm1_weight.is_contiguous() else norm1_weight.contiguous()
+        b1 = norm1_bias if norm1_bias.is_contiguous() else norm1_bias.contiguous()
+        g2 = norm2_weight if norm2_weight.is_contiguous() else norm2_weight.contiguous()
+        b2 = norm2_bias if norm2_bias.is_contiguous() else norm2_bias.contiguous()
+
+        args = (x_c, w1, g1, b1, w2, g2, b2, eps_f)
+
+        key = (tuple(x_c.shape), self.num_groups)
+        plan = _PLAN_CACHE.get(key)
+        if plan is None:
+            cs_chunk = self._chunk_size(x_c)
+            plan = self._autotune(args, cs_chunk, x_c.size(0))
+            _PLAN_CACHE[key] = plan
+
+        cs, use_window = plan
+        return self._run(*args, cs, use_window)

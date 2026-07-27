@@ -48,7 +48,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--server_type", default="claude", help="Label only; all calls go through the Claude Agent SDK (subscription credit)")
     p.add_argument("--server_address", default="localhost", help="Unused (kept for compatibility)")
     p.add_argument("--server_port", type=int, default=8000, help="Unused (kept for compatibility)")
-    p.add_argument("--model_name", default="claude-opus-4-8", help="Claude model (non-Claude names fall back to claude-opus-4-8)")
+    p.add_argument("--model_name", default="claude-opus-5", help="Claude model (non-Claude names fall back to claude-opus-5)")
     p.add_argument("--round", "-G", type=int, default=10, help="Number of generations per task")
     p.add_argument("--work_dir", type=Path, default=Path("run"), help="Output root directory")
     p.add_argument("--device", type=int, default=0, help="CUDA device index for benchmarking")
@@ -368,7 +368,7 @@ def _bench_and_score(
     except Exception:
         pass
 
-    # ========== 添加超时保护：20 分钟（10 分钟编译 + 10 分钟测试）==========
+    # ========== Add timeout protection: 20 minutes (10 minutes compile + 10 minutes test) ==========
     # Wait for child with timeout
     timeout_occurred = False
     p.join(timeout=1200)  # 20 minutes
@@ -392,11 +392,11 @@ def _bench_and_score(
         elif parent_conn.poll():
             payload = parent_conn.recv()
     except EOFError:
-        # 子进程可能在发送错误信息前崩溃（如 CUDA 上下文损坏）
-        # 这种情况下 payload 保持为 None，后续会处理为错误
+        # The child may crash before it sends the error info (e.g., a corrupted CUDA context)
+        # In that case payload stays None and is handled as an error below
         pass
     except Exception as e:
-        # 其他连接错误也捕获，避免程序崩溃
+        # Catch other connection errors as well so the program doesn't crash
         print(f"Warning: Failed to receive payload from child process: {e}")
     finally:
         try:
@@ -472,11 +472,11 @@ def _bench_and_score(
             print(f"[{phase}] WARNING: failed to save metrics: {save_exc}", flush=True)
 
     # Light cleanup in parent
-    # NOTE: 不在父进程中执行 CUDA 操作，避免子进程的 GPU 错误传播到父进程
-    # 子进程的 CUDA 上下文是隔离的，父进程不需要也不应该清理
+    # NOTE: Avoid CUDA operations in the parent so GPU errors from the child don't propagate here
+    # The child's CUDA context is isolated; the parent neither needs to nor should clean it up
     if torch.cuda.is_available():
         try:
-            # 仅清理内存，不做同步操作（避免触发子进程遗留的 CUDA 错误）
+            # Only free memory, no synchronization (avoids triggering CUDA errors left by the child)
             torch.cuda.empty_cache()
         except Exception:
             pass
@@ -651,6 +651,38 @@ def _append_usage_totals(log_path: Path) -> Dict[str, int]:
 
 
 # --------------------- single-task run -----------------
+def _nsys_launch_table_block(full_df, top_n: int = 15) -> str:
+    """Render the full per-kernel nsys launch table as a prompt block.
+
+    NCU only profiles the kernels we wrote, so the model has no view of the
+    library kernels surrounding them. Kernel launch counts expose that: e.g. a
+    layout-transform kernel launching more often than the convolution it feeds
+    means the block is paying repeated NCHW<->NHWC conversions on large tensors.
+    """
+    df = full_df.sort_values("kernel_launch_count", ascending=False).head(top_n)
+    total = int(full_df["kernel_launch_count"].sum())
+    lines = [
+        "",
+        "# Kernel launch counts — ALL kernels in the forward pass (Nsight Systems)",
+        "",
+        "Includes library kernels (cuDNN/cuBLAS/PyTorch) that NCU does not profile.",
+        "Look for kernels that do no math — layout transforms, copies, casts — and",
+        "for launch counts that exceed the number of real operations in the block.",
+        "",
+        "| kernel | launches |",
+        "|---|---|",
+    ]
+    for _, r in df.iterrows():
+        name = str(r["Kernel Name"])
+        if len(name) > 90:
+            name = name[:87] + "..."
+        lines.append(f"| `{name}` | {int(r['kernel_launch_count'])} |")
+    lines.append("")
+    lines.append(f"Total kernel launches in the forward pass: **{total}**")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # --- per-task directories under the SAME batch_dir
     task_root = (batch_dir / task_path.stem).resolve()
@@ -963,19 +995,19 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         print(f"[repair] Warning: Failed to update opt history after repair: {e}")
             else:
                 print("Optimizing start")
-                # ========== 确定要优化的kernel：应该是base_kernel（满足更新条件的基准kernel）==========
-                # 优化阶段应该一直基于base_kernel进行迭代，而不是current_kernel
-                # 因为current_kernel可能是上一轮生成的，但不如base_kernel好
-                # parent_kernel是base_kernel_temp，只有通过了ncu profiling才认为是真正的base_kernel
+                # ========== Determine the kernel to optimize: it should be base_kernel (the baseline kernel that met the update criteria) ==========
+                # The optimization phase should keep iterating on base_kernel rather than current_kernel,
+                # because current_kernel may have been generated in the previous round, yet is not as good as base_kernel.
+                # parent_kernel is base_kernel_temp; it only counts as a real base_kernel once ncu profiling passes
                 parent_kernel = base_kernel if base_kernel is not None else current_kernel
                 
-                # 确保test_kernel文件包含parent_kernel（best_kernel_temp）的代码，用于ncu profiling
+                # Make sure the test_kernel file holds the code of parent_kernel (best_kernel_temp) for ncu profiling
                 if parent_kernel and hasattr(parent_kernel, 'code'):
                     with open(test_kernel, "w", encoding="utf-8") as f:
                         f.write(parent_kernel.code)
                     print(f"[opt] Updated test_kernel with {'base_kernel (temp, needs profiling)' if base_kernel else 'current_kernel'} for ncu profiling")
                 
-                # 从test_kernel文件提取kernel名称（现在应该是base_kernel_temp）
+                # Extract kernel names from the test_kernel file (which should now be base_kernel_temp)
                 kernel_names = extract_cuda_kernel_names(test_kernel)
                 print("=============================================================")
                 print(f"Detected kernel names: {kernel_names} (from {'base_kernel (temp)' if base_kernel else 'current_kernel'})")
@@ -1090,7 +1122,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     # Only update best_kernel if the repaired kernel's score exceeds best_score
                     return repaired_kernel
                 
-                # ========== 预加载 kernel，确保编译缓存存在，避免 ncu 环境下重新编译 ==========
+                # ========== Preload the kernel to ensure the compile cache exists, avoiding a recompile under ncu ==========
                 precompile_timeout = False
                 precompile_error_detail = ""
                 
@@ -1104,7 +1136,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     p.start()
                     child_conn.close()
                     
-                    # 10 分钟超时
+                    # 10 minute timeout
                     p.join(timeout=600)
                     
                     if p.is_alive():
@@ -1118,7 +1150,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         precompile_timeout = True
                         precompile_error_detail = f"Preload process exceeded 10 minute timeout for kernel: {test_kernel}"
                     else:
-                        # 检查结果
+                        # Check the result
                         if parent_conn.poll():
                             status, msg = parent_conn.recv()
                             if status == "ok":
@@ -1176,15 +1208,15 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         if is_level3:
                             print(f"[ncu] Level3 task detected: using repeat={ncu_repeat}, timeout={ncu_timeout_seconds//60} minutes", flush=True)
                         
-                        # 明确指定要 profile 的 kernel 文件（parent_kernel 的代码）
-                        kernel_file_to_profile = test_kernel  # test_kernel 已经包含了 parent_kernel.code
+                        # Explicitly specify the kernel file to profile (parent_kernel's code)
+                        kernel_file_to_profile = test_kernel  # test_kernel already contains parent_kernel.code
                         print(f"[ncu] Profiling kernel from file: {kernel_file_to_profile} (parent_kernel: {parent_kernel.code_path if parent_kernel and hasattr(parent_kernel, 'code_path') else 'N/A'})", flush=True)
                         
                         csv_path_str = f"ncu_temp_{args.subproc_id}.csv"
                         csv_path_result = profile_bench(
                             bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
-                            kernel_names=kernel_names,  # 传递 kernel 名称，只监控指定的 kernel
-                            kernel_file=kernel_file_to_profile,  # 明确指定要 profile 的 kernel 文件
+                            kernel_names=kernel_names,  # pass the kernel names so only the specified kernel is monitored
+                            kernel_file=kernel_file_to_profile,  # explicitly specify the kernel file to profile
                             out_csv=csv_path_str,
                             device_idx=args.device,
                             repeat=ncu_repeat,
@@ -1233,6 +1265,25 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 kernel_names=kernel_names,
                                 out_csv=nsys_csv_path,
                             )
+
+                            # The filtered CSV above feeds machine_check's scalar
+                            # kernel_launch_count (calibrated on our own kernels).
+                            # Separately surface the FULL per-kernel launch table in
+                            # the prompt: NCU only profiles our kernels, so this is
+                            # the sole view of what else runs in the forward pass
+                            # (cuDNN layout transforms, conv engines, elementwise).
+                            try:
+                                full_df = load_nsys_stats(
+                                    rep_path=nsys_rep_path,
+                                    kernel_names=None,
+                                    out_csv=Path(f"nsys_full_{args.subproc_id}.csv"),
+                                )
+                                if full_df is not None and not full_df.empty:
+                                    metrics_block += _nsys_launch_table_block(full_df)
+                                    print(f"[nsys] Added full launch table "
+                                          f"({len(full_df)} kernels) to optimization prompt", flush=True)
+                            except Exception as full_err:
+                                print(f"[nsys] Warning: full launch table unavailable: {full_err}")
                             print(f"[nsys] Successfully extracted kernel launch counts", flush=True)
                             
                             # Save nsys results to profile folder
@@ -1547,8 +1598,8 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 print(f"[opt] Warning: Failed to update optimization history: {e}")
 
         # -------- update state + record curve --------
-        # current_kernel: 当前刚生成/修复完的kernel，用于记录和后续repair
-        # 修复时使用current_kernel记录正在修复的kernel，避免和best、test、parent混淆
+        # current_kernel: the kernel just generated/repaired, used for logging and any subsequent repair
+        # During repair, current_kernel tracks the kernel being repaired to avoid confusion with best, test, and parent
         current_kernel = ind
         runnable = bool(getattr(ind, "metrics", {}).get("runnable", False))
         this_score = ind.score if (ind.score is not None and runnable) else None

@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 
 # Make the vendored sol_execbench importable (regenerates inputs like the harness).
-_SOLBENCH_SRC = os.environ.get("SOLBENCH_SRC", '/home/elek/KernelMem/third_party/SOL-ExecBench/src')
+_SOLBENCH_SRC = os.environ.get("SOLBENCH_SRC", '/home/otter77/git_project/KernelMem/third_party/SOL-ExecBench/src')
 if _SOLBENCH_SRC and _SOLBENCH_SRC not in sys.path:
     sys.path.insert(0, _SOLBENCH_SRC)
 

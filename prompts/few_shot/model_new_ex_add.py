@@ -47,7 +47,7 @@ elementwise_add = load_inline(
     verbose=True,
     extra_cflags=[
         "-O3",                          # High optimization
-        "-std=c++17",                    # Use C++17 standard
+        "-std=c++20",                    # Use C++20 standard
         # "-U__CUDA_NO_HALF_OPERATORS__",  # Enable half precision operations
         # "-U__CUDA_NO_HALF_CONVERSIONS__", # Enable conversions for half precision
         # "-U__CUDA_NO_BFLOAT16_CONVERSIONS__", # Enable bfloat16 operations
@@ -55,6 +55,8 @@ elementwise_add = load_inline(
         ],
     extra_ldflags=[""],
     extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",  # nvcc 13.x miscompiles the ATen headers in C++17 mode
         "-gencode=arch=compute_80,code=sm_80",  # Correct CUDA target arch
         "--expt-relaxed-constexpr",  # CUDA specific flag
         "-lineinfo",  # Line information for debugging

@@ -1,0 +1,609 @@
+# ==========================================================================
+# ModelNew — fused VAE residual block (Conv3x3 -> GN -> SiLU -> Conv3x3 -> GN -> SiLU -> +x)
+#
+# GRANULARITY (STRICT, EXACTLY ONE): (D) FULL FORWARD REWRITE.
+#
+# Optimisation applied: fp16_mixed_precision_tensorcore
+#   * Conv mainloops and all intermediate activations stored in fp16
+#     (cuDNN half tensor-core engines, fp32 accumulate).
+#   * GroupNorm statistics, affine, SiLU and the residual add stay in fp32.
+#   * Residual is read from the ORIGINAL fp32 x (never a half copy).
+#   * DRAM traffic of the roofline-bound GN kernels halves (uint4 = 8 halves
+#     per 16B transaction instead of float4 = 4 floats).
+# ==========================================================================
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <vector>
+#include <cstdint>
+
+#define GN_BLOCK 256
+
+__inline__ __device__ float warp_reduce_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// ===========================================================================
+//                        FP32 PATH (fallback, unchanged)
+// ===========================================================================
+template <bool V4>
+__global__ void gn_stats_kernel(const float* __restrict__ x,
+                                float* __restrict__ part,
+                                int n, int seg) {
+    const int g = blockIdx.x;
+    const int s = blockIdx.y;
+
+    const int per   = (n + seg - 1) / seg;
+    const int start = s * per;
+    int end = start + per;
+    if (end > n) end = n;
+
+    float sum = 0.f, sq = 0.f;
+
+    if (V4) {
+        const float4* xp = reinterpret_cast<const float4*>(x) + (long long)g * (long long)n;
+        for (int i = start + (int)threadIdx.x; i < end; i += GN_BLOCK) {
+            float4 v = xp[i];
+            sum += v.x + v.y + v.z + v.w;
+            sq  += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    } else {
+        const float* xp = x + (long long)g * (long long)n;
+        for (int i = start + (int)threadIdx.x; i < end; i += GN_BLOCK) {
+            float v = xp[i];
+            sum += v;
+            sq  += v * v;
+        }
+    }
+
+    __shared__ float ssum[GN_BLOCK / 32];
+    __shared__ float ssq[GN_BLOCK / 32];
+
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+
+    sum = warp_reduce_sum(sum);
+    sq  = warp_reduce_sum(sq);
+    if (lane == 0) { ssum[wid] = sum; ssq[wid] = sq; }
+    __syncthreads();
+
+    if (wid == 0) {
+        const int nw = GN_BLOCK / 32;
+        float a = (lane < nw) ? ssum[lane] : 0.f;
+        float b = (lane < nw) ? ssq[lane]  : 0.f;
+        a = warp_reduce_sum(a);
+        b = warp_reduce_sum(b);
+        if (lane == 0) {
+            part[2 * (g * seg + s) + 0] = a;
+            part[2 * (g * seg + s) + 1] = b;
+        }
+    }
+}
+
+template <bool V4, bool RES>
+__global__ void gn_apply_kernel(const float* __restrict__ x,
+                                const float* __restrict__ part,
+                                const float* __restrict__ gamma,
+                                const float* __restrict__ beta,
+                                const float* __restrict__ res,
+                                float* __restrict__ out,
+                                int n, int seg, int hwv, int shift,
+                                int cpg, int G, float eps, float inv_n) {
+    const int g = blockIdx.x;
+
+    __shared__ float sstat[2];
+    __shared__ float sc[64];
+    __shared__ float sb[64];
+
+    if (threadIdx.x == 0) {
+        const float* p = part + 2 * (long long)g * (long long)seg;
+        float sum = 0.f, sq = 0.f;
+        for (int i = 0; i < seg; ++i) { sum += p[2 * i]; sq += p[2 * i + 1]; }
+        float mean = sum * inv_n;
+        float var  = sq * inv_n - mean * mean;
+        if (var < 0.f) var = 0.f;
+        sstat[0] = mean;
+        sstat[1] = rsqrtf(var + eps);
+    }
+    __syncthreads();
+
+    const float mean = sstat[0];
+    const float rstd = sstat[1];
+    const int   gi   = g % G;
+
+    if ((int)threadIdx.x < cpg) {
+        float gm = gamma[gi * cpg + (int)threadIdx.x];
+        float bt = beta[gi * cpg + (int)threadIdx.x];
+        float a  = gm * rstd;
+        sc[threadIdx.x] = a;
+        sb[threadIdx.x] = bt - mean * a;
+    }
+    __syncthreads();
+
+    const long long base   = (long long)g * (long long)n;
+    const int        stride = gridDim.y * GN_BLOCK;
+    int i0 = blockIdx.y * GN_BLOCK + (int)threadIdx.x;
+
+    if (V4) {
+        const float4* xp = reinterpret_cast<const float4*>(x) + base;
+        float4*       op = reinterpret_cast<float4*>(out) + base;
+        const float4* rp = RES ? (reinterpret_cast<const float4*>(res) + base) : nullptr;
+        for (int i = i0; i < n; i += stride) {
+            int ch = (shift >= 0) ? (i >> shift) : (i / hwv);
+            float a = sc[ch], b = sb[ch];
+            float4 v = xp[i];
+            float4 o;
+            float t;
+            t = fmaf(v.x, a, b); o.x = t / (1.f + expf(-t));
+            t = fmaf(v.y, a, b); o.y = t / (1.f + expf(-t));
+            t = fmaf(v.z, a, b); o.z = t / (1.f + expf(-t));
+            t = fmaf(v.w, a, b); o.w = t / (1.f + expf(-t));
+            if (RES) {
+                float4 r = rp[i];
+                o.x += r.x; o.y += r.y; o.z += r.z; o.w += r.w;
+            }
+            op[i] = o;
+        }
+    } else {
+        const float* xp = x + base;
+        float*       op = out + base;
+        const float* rp = RES ? (res + base) : nullptr;
+        for (int i = i0; i < n; i += stride) {
+            int ch = (shift >= 0) ? (i >> shift) : (i / hwv);
+            float t = fmaf(xp[i], sc[ch], sb[ch]);
+            float o = t / (1.f + expf(-t));
+            if (RES) o += rp[i];
+            op[i] = o;
+        }
+    }
+}
+
+// ===========================================================================
+//                    FP16 PATH (primary, 2x fewer bytes)
+//  Input activations are half, read as uint4 (8 halves = 16B per transaction).
+//  All statistics / affine / SiLU / residual math is fp32.
+// ===========================================================================
+__global__ void gn_stats_kernel_h(const __half* __restrict__ x,
+                                  float* __restrict__ part,
+                                  int n, int seg) {
+    const int g = blockIdx.x;
+    const int s = blockIdx.y;
+
+    const int per   = (n + seg - 1) / seg;
+    const int start = s * per;
+    int end = start + per;
+    if (end > n) end = n;
+
+    float sum = 0.f, sq = 0.f;
+
+    const uint4* xp = reinterpret_cast<const uint4*>(x) + (long long)g * (long long)n;
+    for (int i = start + (int)threadIdx.x; i < end; i += GN_BLOCK) {
+        uint4 v = xp[i];
+        const __half2* h = reinterpret_cast<const __half2*>(&v);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float2 f = __half22float2(h[j]);
+            sum += f.x + f.y;
+            sq   = fmaf(f.x, f.x, fmaf(f.y, f.y, sq));
+        }
+    }
+
+    __shared__ float ssum[GN_BLOCK / 32];
+    __shared__ float ssq[GN_BLOCK / 32];
+
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+
+    sum = warp_reduce_sum(sum);
+    sq  = warp_reduce_sum(sq);
+    if (lane == 0) { ssum[wid] = sum; ssq[wid] = sq; }
+    __syncthreads();
+
+    if (wid == 0) {
+        const int nw = GN_BLOCK / 32;
+        float a = (lane < nw) ? ssum[lane] : 0.f;
+        float b = (lane < nw) ? ssq[lane]  : 0.f;
+        a = warp_reduce_sum(a);
+        b = warp_reduce_sum(b);
+        if (lane == 0) {
+            part[2 * (g * seg + s) + 0] = a;
+            part[2 * (g * seg + s) + 1] = b;
+        }
+    }
+}
+
+template <bool OUT_HALF, bool RES>
+__global__ void gn_apply_kernel_h(const __half* __restrict__ x,
+                                  const float* __restrict__ part,
+                                  const float* __restrict__ gamma,
+                                  const float* __restrict__ beta,
+                                  const float* __restrict__ res,
+                                  void* __restrict__ out,
+                                  int n, int seg, int hwv, int shift,
+                                  int cpg, int G, float eps, float inv_n) {
+    const int g = blockIdx.x;
+
+    __shared__ float sstat[2];
+    __shared__ float sc[64];
+    __shared__ float sb[64];
+
+    if (threadIdx.x == 0) {
+        const float* p = part + 2 * (long long)g * (long long)seg;
+        float sum = 0.f, sq = 0.f;
+        for (int i = 0; i < seg; ++i) { sum += p[2 * i]; sq += p[2 * i + 1]; }
+        float mean = sum * inv_n;
+        float var  = sq * inv_n - mean * mean;
+        if (var < 0.f) var = 0.f;
+        sstat[0] = mean;
+        sstat[1] = rsqrtf(var + eps);
+    }
+    __syncthreads();
+
+    const float mean = sstat[0];
+    const float rstd = sstat[1];
+    const int   gi   = g % G;
+
+    if ((int)threadIdx.x < cpg) {
+        float gm = gamma[gi * cpg + (int)threadIdx.x];
+        float bt = beta[gi * cpg + (int)threadIdx.x];
+        float a  = gm * rstd;
+        sc[threadIdx.x] = a;
+        sb[threadIdx.x] = bt - mean * a;
+    }
+    __syncthreads();
+
+    const long long base   = (long long)g * (long long)n;
+    const int       stride = gridDim.y * GN_BLOCK;
+    int i0 = blockIdx.y * GN_BLOCK + (int)threadIdx.x;
+
+    const uint4* xp = reinterpret_cast<const uint4*>(x) + base;
+
+    for (int i = i0; i < n; i += stride) {
+        const int ch = (shift >= 0) ? (i >> shift) : (i / hwv);
+        const float a = sc[ch], b = sb[ch];
+
+        uint4 v = xp[i];
+        const __half2* h = reinterpret_cast<const __half2*>(&v);
+
+        float o[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float2 f = __half22float2(h[j]);
+            float t0 = fmaf(f.x, a, b);
+            float t1 = fmaf(f.y, a, b);
+            o[2 * j + 0] = t0 / (1.f + expf(-t0));
+            o[2 * j + 1] = t1 / (1.f + expf(-t1));
+        }
+
+        if (RES) {
+            const float4* rp = reinterpret_cast<const float4*>(res) + 2 * (base + (long long)i);
+            float4 r0 = rp[0];
+            float4 r1 = rp[1];
+            o[0] += r0.x; o[1] += r0.y; o[2] += r0.z; o[3] += r0.w;
+            o[4] += r1.x; o[5] += r1.y; o[6] += r1.z; o[7] += r1.w;
+        }
+
+        if (OUT_HALF) {
+            uint4 ov;
+            __half2* oh = reinterpret_cast<__half2*>(&ov);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                oh[j] = __floats2half2_rn(o[2 * j + 0], o[2 * j + 1]);
+            reinterpret_cast<uint4*>(out)[base + (long long)i] = ov;
+        } else {
+            float4* op = reinterpret_cast<float4*>(out) + 2 * (base + (long long)i);
+            float4 f0; f0.x = o[0]; f0.y = o[1]; f0.z = o[2]; f0.w = o[3];
+            float4 f1; f1.x = o[4]; f1.y = o[5]; f1.z = o[6]; f1.w = o[7];
+            op[0] = f0;
+            op[1] = f1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// host launcher : fp32 activations (fallback path)
+// ---------------------------------------------------------------------------
+static void gn_silu_launch(const at::Tensor& in,
+                           const at::Tensor& gamma,
+                           const at::Tensor& beta,
+                           const float* res_ptr,
+                           at::Tensor& out,
+                           double eps) {
+    const int64_t B = in.size(0), C = in.size(1), H = in.size(2), W = in.size(3);
+    const int G = 32;
+    TORCH_CHECK(C % G == 0, "channels must be divisible by 32");
+    const int64_t cpg = C / G;
+    TORCH_CHECK(cpg <= 64, "channels per group must be <= 64");
+    const int64_t HW = H * W;
+    const int64_t gsize = cpg * HW;
+    TORCH_CHECK(gsize > 0, "empty group");
+
+    const bool v4 = (HW % 4 == 0);
+    const int n   = (int)(v4 ? (gsize / 4) : gsize);
+    const int hwv = (int)(v4 ? (HW / 4) : HW);
+
+    int shift = -1;
+    for (int s = 0; s < 31; ++s) if ((1 << s) == hwv) { shift = s; break; }
+
+    int seg = (int)((n + 2047) / 2048);
+    if (seg < 1) seg = 1;
+    if (seg > 32) seg = 32;
+
+    const int ngroups = (int)(B * G);
+    auto part = at::empty({(int64_t)ngroups * seg * 2}, in.options());
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    dim3 grid_s(ngroups, seg);
+    if (v4) {
+        gn_stats_kernel<true><<<grid_s, GN_BLOCK, 0, stream>>>(
+            in.data_ptr<float>(), part.data_ptr<float>(), n, seg);
+    } else {
+        gn_stats_kernel<false><<<grid_s, GN_BLOCK, 0, stream>>>(
+            in.data_ptr<float>(), part.data_ptr<float>(), n, seg);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    int by = (n + GN_BLOCK * 8 - 1) / (GN_BLOCK * 8);
+    if (by < 1) by = 1;
+    if (by > 256) by = 256;
+    dim3 grid_a(ngroups, by);
+
+    const float inv_n = 1.0f / (float)gsize;
+    const float epsf  = (float)eps;
+
+    if (v4) {
+        if (res_ptr) {
+            gn_apply_kernel<true, true><<<grid_a, GN_BLOCK, 0, stream>>>(
+                in.data_ptr<float>(), part.data_ptr<float>(),
+                gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                res_ptr, out.data_ptr<float>(),
+                n, seg, hwv, shift, (int)cpg, G, epsf, inv_n);
+        } else {
+            gn_apply_kernel<true, false><<<grid_a, GN_BLOCK, 0, stream>>>(
+                in.data_ptr<float>(), part.data_ptr<float>(),
+                gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                nullptr, out.data_ptr<float>(),
+                n, seg, hwv, shift, (int)cpg, G, epsf, inv_n);
+        }
+    } else {
+        if (res_ptr) {
+            gn_apply_kernel<false, true><<<grid_a, GN_BLOCK, 0, stream>>>(
+                in.data_ptr<float>(), part.data_ptr<float>(),
+                gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                res_ptr, out.data_ptr<float>(),
+                n, seg, hwv, shift, (int)cpg, G, epsf, inv_n);
+        } else {
+            gn_apply_kernel<false, false><<<grid_a, GN_BLOCK, 0, stream>>>(
+                in.data_ptr<float>(), part.data_ptr<float>(),
+                gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                nullptr, out.data_ptr<float>(),
+                n, seg, hwv, shift, (int)cpg, G, epsf, inv_n);
+        }
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// host launcher : fp16 activations (primary path)
+//   in  : half (B,C,H,W) contiguous
+//   out : half buffer (out_half=true) or fp32 buffer (out_half=false)
+//   res : optional fp32 residual (read as two float4 per 8 elements)
+// ---------------------------------------------------------------------------
+static void gn_silu_launch_half(const at::Tensor& in,
+                                const at::Tensor& gamma,
+                                const at::Tensor& beta,
+                                const float* res_ptr,
+                                void* out_ptr,
+                                bool out_half,
+                                double eps) {
+    const int64_t B = in.size(0), C = in.size(1), H = in.size(2), W = in.size(3);
+    const int G = 32;
+    TORCH_CHECK(C % G == 0, "channels must be divisible by 32");
+    const int64_t cpg = C / G;
+    TORCH_CHECK(cpg <= 64, "channels per group must be <= 64");
+    const int64_t HW = H * W;
+    TORCH_CHECK(HW % 8 == 0, "HW must be divisible by 8 for the fp16 path");
+    const int64_t gsize = cpg * HW;
+    TORCH_CHECK(gsize > 0, "empty group");
+
+    const int n   = (int)(gsize / 8);   // uint4 (8 halves) elements per group
+    const int hwv = (int)(HW / 8);
+
+    int shift = -1;
+    for (int s = 0; s < 31; ++s) if ((1 << s) == hwv) { shift = s; break; }
+
+    const __half* xptr = reinterpret_cast<const __half*>(in.data_ptr<at::Half>());
+    TORCH_CHECK(((uintptr_t)xptr % 16) == 0, "half input must be 16B aligned");
+    TORCH_CHECK(((uintptr_t)out_ptr % 16) == 0, "output must be 16B aligned");
+    if (res_ptr) TORCH_CHECK(((uintptr_t)res_ptr % 16) == 0, "residual must be 16B aligned");
+
+    int seg = (n + 1023) / 1024;
+    if (seg < 1) seg = 1;
+    if (seg > 32) seg = 32;
+
+    const int ngroups = (int)(B * G);
+    auto part = at::empty({(int64_t)ngroups * seg * 2},
+                          in.options().dtype(at::kFloat));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    dim3 grid_s(ngroups, seg);
+    gn_stats_kernel_h<<<grid_s, GN_BLOCK, 0, stream>>>(
+        xptr, part.data_ptr<float>(), n, seg);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    int by = (n + GN_BLOCK * 4 - 1) / (GN_BLOCK * 4);
+    if (by < 1) by = 1;
+    if (by > 256) by = 256;
+    dim3 grid_a(ngroups, by);
+
+    const float inv_n = 1.0f / (float)gsize;   // element count unchanged
+    const float epsf  = (float)eps;
+
+    if (out_half) {
+        gn_apply_kernel_h<true, false><<<grid_a, GN_BLOCK, 0, stream>>>(
+            xptr, part.data_ptr<float>(),
+            gamma.data_ptr<float>(), beta.data_ptr<float>(),
+            nullptr, out_ptr,
+            n, seg, hwv, shift, (int)cpg, G, epsf, inv_n);
+    } else {
+        if (res_ptr) {
+            gn_apply_kernel_h<false, true><<<grid_a, GN_BLOCK, 0, stream>>>(
+                xptr, part.data_ptr<float>(),
+                gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                res_ptr, out_ptr,
+                n, seg, hwv, shift, (int)cpg, G, epsf, inv_n);
+        } else {
+            gn_apply_kernel_h<false, false><<<grid_a, GN_BLOCK, 0, stream>>>(
+                xptr, part.data_ptr<float>(),
+                gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                nullptr, out_ptr,
+                n, seg, hwv, shift, (int)cpg, G, epsf, inv_n);
+        }
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+torch::Tensor fused_resblock(torch::Tensor x,
+                             torch::Tensor conv1_weight,
+                             torch::Tensor norm1_weight,
+                             torch::Tensor norm1_bias,
+                             torch::Tensor conv2_weight,
+                             torch::Tensor norm2_weight,
+                             torch::Tensor norm2_bias,
+                             double eps) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D (B,C,H,W)");
+
+    at::Tensor xc  = x.is_contiguous() ? x : x.contiguous();
+    at::Tensor w1c = conv1_weight.is_contiguous() ? conv1_weight : conv1_weight.contiguous();
+    at::Tensor w2c = conv2_weight.is_contiguous() ? conv2_weight : conv2_weight.contiguous();
+    at::Tensor g1  = norm1_weight.is_contiguous() ? norm1_weight : norm1_weight.contiguous();
+    at::Tensor b1  = norm1_bias.is_contiguous()   ? norm1_bias   : norm1_bias.contiguous();
+    at::Tensor g2  = norm2_weight.is_contiguous() ? norm2_weight : norm2_weight.contiguous();
+    at::Tensor b2  = norm2_bias.is_contiguous()   ? norm2_bias   : norm2_bias.contiguous();
+
+    std::vector<int64_t> ones{1, 1};
+    std::vector<int64_t> pads{1, 1};
+
+    const int64_t HW = xc.size(2) * xc.size(3);
+    const bool use_fp16 = (xc.scalar_type() == at::kFloat) && (HW % 8 == 0);
+
+    // accuracy knob (plan item 9): set to false to keep conv1 in fp32
+    constexpr bool FP16_CONV1 = true;
+
+    if (!use_fp16) {
+        // ---------------- fp32 fallback path (original) ----------------
+        TORCH_CHECK(xc.scalar_type() == at::kFloat, "float32 only");
+        at::Tensor y = at::conv2d(xc, w1c, {}, ones, pads, ones, 1);
+        if (!y.is_contiguous()) y = y.contiguous();
+        gn_silu_launch(y, g1, b1, nullptr, y, eps);
+
+        at::Tensor z = at::conv2d(y, w2c, {}, ones, pads, ones, 1);
+        if (!z.is_contiguous()) z = z.contiguous();
+
+        at::Tensor out = at::empty_like(xc);
+        gn_silu_launch(z, g2, b2, xc.data_ptr<float>(), out, eps);
+        return out;
+    }
+
+    // ---------------- fp16 mixed-precision path ----------------
+    at::Tensor w1h = w1c.to(at::kHalf);
+    at::Tensor w2h = w2c.to(at::kHalf);
+
+    // conv1 : half in -> half out (cuDNN fp32 accumulate / tensor cores)
+    at::Tensor y;
+    if (FP16_CONV1) {
+        at::Tensor xh = xc.to(at::kHalf);
+        y = at::conv2d(xh, w1h, {}, ones, pads, ones, 1);
+    } else {
+        y = at::conv2d(xc, w1c, {}, ones, pads, ones, 1).to(at::kHalf);
+    }
+    if (!y.is_contiguous()) y = y.contiguous();
+
+    // GN + SiLU, half out, in-place into our own buffer y
+    gn_silu_launch_half(y, g1, b1, nullptr,
+                        static_cast<void*>(y.data_ptr<at::Half>()),
+                        /*out_half=*/true, eps);
+
+    // conv2 : half in -> half out
+    at::Tensor z = at::conv2d(y, w2h, {}, ones, pads, ones, 1);
+    if (!z.is_contiguous()) z = z.contiguous();
+
+    // GN + SiLU + fp32 residual add, fp32 out
+    at::Tensor out = at::empty_like(xc);
+    gn_silu_launch_half(z, g2, b2, xc.data_ptr<float>(),
+                        static_cast<void*>(out.data_ptr<float>()),
+                        /*out_half=*/false, eps);
+
+    return out;
+}
+"""
+
+_CPP_SRC = r"""
+torch::Tensor fused_resblock(torch::Tensor x,
+                             torch::Tensor conv1_weight,
+                             torch::Tensor norm1_weight,
+                             torch::Tensor norm1_bias,
+                             torch::Tensor conv2_weight,
+                             torch::Tensor norm2_weight,
+                             torch::Tensor norm2_bias,
+                             double eps);
+"""
+
+_ext = load_inline(
+    name="vae_resblock_fused_fp16_v2",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["fused_resblock"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+    ],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """Fully-rewritten forward (granularity D) with fp16 mixed-precision intermediates."""
+
+    def __init__(self):
+        super().__init__()
+        self._ext = _ext
+
+    @torch.no_grad()
+    def forward(self,
+                x,
+                conv1_weight,
+                norm1_weight,
+                norm1_bias,
+                conv2_weight,
+                norm2_weight,
+                norm2_bias,
+                eps):
+        if torch.is_tensor(eps):
+            eps_f = float(eps.item())
+        else:
+            eps_f = float(eps)
+        return self._ext.fused_resblock(
+            x, conv1_weight, norm1_weight, norm1_bias,
+            conv2_weight, norm2_weight, norm2_bias, eps_f,
+        )

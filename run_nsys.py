@@ -61,7 +61,7 @@ def profile_bench(
     bench_py: str = "bench_ref_inputs.py",
     kernel_names: Optional[List[str]] = None,
     kernel_file: Optional[Union[str, Path]] = None,
-    conda_bin: str = "/root/miniconda3/envs/CudaForge/bin",
+    conda_bin: str = str(Path(sys.executable).parent),
     out_rep: Union[str, Path] = "nsys_temp.nsys-rep",
     device_idx: Optional[int] = None,
     timeout: int = 300,  # 5 minutes default timeout
@@ -91,11 +91,19 @@ def profile_bench(
     env = os.environ.copy()
     env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
     
-    # Use Python from conda_bin if available, otherwise use sys.executable
-    # Try python3 first, then python
-    if Path(f"{conda_bin}/python3").exists():
+    # Use Python from conda_bin if available, otherwise use sys.executable.
+    # Path.exists() re-raises PermissionError (it only swallows ENOENT/ENOTDIR/
+    # EBADF/ELOOP), so a conda_bin under an unreadable directory such as /root
+    # would abort profiling instead of falling back. Probe defensively.
+    def _usable(p: str) -> bool:
+        try:
+            return os.access(p, os.X_OK)
+        except OSError:
+            return False
+
+    if _usable(f"{conda_bin}/python3"):
         python_bin = f"{conda_bin}/python3"
-    elif Path(f"{conda_bin}/python").exists():
+    elif _usable(f"{conda_bin}/python"):
         python_bin = f"{conda_bin}/python"
     else:
         python_bin = sys.executable
@@ -104,7 +112,10 @@ def profile_bench(
     cmd = [
         nsys_bin,
         "profile",
-        "-t", "cuda,nvtx,osrt",
+        # 'osrt' (OS-runtime syscall tracing) hangs indefinitely on this stack
+        # (>150s vs 3s without it) and is unused — launch counts come from the
+        # CUDA trace alone.
+        "-t", "cuda,nvtx",
         "--sample=none",
         "--force-overwrite=true",
         "-o", str(rep_path.with_suffix("")),  # nsys adds .nsys-rep automatically

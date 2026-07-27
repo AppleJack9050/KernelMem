@@ -1,0 +1,616 @@
+# ==========================================================================
+# ModelNew — SOL problem 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# HEADER / PLAN
+# 1) Chosen granularity: (B) replace several ops + schedule multiple kernels.
+#
+# 2) Ops replaced by custom CUDA kernels:
+#      - F.group_norm  (both occurrences)      -> persistent single-pass kernel
+#      - F.silu        (both occurrences)      -> fused into the same kernel
+#      - residual add  (out + residual)        -> fused into the same kernel
+#
+# 3) Fusion map:
+#      FAST PATH (default): ONE cooperative persistent kernel
+#         gn_fused_persistent_kernel<RESID>
+#           Phase A: load slice ONCE into registers (float4 reg[8]) -> sum/sumsq
+#           grid barrier
+#           Phase B: mean/rstd from registers -> affine + SiLU (+residual), float4 stores
+#         => removes the redundant full-tensor DRAM re-read (GN1 192->128MiB,
+#            GN2 256->192MiB) and deletes the stats/finalize launches.
+#      FALLBACK: original 3-kernel path (stats -> finalize -> apply).
+#
+# 4) What remains in PyTorch and why:
+#      - F.conv2d (3x3, C=256->256, NCHW fp32): cuDNN, already at/near SOL and
+#        keeps bit-identical convolution numerics w.r.t. the reference.
+# ==========================================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <algorithm>
+#include <unordered_map>
+
+#define CDIV(a, b) (((a) + (b) - 1) / (b))
+
+#define GN_BLOCK 256
+#define GN_VPT   8                          // float4 per thread
+#define GN_EPB   (GN_BLOCK * GN_VPT * 4)    // 8192 floats per block
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Lock-free grid-wide barrier (co-residency guaranteed by cooperative launch).
+// bar[0] = arrival counter, bar[1] = generation.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void grid_barrier(unsigned int* __restrict__ bar,
+                                             unsigned int nblocks,
+                                             unsigned int& gen_local) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        unsigned int old = atomicAdd(&bar[0], 1u);
+        if (old == nblocks - 1u) {
+            atomicExch(&bar[0], 0u);
+            __threadfence();
+            atomicAdd(&bar[1], 1u);
+        } else {
+            volatile unsigned int* g = (volatile unsigned int*)&bar[1];
+            while (*g == gen_local) {
+                __nanosleep(64);
+            }
+        }
+    }
+    __syncthreads();
+    gen_local += 1u;
+}
+
+// ---------------------------------------------------------------------------
+// FAST PATH: persistent single-pass GroupNorm + SiLU (+ residual)
+//   grid = gpr * K blocks (all co-resident), block = 256
+// ---------------------------------------------------------------------------
+template <bool RESID>
+__global__ __launch_bounds__(GN_BLOCK, 4)
+void gn_fused_persistent_kernel(const float* __restrict__ y,
+                                const float* __restrict__ res,
+                                const float* __restrict__ gamma,
+                                const float* __restrict__ beta,
+                                float* __restrict__ out,
+                                float* __restrict__ acc,
+                                unsigned int* __restrict__ bar,
+                                int C, long long HW, long long group_size,
+                                int K, int NG, int nRounds,
+                                float inv_n, float eps) {
+    const int tid = threadIdx.x;
+    const int gLocal = blockIdx.x / K;
+    const int sub = blockIdx.x - gLocal * K;
+    const int gpr = gridDim.x / K;
+
+    unsigned int gen_local = *(volatile unsigned int*)&bar[1];
+
+    __shared__ float sred[64];
+
+    float4 reg[GN_VPT];
+
+    for (int r = 0; r < nRounds; ++r) {
+        const int g = gLocal + r * gpr;
+        long long base = 0;
+
+        // ---------------- Phase A : load once into registers + reduce -------
+        if (g < NG) {
+            base = (long long)g * group_size + (long long)sub * (long long)GN_EPB;
+            const float4* __restrict__ p4 = reinterpret_cast<const float4*>(y + base);
+
+            float s = 0.f, q = 0.f;
+#pragma unroll
+            for (int i = 0; i < GN_VPT; ++i) {
+                float4 v = p4[(long long)i * GN_BLOCK + tid];
+                reg[i] = v;
+                s += v.x + v.y + v.z + v.w;
+                q += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            }
+
+            s = warp_sum(s);
+            q = warp_sum(q);
+            const int lane = tid & 31;
+            const int wid = tid >> 5;
+            if (lane == 0) { sred[wid] = s; sred[32 + wid] = q; }
+            __syncthreads();
+            if (wid == 0) {
+                const int nw = GN_BLOCK >> 5;
+                float a = (lane < nw) ? sred[lane] : 0.f;
+                float b = (lane < nw) ? sred[32 + lane] : 0.f;
+                a = warp_sum(a);
+                b = warp_sum(b);
+                if (lane == 0) {
+                    atomicAdd(&acc[2 * g + 0], a);
+                    atomicAdd(&acc[2 * g + 1], b);
+                }
+            }
+        }
+
+        grid_barrier(bar, gridDim.x, gen_local);
+
+        // ---------------- Phase B : stats -> affine + SiLU (+resid) ---------
+        if (g < NG) {
+            const float S = __ldcg(&acc[2 * g + 0]);
+            const float Q = __ldcg(&acc[2 * g + 1]);
+            const float mean = S * inv_n;
+            float var = Q * inv_n - mean * mean;
+            var = fmaxf(var, 0.f);
+            const float rstd = rsqrtf(var + eps);
+
+            const int c = (int)((base / HW) % (long long)C);
+            const float sc = gamma[c] * rstd;
+            const float bi = beta[c] - mean * sc;
+
+            float4* __restrict__ o4 = reinterpret_cast<float4*>(out + base);
+            const float4* __restrict__ r4 =
+                RESID ? reinterpret_cast<const float4*>(res + base) : nullptr;
+
+#pragma unroll
+            for (int i = 0; i < GN_VPT; ++i) {
+                const long long idx = (long long)i * GN_BLOCK + tid;
+                float4 v = reg[i];
+                float a0 = v.x * sc + bi;
+                float a1 = v.y * sc + bi;
+                float a2 = v.z * sc + bi;
+                float a3 = v.w * sc + bi;
+                a0 = a0 / (1.f + expf(-a0));
+                a1 = a1 / (1.f + expf(-a1));
+                a2 = a2 / (1.f + expf(-a2));
+                a3 = a3 / (1.f + expf(-a3));
+                if (RESID) {
+                    float4 rr = r4[idx];
+                    a0 += rr.x; a1 += rr.y; a2 += rr.z; a3 += rr.w;
+                }
+                float4 o;
+                o.x = a0; o.y = a1; o.z = a2; o.w = a3;
+                o4[idx] = o;
+            }
+        }
+    }
+
+    // leave the persistent accumulator zeroed for the next launch
+    grid_barrier(bar, gridDim.x, gen_local);
+    for (long long i = (long long)blockIdx.x * blockDim.x + tid;
+         i < (long long)NG * 2; i += (long long)gridDim.x * blockDim.x) {
+        acc[i] = 0.f;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FALLBACK PATH (original 3 kernels)
+// ---------------------------------------------------------------------------
+template <bool VEC>
+__global__ void gn_stats_partial_kernel(const float* __restrict__ y,
+                                        float* __restrict__ partial,
+                                        long long group_size,
+                                        int splits) {
+    const long long g = blockIdx.y;
+    const int s = blockIdx.x;
+    const float* __restrict__ base = y + g * group_size;
+
+    float sum = 0.f, sq = 0.f;
+
+    if (VEC) {
+        const long long nvec = group_size >> 2;
+        const long long start = ((long long)s * nvec) / splits;
+        const long long end = ((long long)(s + 1) * nvec) / splits;
+        const float4* __restrict__ b4 = reinterpret_cast<const float4*>(base);
+        for (long long i = start + threadIdx.x; i < end; i += blockDim.x) {
+            float4 v = b4[i];
+            sum += v.x + v.y + v.z + v.w;
+            sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    } else {
+        const long long start = ((long long)s * group_size) / splits;
+        const long long end = ((long long)(s + 1) * group_size) / splits;
+        for (long long i = start + threadIdx.x; i < end; i += blockDim.x) {
+            float v = base[i];
+            sum += v;
+            sq += v * v;
+        }
+    }
+
+    __shared__ float ws[32];
+    __shared__ float wq[32];
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+
+    sum = warp_sum(sum);
+    sq = warp_sum(sq);
+    if (lane == 0) { ws[wid] = sum; wq[wid] = sq; }
+    __syncthreads();
+
+    if (wid == 0) {
+        const int nw = blockDim.x >> 5;
+        float a = (lane < nw) ? ws[lane] : 0.f;
+        float b = (lane < nw) ? wq[lane] : 0.f;
+        a = warp_sum(a);
+        b = warp_sum(b);
+        if (lane == 0) {
+            partial[(g * splits + s) * 2 + 0] = a;
+            partial[(g * splits + s) * 2 + 1] = b;
+        }
+    }
+}
+
+__global__ void gn_finalize_kernel(const float* __restrict__ partial,
+                                   float* __restrict__ ms,
+                                   int splits, float inv_n, float eps) {
+    const int g = blockIdx.x;
+    float s = 0.f, q = 0.f;
+    for (int i = threadIdx.x; i < splits; i += 32) {
+        s += partial[(long long)(g * splits + i) * 2 + 0];
+        q += partial[(long long)(g * splits + i) * 2 + 1];
+    }
+    s = warp_sum(s);
+    q = warp_sum(q);
+    if (threadIdx.x == 0) {
+        float m = s * inv_n;
+        float var = q * inv_n - m * m;
+        var = fmaxf(var, 0.f);
+        ms[2 * g + 0] = m;
+        ms[2 * g + 1] = rsqrtf(var + eps);
+    }
+}
+
+template <bool VEC, bool RESID>
+__global__ void gn_silu_apply_kernel(const float* __restrict__ y,
+                                     const float* __restrict__ res,
+                                     const float* __restrict__ gamma,
+                                     const float* __restrict__ beta,
+                                     const float* __restrict__ ms,
+                                     float* __restrict__ out,
+                                     int C, int cpg, int G, long long HW) {
+    const int nc = blockIdx.y;
+    const int c = nc % C;
+    const int n = nc / C;
+    const int gid = n * G + (c / cpg);
+
+    const float mean = ms[2 * gid + 0];
+    const float rstd = ms[2 * gid + 1];
+    const float gam = gamma[c];
+    const float bet = beta[c];
+    const float scale = gam * rstd;
+    const float bias = bet - mean * scale;
+
+    const long long off = (long long)nc * HW;
+
+    if (VEC) {
+        const long long nvec = HW >> 2;
+        const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < nvec) {
+            const float4* __restrict__ y4 = reinterpret_cast<const float4*>(y + off);
+            float4* __restrict__ o4 = reinterpret_cast<float4*>(out + off);
+            float4 v = y4[idx];
+            float a0 = v.x * scale + bias;
+            float a1 = v.y * scale + bias;
+            float a2 = v.z * scale + bias;
+            float a3 = v.w * scale + bias;
+            a0 = a0 / (1.f + expf(-a0));
+            a1 = a1 / (1.f + expf(-a1));
+            a2 = a2 / (1.f + expf(-a2));
+            a3 = a3 / (1.f + expf(-a3));
+            if (RESID) {
+                const float4* __restrict__ r4 = reinterpret_cast<const float4*>(res + off);
+                float4 r = r4[idx];
+                a0 += r.x; a1 += r.y; a2 += r.z; a3 += r.w;
+            }
+            float4 o;
+            o.x = a0; o.y = a1; o.z = a2; o.w = a3;
+            o4[idx] = o;
+        }
+    } else {
+        const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < HW) {
+            float a = y[off + idx] * scale + bias;
+            a = a / (1.f + expf(-a));
+            if (RESID) a += res[off + idx];
+            out[off + idx] = a;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent (cached) scratch buffers for the fused path
+// ---------------------------------------------------------------------------
+static std::unordered_map<int, torch::Tensor>& acc_cache() {
+    static std::unordered_map<int, torch::Tensor> m;
+    return m;
+}
+static std::unordered_map<int, torch::Tensor>& bar_cache() {
+    static std::unordered_map<int, torch::Tensor> m;
+    return m;
+}
+
+template <bool RESID>
+static bool run_fused(const float* y, const float* res, const float* gam, const float* bet,
+                      float* out, int64_t N, int64_t C, int64_t HW, int64_t G,
+                      double eps, cudaStream_t stream, const torch::TensorOptions& fopts,
+                      int dev) {
+    const int64_t cpg = C / G;
+    const int64_t group_size = cpg * HW;
+    if (HW % GN_EPB != 0) return false;
+    if (group_size % GN_EPB != 0) return false;
+
+    const int64_t NG = N * G;
+    const int64_t K64 = group_size / GN_EPB;
+    if (K64 < 1 || K64 > 4096) return false;
+
+    static int coop_supported = -1;
+    static int num_sm = 0;
+    if (coop_supported < 0) {
+        int cs = 0, nsm = 0;
+        if (cudaDeviceGetAttribute(&cs, cudaDevAttrCooperativeLaunch, dev) != cudaSuccess) cs = 0;
+        if (cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) nsm = 0;
+        num_sm = nsm;
+        coop_supported = cs;
+    }
+    if (coop_supported <= 0 || num_sm <= 0) return false;
+
+    static int blocksPerSM = -1;
+    if (blocksPerSM < 0) {
+        int b = 0;
+        cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &b, (const void*)gn_fused_persistent_kernel<RESID>, GN_BLOCK, 0);
+        blocksPerSM = (e == cudaSuccess) ? b : 0;
+    }
+    if (blocksPerSM <= 0) return false;
+
+    const int64_t maxBlocks = (int64_t)blocksPerSM * (int64_t)num_sm;
+    const int64_t totalUnits = NG * K64;
+    int64_t gridBlocks = std::min(maxBlocks, totalUnits);
+    gridBlocks = (gridBlocks / K64) * K64;
+    if (gridBlocks < K64) return false;                 // cannot host one full group
+
+    int nRounds = (int)CDIV(totalUnits, gridBlocks);
+    int64_t gpr = CDIV(NG, (int64_t)nRounds);           // balance rounds
+    gridBlocks = gpr * K64;
+    if (gridBlocks > maxBlocks || gridBlocks <= 0) return false;
+
+    // persistent scratch (acc is left all-zero by the kernel)
+    torch::Tensor& accT = acc_cache()[dev];
+    if (!accT.defined() || accT.numel() < NG * 2) {
+        accT = torch::zeros({NG * 2}, fopts);
+    }
+    torch::Tensor& barT = bar_cache()[dev];
+    if (!barT.defined()) {
+        barT = torch::zeros({2}, fopts.dtype(torch::kInt32));
+    }
+
+    const float* p_y = y;
+    const float* p_res = RESID ? res : y;
+    const float* p_gam = gam;
+    const float* p_bet = bet;
+    float* p_out = out;
+    float* p_acc = accT.data_ptr<float>();
+    unsigned int* p_bar = reinterpret_cast<unsigned int*>(barT.data_ptr<int>());
+    int i_C = (int)C;
+    long long l_HW = (long long)HW;
+    long long l_gs = (long long)group_size;
+    int i_K = (int)K64;
+    int i_NG = (int)NG;
+    int i_R = nRounds;
+    float f_invn = (float)(1.0 / (double)group_size);
+    float f_eps = (float)eps;
+
+    void* args[] = {(void*)&p_y, (void*)&p_res, (void*)&p_gam, (void*)&p_bet,
+                    (void*)&p_out, (void*)&p_acc, (void*)&p_bar,
+                    (void*)&i_C, (void*)&l_HW, (void*)&l_gs,
+                    (void*)&i_K, (void*)&i_NG, (void*)&i_R,
+                    (void*)&f_invn, (void*)&f_eps};
+
+    dim3 grid((unsigned)gridBlocks);
+    dim3 block(GN_BLOCK);
+    cudaError_t err = cudaLaunchCooperativeKernel(
+        (const void*)gn_fused_persistent_kernel<RESID>, grid, block, args, 0, stream);
+    if (err != cudaSuccess) {
+        cudaGetLastError();  // clear
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Host launcher
+// ---------------------------------------------------------------------------
+static torch::Tensor gn_silu_impl(const torch::Tensor& y,
+                                  const torch::Tensor& gamma,
+                                  const torch::Tensor& beta,
+                                  const torch::Tensor* res,
+                                  int64_t num_groups,
+                                  double eps) {
+    TORCH_CHECK(y.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(y.scalar_type() == at::kFloat, "input must be float32");
+    TORCH_CHECK(y.dim() == 4, "input must be 4D (N,C,H,W)");
+    TORCH_CHECK(y.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(gamma.is_cuda() && beta.is_cuda(), "affine params must be CUDA");
+    TORCH_CHECK(gamma.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat,
+                "affine params must be float32");
+
+    const int64_t N = y.size(0);
+    const int64_t C = y.size(1);
+    const int64_t HW = y.size(2) * y.size(3);
+    TORCH_CHECK(C % num_groups == 0, "C must be divisible by num_groups");
+    const int64_t cpg = C / num_groups;
+    const int64_t group_size = cpg * HW;
+    const int64_t NG = N * num_groups;
+
+    if (res != nullptr) {
+        TORCH_CHECK(res->is_cuda() && res->scalar_type() == at::kFloat, "residual dtype/device");
+        TORCH_CHECK(res->is_contiguous(), "residual must be contiguous");
+        TORCH_CHECK(res->numel() == y.numel(), "residual numel mismatch");
+    }
+
+    auto out = torch::empty_like(y);
+    auto opts = y.options();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int dev = (int)y.device().index();
+
+    // ---------------- FAST PATH: persistent single-pass ---------------------
+    bool ok;
+    if (res != nullptr) {
+        ok = run_fused<true>(y.data_ptr<float>(), res->data_ptr<float>(),
+                             gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                             out.data_ptr<float>(), N, C, HW, num_groups, eps,
+                             stream, opts, dev);
+    } else {
+        ok = run_fused<false>(y.data_ptr<float>(), nullptr,
+                              gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                              out.data_ptr<float>(), N, C, HW, num_groups, eps,
+                              stream, opts, dev);
+    }
+    if (ok) {
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return out;
+    }
+
+    // ---------------- FALLBACK: original 3-kernel path ----------------------
+    auto ms = torch::empty({NG * 2}, opts);
+
+    int splits = (int)std::min<int64_t>(32, std::max<int64_t>(1, 2048 / std::max<int64_t>(NG, 1)));
+    while (splits > 1 && group_size / splits < 4096) splits >>= 1;
+    if (splits < 1) splits = 1;
+
+    auto partial = torch::empty({NG * (int64_t)splits * 2}, opts);
+
+    const bool vec_stats = (group_size % 4 == 0);
+    dim3 sgrid((unsigned)splits, (unsigned)NG);
+    if (vec_stats) {
+        gn_stats_partial_kernel<true><<<sgrid, 256, 0, stream>>>(
+            y.data_ptr<float>(), partial.data_ptr<float>(), (long long)group_size, splits);
+    } else {
+        gn_stats_partial_kernel<false><<<sgrid, 256, 0, stream>>>(
+            y.data_ptr<float>(), partial.data_ptr<float>(), (long long)group_size, splits);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    gn_finalize_kernel<<<(unsigned)NG, 32, 0, stream>>>(
+        partial.data_ptr<float>(), ms.data_ptr<float>(), splits,
+        (float)(1.0 / (double)group_size), (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const bool vec_apply = (HW % 4 == 0);
+    const int block = 256;
+    const int64_t units = vec_apply ? (HW / 4) : HW;
+    dim3 agrid((unsigned)CDIV(units, (int64_t)block), (unsigned)(N * C));
+
+    const float* rptr = (res != nullptr) ? res->data_ptr<float>() : nullptr;
+
+    if (vec_apply) {
+        if (res != nullptr) {
+            gn_silu_apply_kernel<true, true><<<agrid, block, 0, stream>>>(
+                y.data_ptr<float>(), rptr, gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                ms.data_ptr<float>(), out.data_ptr<float>(),
+                (int)C, (int)cpg, (int)num_groups, (long long)HW);
+        } else {
+            gn_silu_apply_kernel<true, false><<<agrid, block, 0, stream>>>(
+                y.data_ptr<float>(), y.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                ms.data_ptr<float>(), out.data_ptr<float>(),
+                (int)C, (int)cpg, (int)num_groups, (long long)HW);
+        }
+    } else {
+        if (res != nullptr) {
+            gn_silu_apply_kernel<false, true><<<agrid, block, 0, stream>>>(
+                y.data_ptr<float>(), rptr, gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                ms.data_ptr<float>(), out.data_ptr<float>(),
+                (int)C, (int)cpg, (int)num_groups, (long long)HW);
+        } else {
+            gn_silu_apply_kernel<false, false><<<agrid, block, 0, stream>>>(
+                y.data_ptr<float>(), y.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                ms.data_ptr<float>(), out.data_ptr<float>(),
+                (int)C, (int)cpg, (int)num_groups, (long long)HW);
+        }
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+
+torch::Tensor gn_silu(torch::Tensor y, torch::Tensor gamma, torch::Tensor beta,
+                      int64_t num_groups, double eps) {
+    return gn_silu_impl(y, gamma, beta, nullptr, num_groups, eps);
+}
+
+torch::Tensor gn_silu_add(torch::Tensor y, torch::Tensor residual, torch::Tensor gamma,
+                          torch::Tensor beta, int64_t num_groups, double eps) {
+    return gn_silu_impl(y, gamma, beta, &residual, num_groups, eps);
+}
+"""
+
+_CPP_SRC = r"""
+torch::Tensor gn_silu(torch::Tensor y, torch::Tensor gamma, torch::Tensor beta,
+                      int64_t num_groups, double eps);
+torch::Tensor gn_silu_add(torch::Tensor y, torch::Tensor residual, torch::Tensor gamma,
+                          torch::Tensor beta, int64_t num_groups, double eps);
+"""
+
+_ext = load_inline(
+    name="vae_gn_silu_res_persistent_ext",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["gn_silu", "gn_silu_add"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+    ],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Granularity (B): several ops replaced + custom kernels scheduled.
+      replaced : group_norm x2, silu x2, residual add
+                 -> ONE persistent cooperative kernel per normalization
+                    (fallback: original 3-kernel path)
+      kept     : F.conv2d (cuDNN) for bit-identical conv numerics & SOL-level perf
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+        self.num_groups = 32
+
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        if isinstance(eps, torch.Tensor):
+            eps_f = float(eps.item())
+        else:
+            eps_f = float(eps)
+
+        x_c = x if x.is_contiguous() else x.contiguous()
+        w1 = conv1_weight if conv1_weight.is_contiguous() else conv1_weight.contiguous()
+        w2 = conv2_weight if conv2_weight.is_contiguous() else conv2_weight.contiguous()
+        g1 = norm1_weight if norm1_weight.is_contiguous() else norm1_weight.contiguous()
+        b1 = norm1_bias if norm1_bias.is_contiguous() else norm1_bias.contiguous()
+        g2 = norm2_weight if norm2_weight.is_contiguous() else norm2_weight.contiguous()
+        b2 = norm2_bias if norm2_bias.is_contiguous() else norm2_bias.contiguous()
+
+        # --- path 1: conv (cuDNN) -> fused persistent GroupNorm + SiLU
+        out = F.conv2d(x_c, w1, bias=None, stride=1, padding=1)
+        out = out if out.is_contiguous() else out.contiguous()
+        out = self.ext.gn_silu(out, g1, b1, self.num_groups, eps_f)
+
+        # --- path 2: conv (cuDNN) -> fused persistent GroupNorm + SiLU + residual
+        out = F.conv2d(out, w2, bias=None, stride=1, padding=1)
+        out = out if out.is_contiguous() else out.contiguous()
+        out = self.ext.gn_silu_add(out, x_c, g2, b2, self.num_groups, eps_f)
+
+        return out

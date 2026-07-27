@@ -136,10 +136,10 @@ CUDA EXTENSION REQUIREMENTS
 COMPILATION OPTIONS (IMPORTANT)
 Always include:
 - "-O3"
-- "-std=c++17"
+- "-std=c++20" (required: nvcc 13.x miscompiles the ATen headers in C++17 mode)
 - "--expt-relaxed-constexpr"
 - "-lineinfo"
-- "-gencode=arch=compute_80,code=sm_80" (target is fixed: A100 / sm_80)
+- "$gencode_flag" (this is the target architecture of the GPU you are compiling for; do not substitute another one)
 
 Here are examples to show you the syntax of inline embedding custom CUDA operators in torch:
 $few_shot_examples
@@ -172,6 +172,17 @@ output the code within:
 # ---------------------------------------------------------------------------
 # GPU spec loader
 # ---------------------------------------------------------------------------
+
+
+def _detect_gencode_flag() -> str:  # noqa: D401
+    """Return the -gencode flag for the local device (falls back to sm_80)."""
+    try:
+        import torch
+        major, minor = torch.cuda.get_device_capability(0)
+        cc = f"{major}{minor}"
+        return f"-gencode=arch=compute_{cc},code=sm_{cc}"
+    except Exception:  # pragma: no cover - no CUDA device visible
+        return "-gencode=arch=compute_80,code=sm_80"
 
 
 def _load_gpu_spec() -> dict:  # noqa: D401
@@ -216,12 +227,18 @@ def build_seed_prompt(
         f"• {k}: {v}" for k, v in info.items() if k != "GPU Architecture"
     ) if gpu_arch != "Unknown" else "Not Specified"
 
+    # The few-shot examples ship an A100 -gencode flag; retarget them at the
+    # local device so the model does not copy a wrong architecture.
+    gencode_flag = _detect_gencode_flag()
+
     # Build few-shot examples from all pairs
     few_shot_examples = []
     for i, pair in enumerate(FEWSHOT_PAIRS, 1):
         try:
             base_content = pair["base"].read_text().strip()
-            new_content = pair["new"].read_text().strip()
+            new_content = pair["new"].read_text().strip().replace(
+                "-gencode=arch=compute_80,code=sm_80", gencode_flag
+            )
             few_shot_examples.append(
                 f"Example {i}:\n"
                 f"The example given architecture is:\n"
@@ -239,7 +256,8 @@ def build_seed_prompt(
     return test.substitute(
         few_shot_examples=few_shot_examples_text,
         arch_src=arch_src,
-        kernel_src=kernel_src
+        kernel_src=kernel_src,
+        gencode_flag=gencode_flag,
     )
 
 

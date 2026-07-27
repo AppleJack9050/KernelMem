@@ -122,7 +122,7 @@ METRICS_NEW = ",".join([
 
 # List of sections we want to collect. We'll expand these into multiple
 # '--section=<name>' arguments because this ncu version does not support
-# comma‑separated lists in a single --section option.
+# comma-separated lists in a single --section option.
 SECTIONS = "Occupancy,WarpStateStats,MemoryWorkloadAnalysis,ComputeWorkloadAnalysis,SpeedOfLight"
 
 # List version for convenient header selection
@@ -136,13 +136,13 @@ def profile_bench(
     bench_py: str = "bench_ref_inputs.py",
     kernel_names: Optional[List[str]] = None,
     kernel_file: Optional[Union[str, Path]] = None,  # New: explicitly specify which kernel file to profile
-    conda_bin: str = "/root/miniconda3/envs/CudaForge/bin",
+    conda_bin: str = str(Path(sys.executable).parent),
     out_csv: Union[str, Path] = "ncu_temp.csv",
     repeat: int = 10,
     device_idx: Optional[int] = None,
     timeout_override: Optional[int] = None,  # New: override timeout for specific tasks (in seconds)
 ) -> Path:
-    ncu_bin = "/root/miniconda3/envs/robust_kbench/bin/ncu"
+    ncu_bin = os.environ.get("NCU_BIN") or shutil.which("ncu") or "ncu"
     csv_path = Path(out_csv).resolve()
 
     env = os.environ.copy()
@@ -151,19 +151,20 @@ def profile_bench(
     tmp_ncu_dir.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(tmp_ncu_dir)
     
-    # ========== FIX: 使用已有的 PyTorch 缓存，避免 ncu 环境下重新编译 ==========
-    # 不设置 TORCH_EXTENSIONS_DIR，让 PyTorch 使用默认的 ~/.cache/torch_extensions/
-    # 这样可以复用之前编译好的 .so 文件，避免在 ncu 环境下触发重新编译导致卡死
+    # ========== FIX: reuse the existing PyTorch cache to avoid rebuilding under ncu ==========
+    # Leave TORCH_EXTENSIONS_DIR unset so PyTorch falls back to ~/.cache/torch_extensions/
+    # That way previously compiled .so files are reused, avoiding a rebuild under ncu that would hang
     # 
-    # 原代码强制使用临时目录，导致每次 ncu 都重新编译：
+    # The original code forced a temp directory, so every ncu run recompiled from scratch:
     # tmp_ext = tempfile.mkdtemp(prefix="torch_ext_")
     # env["TORCH_EXTENSIONS_DIR"] = tmp_ext
 
-    # 配置文件路径
-    config_metrics = '/root/KernelMem/config_metrics.ncu-cfg'
-    config_section = '/root/KernelMem/config_section.ncu-cfg'
+    # Config file paths
+    _repo_root = Path(__file__).resolve().parent
+    config_metrics = str(_repo_root / 'config_metrics.ncu-cfg')
+    config_section = str(_repo_root / 'config_section.ncu-cfg')
     
-    # 解析 kernel_file 参数
+    # Resolve the kernel_file argument
     kernel_file_path = None
     if kernel_file:
         kernel_file_path = Path(kernel_file).resolve()
@@ -172,12 +173,12 @@ def profile_bench(
         print(f"[ncu] Profiling kernel from file: {kernel_file_path}", flush=True)
 
     def build_cmd(config_file: str, log_file: str, single_kernel_name: Optional[str] = None) -> List[str]:
-        """构建 ncu 命令
+        """Build the ncu command
         
         Args:
-            config_file: ncu 配置文件路径
-            log_file: 输出 CSV 文件路径
-            single_kernel_name: 如果指定，只监控这个单个 kernel（用于多 kernel 场景）
+            config_file: path to the ncu config file
+            log_file: path to the output CSV file
+            single_kernel_name: if given, profile only this single kernel (used for the multi-kernel case)
         """
         cmd = [
             ncu_bin,
@@ -192,7 +193,7 @@ def profile_bench(
         if device_idx is not None:
             cmd.extend(["--device-idx", str(device_idx)])
         
-        # 如果指定了 kernel_file，添加 --test 参数
+        # If a kernel_file was given, add the --test argument
         if kernel_file_path:
             cmd.extend(["--test", str(kernel_file_path)])
 
@@ -201,7 +202,7 @@ def profile_bench(
         # Insert --kernel-name after --log-file, before sys.executable
         insert_pos = cmd.index(sys.executable)
         
-        # 如果指定了单个 kernel 名称（用于多 kernel 场景），使用它
+        # If a single kernel name was given (multi-kernel case), use it
         if single_kernel_name:
             escaped_name = re.escape(single_kernel_name)
             pattern = f"\\b{escaped_name}\\b"
@@ -222,14 +223,14 @@ def profile_bench(
         
         return cmd
 
-    # ========== 第一次执行：使用 config_metrics.ncu-cfg ==========
-    # 计算超时时间：如果指定了 timeout_override，section 和 metrics 都使用该值
-    # 否则 metrics 使用 10 分钟，section 使用 15 分钟
+    # ========== First run: use config_metrics.ncu-cfg ==========
+    # Timeout selection: when timeout_override is given, both section and metrics use that value
+    # Otherwise metrics gets 10 minutes and section gets 15 minutes
     metrics_timeout = timeout_override if timeout_override is not None else 600
     section_timeout = timeout_override if timeout_override is not None else 900
     
     def run_ncu_with_timeout(cmd: List[str], phase: str, timeout: int, output_csv: Optional[Path] = None) -> bool:
-        """执行 ncu 命令，带超时保护（使用指定的超时时间）
+        """Run the ncu command with timeout protection (using the given timeout)
         
         Returns:
             bool: True if successful, False if timeout or error
@@ -237,23 +238,23 @@ def profile_bench(
         print(f"[ncu] [{phase}] running:", " ".join(cmd), flush=True)
         
         try:
-            # 使用 Popen 而不是 run，以便在超时时能够强制终止进程树
-            # 注意：stderr 设置为 subprocess.STDOUT 以便实时看到错误信息
-            # 这对于调试 CUDA kernel 崩溃很重要
+            # Use Popen rather than run so the whole process tree can be force-killed on timeout
+            # NOTE: stderr is redirected to subprocess.STDOUT so error messages show up live
+            # This matters a lot when debugging CUDA kernel crashes
             proc = subprocess.Popen(
                 cmd, 
                 env=env, 
                 text=True, 
                 stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT,  # 将 stderr 合并到 stdout，便于实时查看错误
-                preexec_fn=os.setsid  # 创建新的进程组，便于终止整个进程树
+                stderr=subprocess.STDOUT,  # merge stderr into stdout so errors are visible live
+                preexec_fn=os.setsid  # start a new process group so the whole process tree can be killed
             )
             
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
-                # 由于 stderr=subprocess.STDOUT，stderr 会是 None，所有输出都在 stdout 中
+                # Since stderr=subprocess.STDOUT, stderr is None and all output lands in stdout
                 if proc.returncode != 0:
-                    # 输出完整的 stdout（包含 stderr）以便调试
+                    # Dump the full stdout (which includes stderr) for debugging
                     if stdout:
                         sys.stderr.write("=" * 80 + "\n")
                         sys.stderr.write(f"[ncu] [{phase}] Process exited with return code {proc.returncode}\n")
@@ -261,11 +262,11 @@ def profile_bench(
                         sys.stderr.write(stdout)
                         sys.stderr.write("=" * 80 + "\n")
                     raise SystemExit(proc.returncode)
-                # 成功完成
+                # Finished successfully
                 print(f"[ncu] [{phase}] completed successfully", flush=True)
                 return True
             except subprocess.TimeoutExpired:
-                # 超时：终止整个进程组
+                # Timed out: kill the entire process group
                 print(f"[ncu] [{phase}] Timeout after {timeout} seconds, terminating process group...", flush=True)
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -274,9 +275,9 @@ def profile_bench(
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     proc.wait()
                 except ProcessLookupError:
-                    pass  # 进程已经退出
+                    pass  # process already exited
                 
-                # 如果超时，输出 CSV 文件的最后几行（如果存在）
+                # On timeout, dump the last few lines of the CSV file (if it exists)
                 if output_csv and output_csv.exists():
                     try:
                         with open(output_csv, 'r', encoding='utf-8') as f:
@@ -295,7 +296,7 @@ def profile_bench(
         except RuntimeError:
             raise
         except Exception as e:
-            # 确保进程被清理
+            # Make sure the process is cleaned up
             try:
                 if 'proc' in locals() and proc.poll() is None:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -303,13 +304,13 @@ def profile_bench(
                 pass
             raise
     
-    # ========== 策略选择：单个 kernel vs 多个 kernel ==========
-    # 如果有多个 kernel，为每个 kernel 单独运行 ncu，确保每个 kernel 都能被监控到
-    # 这样可以避免 --launch-count 的限制导致后面的 kernel 无法被收集
+    # ========== Strategy: single kernel vs multiple kernels ==========
+    # With multiple kernels, run ncu once per kernel so that every kernel actually gets profiled
+    # This avoids the --launch-count limit, which stops the later kernels from being captured
     if kernel_names and len(kernel_names) > 1:
         print(f"[ncu] Multiple kernels detected ({len(kernel_names)}), profiling each kernel separately to ensure all are captured")
         
-        # 为每个 kernel 单独运行 ncu
+        # Run ncu separately for each kernel
         all_metrics_csvs = []
         all_section_csvs = []
         kernel_name_map = {}  # Map kernel index to actual kernel name for markers
@@ -318,7 +319,7 @@ def profile_bench(
             print(f"[ncu] Profiling kernel {idx+1}/{len(kernel_names)}: {kernel_name}")
             kernel_name_map[idx] = kernel_name  # Store mapping for use in merge function
             
-            # Metrics phase for this kernel (单独监控这个 kernel)
+            # Metrics phase for this kernel (profile this kernel on its own)
             kernel_metrics_csv = csv_path.parent / f"{csv_path.stem}_kernel{idx}_metrics{csv_path.suffix}"
             run_ncu_with_timeout(
                 build_cmd(config_metrics, str(kernel_metrics_csv), single_kernel_name=kernel_name), 
@@ -329,7 +330,7 @@ def profile_bench(
             print(f"[ncu] [metrics] Completed for kernel {idx+1}/{len(kernel_names)}: {kernel_name}", flush=True)
             all_metrics_csvs.append(kernel_metrics_csv)
             
-            # Section phase for this kernel (单独监控这个 kernel)
+            # Section phase for this kernel (profile this kernel on its own)
             kernel_section_csv = csv_path.parent / f"{csv_path.stem}_kernel{idx}_section{csv_path.suffix}"
             try:
                 run_ncu_with_timeout(
@@ -340,7 +341,7 @@ def profile_bench(
                 )
                 print(f"[ncu] [section] Completed for kernel {idx+1}/{len(kernel_names)}: {kernel_name}", flush=True)
             except RuntimeError as e:
-                # Section 执行失败，输出 CSV 的最后几行
+                # Section run failed, dump the last few lines of the CSV
                 print(f"[ncu] [section] Failed for kernel {idx+1}/{len(kernel_names)}: {kernel_name}", flush=True)
                 if kernel_section_csv.exists():
                     try:
@@ -355,28 +356,28 @@ def profile_bench(
                 raise
             all_section_csvs.append(kernel_section_csv)
         
-        # 合并所有 kernel 的结果（传递 kernel 名称映射）
+        # Merge the results of all kernels (passing the kernel name map through)
         _merge_multiple_ncu_csvs(all_metrics_csvs, all_section_csvs, csv_path, kernel_name_map)
         
-        # 清理临时文件
+        # Clean up the temp files
         for f in all_metrics_csvs + all_section_csvs:
             if f.exists():
                 f.unlink()
         
     else:
-        # 单个 kernel 或没有指定 kernel：使用原来的逻辑（一次运行）
+        # Single kernel or no kernel specified: use the original logic (a single run)
         run_ncu_with_timeout(build_cmd(config_metrics, str(csv_path)), "metrics", metrics_timeout, output_csv=csv_path)
         print(f"[ncu] [metrics] Completed", flush=True)
 
-        # ========== 第二次执行：使用 config_section.ncu-cfg，追加到 CSV ==========
-        # 使用临时文件存储第二次的结果
+        # ========== Second run: use config_section.ncu-cfg, appended to the CSV ==========
+        # Store the second run's output in a temp file
         temp_csv = csv_path.parent / f"{csv_path.stem}_section_temp{csv_path.suffix}"
         
         try:
             run_ncu_with_timeout(build_cmd(config_section, str(temp_csv)), "section", section_timeout, output_csv=temp_csv)
             print(f"[ncu] [section] Completed", flush=True)
             
-            # 合并两个 CSV 文件
+            # Merge the two CSV files
             if temp_csv.exists() and csv_path.exists():
                 with open(csv_path, 'r', encoding='utf-8') as f1:
                     first_lines = f1.readlines()
@@ -384,26 +385,26 @@ def profile_bench(
                 with open(temp_csv, 'r', encoding='utf-8') as f2:
                     second_lines = f2.readlines()
                 
-                # 合并：第一个文件的全部内容 + 第二个文件的所有非注释行
+                # Merge: the full contents of the first file + every non-comment line of the second
                 merged_content = ''.join(first_lines).rstrip()
                 if not merged_content.endswith('\n'):
                     merged_content += '\n'
                 
-                # 追加第二个文件的所有行，只跳过注释行（以 == 开头）
+                # Append all lines of the second file, skipping only comment lines (those starting with ==)
                 for line in second_lines:
                     line_stripped = line.strip()
-                    # 跳过注释行（以 == 开头）和空行
+                    # Skip comment lines (those starting with ==) and blank lines
                     if line_stripped and not line_stripped.startswith('=='):
                         merged_content += line
                 
-                # 写回合并后的内容
+                # Write the merged content back
                 with open(csv_path, 'w', encoding='utf-8') as f:
                     f.write(merged_content)
                 
                 print(f"[ok] Merged CSV written: {csv_path}")
             
         except RuntimeError as e:
-            # Section 执行失败，输出 CSV 的最后几行
+            # Section run failed, dump the last few lines of the CSV
             print(f"[ncu] [section] Failed: {e}", flush=True)
             if temp_csv.exists():
                 try:
@@ -417,7 +418,7 @@ def profile_bench(
                     print(f"[ncu] [section] Failed to read section CSV: {read_err}", flush=True)
             raise
         finally:
-            # 清理临时文件
+            # Clean up the temp file
             if temp_csv.exists():
                 temp_csv.unlink()
     
@@ -425,12 +426,12 @@ def profile_bench(
 
 
 def _merge_multiple_ncu_csvs(metrics_csvs: List[Path], section_csvs: List[Path], out_csv: Path, kernel_name_map: Optional[Dict[int, str]] = None) -> None:
-    """合并多个 kernel 的 ncu profiling 结果到一个 CSV 文件
+    """Merge the ncu profiling results of multiple kernels into a single CSV file
     
-    为每个 kernel 的 metrics 和 section 数据添加明确的开始/结束标志，便于后续读取和分离。
-    标志格式：
-    - Metrics: ==METRICS_START:kernel_name== 和 ==METRICS_END:kernel_name==
-    - Section: ==SECTION_START:kernel_name== 和 ==SECTION_END:kernel_name==
+    Add explicit start/end markers around each kernel's metrics and section data so they can be read back and separated later.
+    Marker format:
+    - Metrics: ==METRICS_START:kernel_name== and ==METRICS_END:kernel_name==
+    - Section: ==SECTION_START:kernel_name== and ==SECTION_END:kernel_name==
     
     Args:
         metrics_csvs: List of metrics CSV file paths for each kernel
@@ -444,18 +445,18 @@ def _merge_multiple_ncu_csvs(metrics_csvs: List[Path], section_csvs: List[Path],
     merged_content = ""
     header_written = False
     
-    # 合并所有 metrics CSV
+    # Merge all metrics CSVs
     for idx, metrics_csv in enumerate(metrics_csvs):
         if not metrics_csv.exists():
             continue
         
-        # 获取 kernel 名称：优先使用 kernel_name_map，否则从文件名提取，最后使用默认名称
-        kernel_name = f"kernel_{idx}"  # 默认名称
+        # Resolve the kernel name: prefer kernel_name_map, else parse it from the filename, and finally fall back to the default
+        kernel_name = f"kernel_{idx}"  # default name
         if kernel_name_map and idx in kernel_name_map:
             kernel_name = kernel_name_map[idx]
         else:
             try:
-                # 从文件名中提取 kernel 索引
+                # Extract the kernel index from the filename
                 if "_kernel" in metrics_csv.stem:
                     parts = metrics_csv.stem.split("_kernel")
                     if len(parts) > 1:
@@ -467,41 +468,41 @@ def _merge_multiple_ncu_csvs(metrics_csvs: List[Path], section_csvs: List[Path],
         with open(metrics_csv, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
-        # 添加 metrics 开始标志
+        # Add the metrics start marker
         merged_content += f"==METRICS_START:{kernel_name}==\n"
         
         for line in lines:
             line_stripped = line.strip()
-            # 跳过注释行（但保留我们的标志行）
+            # Skip comment lines (but keep our own marker lines)
             if line_stripped.startswith('==') and not line_stripped.startswith('==METRICS_'):
                 continue
             
-            # 如果是表头行，只写入一次（仅对 metrics 部分）
+            # For a header row, write it only once (metrics part only)
             if line.startswith('"ID"') or line.startswith('ID,'):
                 if not header_written:
                     merged_content += line
                     header_written = True
                 continue
             
-            # 写入数据行
+            # Write the data row
             merged_content += line
         
-        # 添加 metrics 结束标志
+        # Add the metrics end marker
         merged_content += f"==METRICS_END:{kernel_name}==\n"
     
-    # 合并所有 section CSV（追加到末尾）
-    # Section CSV 的数据行列数可能少于 metrics 行，需要填充到相同的列数
+    # Merge all section CSVs (appended at the end)
+    # Section CSV data rows may have fewer columns than the metrics rows, so they need padding to the same column count
     for idx, section_csv in enumerate(section_csvs):
         if not section_csv.exists():
             continue
         
-        # 获取 kernel 名称：优先使用 kernel_name_map，否则从文件名提取，最后使用默认名称
-        kernel_name = f"kernel_{idx}"  # 默认名称
+        # Resolve the kernel name: prefer kernel_name_map, else parse it from the filename, and finally fall back to the default
+        kernel_name = f"kernel_{idx}"  # default name
         if kernel_name_map and idx in kernel_name_map:
             kernel_name = kernel_name_map[idx]
         else:
             try:
-                # 从文件名中提取 kernel 索引
+                # Extract the kernel index from the filename
                 if "_kernel" in section_csv.stem:
                     parts = section_csv.stem.split("_kernel")
                     if len(parts) > 1:
@@ -510,34 +511,34 @@ def _merge_multiple_ncu_csvs(metrics_csvs: List[Path], section_csvs: List[Path],
             except Exception:
                 pass
         
-        # 添加 section 开始标志
+        # Add the section start marker
         merged_content += f"==SECTION_START:{kernel_name}==\n"
         
         with open(section_csv, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
-        # Section 部分有自己的表头（列结构和 metrics 不同）
-        # 保留 section CSV 文件中的表头（每个 kernel 的 section 部分都有自己的表头）
+        # The section part has its own header (its column layout differs from metrics)
+        # Keep the header from the section CSV file (each kernel's section part has its own header)
         section_header_written = False
         for line in lines:
             line_stripped = line.strip()
-            # 跳过注释行（但保留我们的标志行）
+            # Skip comment lines (but keep our own marker lines)
             if line_stripped.startswith('==') and not line_stripped.startswith('==SECTION_'):
                 continue
             
-            # Section 表头：保留它（每个 kernel 的 section 都有自己的表头，列结构不同于 metrics）
+            # Section header: keep it (each kernel's section has its own header, whose columns differ from the metrics header)
             if (line.startswith('"ID"') or line.startswith('ID,')) and not section_header_written:
                 merged_content += line
                 section_header_written = True
                 continue
             
-            # 直接写入 section 数据行（不需要填充列数，因为读取时会分别处理 metrics 和 section）
+            # Write the section data row as-is (no column padding needed, since metrics and section are handled separately on read)
             merged_content += line
         
-        # 添加 section 结束标志
+        # Add the section end marker
         merged_content += f"==SECTION_END:{kernel_name}==\n"
     
-    # 写入合并后的内容
+    # Write out the merged content
     with open(out_csv, 'w', encoding='utf-8') as f:
         f.write(merged_content)
     
@@ -639,33 +640,65 @@ def load_ncu_metrics(
         # Metrics data is between ==METRICS_START:kernel_name== and ==METRICS_END:kernel_name==
         # Section data is between ==SECTION_START:kernel_name== and ==SECTION_END:kernel_name==
         # For now, collect all metrics lines (between METRICS_START and METRICS_END) and all section lines (between SECTION_START and SECTION_END)
-        metrics_lines = []
-        section_lines = []
-        in_metrics = False
-        in_section = False
-        
+        # Split into (kind, name, lines) sections first, so a single unusable
+        # section can be dropped without taking the usable ones with it.
+        sections: List[Tuple[str, str, List[str]]] = []
+        cur: Optional[Tuple[str, str, List[str]]] = None
+
         for line in all_lines:
             stripped = line.strip()
             if stripped.startswith('==METRICS_START:'):
-                in_metrics = True
-                in_section = False
-                continue
-            elif stripped.startswith('==METRICS_END:'):
-                in_metrics = False
+                cur = ('metrics', stripped[len('==METRICS_START:'):].rstrip('='), [])
+                sections.append(cur)
                 continue
             elif stripped.startswith('==SECTION_START:'):
-                in_section = True
-                in_metrics = False
+                cur = ('section', stripped[len('==SECTION_START:'):].rstrip('='), [])
+                sections.append(cur)
                 continue
-            elif stripped.startswith('==SECTION_END:'):
-                in_section = False
+            elif stripped.startswith('==METRICS_END:') or stripped.startswith('==SECTION_END:'):
+                cur = None
                 continue
-            
-            if in_metrics:
-                metrics_lines.append(line)
-            elif in_section:
-                section_lines.append(line)
-        
+
+            if cur is not None:
+                cur[2].append(line)
+
+        # When --kernel-name matches nothing that actually launched (e.g. a kernel
+        # symbol that is compiled but dead at this shape), ncu emits a diagnostic
+        # instead of CSV:
+        #     ==WARNING== No kernels were profiled.
+        #     Available Kernels:
+        #     1. gn_stats_kernel_h(const __half *, float *, int, int)
+        # Those C++ signatures are full of commas, so the row widths are ragged and
+        # pd.read_csv raises ParserError. Previously that exception propagated and
+        # discarded every section that HAD profiled successfully, aborting the whole
+        # optimization round. Keep the good sections and skip the empty ones.
+        def _is_csv_payload(buf: List[str]) -> bool:
+            text = ''.join(buf)
+            if 'No kernels were profiled' in text or 'Available Kernels:' in text:
+                return False
+            return any(l.lstrip().startswith('"') for l in buf)
+
+        metrics_lines = []
+        section_lines = []
+        skipped: List[str] = []
+        for kind, name, buf in sections:
+            if not buf:
+                continue
+            if not _is_csv_payload(buf):
+                skipped.append(f"{name} [{kind}]")
+                continue
+            (metrics_lines if kind == 'metrics' else section_lines).extend(buf)
+
+        if skipped:
+            print(f"[ncu] No profile data for {len(skipped)} kernel name(s), skipping: "
+                  f"{', '.join(skipped)}")
+        if sections and not metrics_lines:
+            raise RuntimeError(
+                "ncu produced no profilable kernels for any requested name "
+                f"({', '.join(n for _, n, _ in sections)}). The kernel names were "
+                "likely extracted from source but never launched at this shape."
+            )
+
         # Use metrics_lines for CSV parsing, section_lines for section parsing
         csv_content = ''.join(metrics_lines)
         csv_end_line = len(all_lines)  # All metrics are already extracted, section is separate

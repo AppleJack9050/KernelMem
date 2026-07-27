@@ -220,9 +220,9 @@ def _bench(model: torch.nn.Module,
     return times
 
 
-# ====================== RNG & 确定性设置 ======================
+# ======================= RNG & determinism settings =======================
 def _seed_everything(seed: int | None, device_idx: int | None = None):
-    """设置随机种子并（可选）启用确定性后端。"""
+    """Set the random seeds and (optionally) enable deterministic backends."""
     import os, random
     import numpy as np
     import torch
@@ -239,15 +239,15 @@ def _seed_everything(seed: int | None, device_idx: int | None = None):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-        # 更强可复现（如不需要可注释掉）
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # 或 ":16:8"
+        # Stronger reproducibility (comment out if not needed)
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # or ":16:8"
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        # 某些算子无确定性实现时仅告警不报错
+        # Some ops have no deterministic implementation: warn instead of erroring
         torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-# ====================== 参数对齐（通用 + 类名/导出名专用） ======================
+# ======= Parameter alignment (generic + class/export-name specific) =======
 import torch
 import torch.nn as nn
 from collections import defaultdict
@@ -270,10 +270,10 @@ def _safe_copy_(dst: torch.Tensor, src: torch.Tensor) -> bool:
 @torch.no_grad()
 def _try_map_shape_and_copy_(dst: torch.Tensor, src: torch.Tensor) -> bool:
     """
-    形状映射覆盖：
+    Supported shape mappings:
       - depthwise 2D:   (C,1,Kh,1)<->(C,Kh), (C,1,Kh,Kw)<->(C,Kh,Kw)
       - PW/Linear:      (Out,In,1,1)<->(Out,In)
-      - Conv/ConvT 3D:  (Out,In,kD,kH,kW) <-> (In,Out,kD,kH,kW) （首两维交换）
+      - Conv/ConvT 3D:  (Out,In,kD,kH,kW) <-> (In,Out,kD,kH,kW) (first two dims swapped)
       - depthwise 3D:   (C,1,kD,kH,kW) <-> (C,kD,kH,kW)
     """
     s = tuple(src.shape)
@@ -287,7 +287,7 @@ def _try_map_shape_and_copy_(dst: torch.Tensor, src: torch.Tensor) -> bool:
         dst.copy_(src.to(dtype=dst.dtype, device=dst.device).reshape(d).contiguous())
         return True
 
-    # --- depthwise 2D: (C,1,Kh,Kw) -> (C,Kh,Kw) 及其反向
+    # --- depthwise 2D: (C,1,Kh,Kw) -> (C,Kh,Kw) and the reverse
     if len(s) == 4 and s[1] == 1 and len(d) == 3 and s[0] == d[0] and s[2] == d[1] and s[3] == d[2]:
         dst.copy_(src.to(dtype=dst.dtype, device=dst.device).squeeze(1).contiguous())
         return True
@@ -303,13 +303,13 @@ def _try_map_shape_and_copy_(dst: torch.Tensor, src: torch.Tensor) -> bool:
         dst.copy_(src.to(dtype=dst.dtype, device=dst.device).reshape(d).contiguous())
         return True
 
-    # --- Conv/ConvTranspose 3D: 5D 权重首两维交换
+    # --- Conv/ConvTranspose 3D: swap the first two dims of the 5D weight
     #     (Out, In, kD, kH, kW)  <->  (In, Out, kD, kH, kW)
     if len(s) == 5 and len(d) == 5 and s[0] == d[1] and s[1] == d[0] and s[2:] == d[2:]:
         dst.copy_(src.permute(1, 0, 2, 3, 4).contiguous().to(dtype=dst.dtype, device=dst.device))
         return True
 
-    # --- depthwise 3D: (C,1,kD,kH,kW) -> (C,kD,kH,kW) 及其反向
+    # --- depthwise 3D: (C,1,kD,kH,kW) -> (C,kD,kH,kW) and the reverse
     if len(s) == 5 and s[1] == 1 and len(d) == 4 and s[0] == d[0] and s[2:] == d[1:]:
         dst.copy_(src.to(dtype=dst.dtype, device=dst.device).squeeze(1).contiguous())
         return True
@@ -327,14 +327,14 @@ def align_params_generic(ref_model: nn.Module, test_model: nn.Module) -> dict[st
     copied_same, unique_shape_copied, mapped, skipped = 0, 0, 0, 0
     aligned_test: set[str] = set()
 
-    # 1) 同名同形状
+    # 1) Same name, same shape
     for name, t_dst in test_named.items():
         t_src = ref_named.get(name, None)
         if t_src is not None and _safe_copy_(t_dst, t_src):
             copied_same += 1
             aligned_test.add(name)
 
-    # 2) 唯一形状匹配
+    # 2) Unique shape match
     shape2ref: dict[tuple, list[tuple[str, torch.Tensor]]] = defaultdict(list)
     shape2test: dict[tuple, list[tuple[str, torch.Tensor]]] = defaultdict(list)
     for n, t in ref_named.items():
@@ -352,7 +352,7 @@ def align_params_generic(ref_model: nn.Module, test_model: nn.Module) -> dict[st
                 unique_shape_copied += 1
                 aligned_test.add(tname)
 
-    # 3) 形状映射
+    # 3) Shape mapping
     for name, t_dst in test_named.items():
         if name in aligned_test:
             continue
@@ -373,7 +373,7 @@ def align_params_generic(ref_model: nn.Module, test_model: nn.Module) -> dict[st
         "skipped": skipped,
     }
 
-# ——（可选）按类名/导出名注册“专用对齐器”：Model → ModelNew ——
+# (Optional) Register a "dedicated aligner" by class name/export name: Model → ModelNew
 _PAIR_ALIGNERS: dict[tuple[str, str], callable] = {}
 
 def register_pair_aligner(ref_key: str, test_key: str):
@@ -396,7 +396,7 @@ def _align_Model_to_ModelNew(ref_model: nn.Module, test_model: nn.Module) -> dic
                     if n.startswith("param::") and t.ndim == dims]
         return cand
 
-    # ---- 2D: Conv / ConvTranspose（4D 同形状 或 首两维交换）----
+    # ---- 2D: Conv / ConvTranspose (4D same shape or first two dims swapped) ----
     r4 = pick(ref_named, 4); t4 = pick(test_named, 4)
     if len(r4) == 1 and len(t4) == 1:
         w_ref, w_tst = r4[0][1], t4[0][1]
@@ -418,7 +418,7 @@ def _align_Model_to_ModelNew(ref_model: nn.Module, test_model: nn.Module) -> dic
             return {"pair_aligner": 1, "copied_same_shape": int(tuple(w_ref.shape)==tuple(w_tst.shape)),
                     "mapped_shape": int(tuple(w_ref.shape)!=tuple(w_tst.shape)), "skipped": 0}
 
-    # ---- 3D: Conv3d / ConvTranspose3d（5D 同形状 或 首两维交换）----
+    # ---- 3D: Conv3d / ConvTranspose3d (5D same shape or first two dims swapped) ----
     r5 = pick(ref_named, 5); t5 = pick(test_named, 5)
     if len(r5) == 1 and len(t5) == 1:
         w_ref, w_tst = r5[0][1], t5[0][1]
@@ -440,7 +440,7 @@ def _align_Model_to_ModelNew(ref_model: nn.Module, test_model: nn.Module) -> dic
                 w_tst.copy_(w_ref.to(dtype=w_tst.dtype, device=w_tst.device).squeeze(1).contiguous())
                 return {"pair_aligner": 1, "copied_same_shape": 0, "mapped_shape": 1, "skipped": 0}
 
-    # 其余回退通用
+    # Fall back to the generic aligner for everything else
     stats = align_params_generic(ref_model, test_model)
     stats["pair_aligner"] = 0
     return stats
@@ -449,13 +449,13 @@ def _align_Model_to_ModelNew(ref_model: nn.Module, test_model: nn.Module) -> dic
 def try_align_params(ref_model: nn.Module, test_model: nn.Module,
                      ref_mod=None, test_mod=None) -> dict[str, int]:
     """
-    优先级：
-      0) 导出名派发（_export_symbol），如 ("Model","ModelNew")
-      0b) 实例类名派发
-      1) 任务自定义 map_ref_to_test_params / align_params
-      2) 通用自动对齐
+    Priority:
+      0) Dispatch by export name (_export_symbol), e.g. ("Model","ModelNew")
+      0b) Dispatch by instance class name
+      1) Task-specific map_ref_to_test_params / align_params
+      2) Generic automatic alignment
     """
-    # 0) 导出名（若 compare_and_bench 已设置）
+    # 0) Export name (if compare_and_bench already set it)
     key_export = (getattr(ref_model, "_export_symbol", None),
                   getattr(test_model, "_export_symbol", None))
     if key_export in _PAIR_ALIGNERS:
@@ -463,14 +463,14 @@ def try_align_params(ref_model: nn.Module, test_model: nn.Module,
         stats["pair_key"] = f"{key_export[0]}->{key_export[1]}"
         return stats
 
-    # 0b) 实例类名
+    # 0b) Instance class name
     key_class = (ref_model.__class__.__name__, test_model.__class__.__name__)
     if key_class in _PAIR_ALIGNERS:
         stats = _PAIR_ALIGNERS[key_class](ref_model, test_model)
         stats["pair_key"] = f"{key_class[0]}->{key_class[1]}"
         return stats
 
-    # 1) 任务自定义
+    # 1) Task-specific
     for mod in (test_mod, ref_mod):
         if mod is None:
             continue
@@ -481,7 +481,7 @@ def try_align_params(ref_model: nn.Module, test_model: nn.Module,
                 return {"pair_aligner": 0, "copied_same_shape": -1, "mapped_shape": -1,
                         "skipped": -1, "pair_key": "custom_fn"}
 
-    # 2) 通用
+    # 2) Generic
     stats = align_params_generic(ref_model, test_model)
     stats["pair_aligner"] = 0
     stats["pair_key"] = "generic"
@@ -489,7 +489,7 @@ def try_align_params(ref_model: nn.Module, test_model: nn.Module,
 
 
 
-# ====================== compare_and_bench（带通用对齐与种子） ======================
+# ========= compare_and_bench (with generic alignment and seeding) =========
 def compare_and_bench(
     ref_py: Path,
     test_py: Path,
@@ -499,19 +499,19 @@ def compare_and_bench(
     repeat: int = 20,
     tol: float = 1e-4,
     log_dir: str | Path | None = "run/debug",
-    seed: int = 100,  # 固定默认 seed；需要环境控制时可改成 None 并用 env 读取
+    seed: int = 100,  # Fixed default seed; set it to None to read the seed from the env instead
 ) -> Dict[str, Any]:
     """
     Benchmark *test_py* against *ref_py*.
 
-    仅从 reference 脚本读取 get_init_inputs()，并对 ref/test 使用同一组初始化参数。
-    同时：固定随机性 + 参数对齐（支持 Model→ModelNew 专用对齐 & 通用对齐）。
+    Reads get_init_inputs() only from the reference script, and uses the same init args for ref/test.
+    Also: fixed randomness + parameter alignment (supports the Model→ModelNew dedicated aligner & generic alignment).
     """
     import os
     import contextlib
     from datetime import datetime
 
-    # ------------ 设备设置 ------------
+    # ------------ Device setup ------------
     dev = torch.device(f"cuda:{device_idx}") if TORCH_DEVICE == "cuda" else torch.device("cpu")
     if TORCH_DEVICE == "cuda":
         torch.cuda.set_device(dev)
@@ -519,7 +519,7 @@ def compare_and_bench(
         # This makes CUDA operations synchronous and provides better error reporting
         # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-    # 若需要通过环境变量控制 seed
+    # In case the seed needs to be controlled through an environment variable
     if seed is None:
         env_seed = os.environ.get("KERNELBENCH_SEED")
         seed = int(env_seed) if env_seed is not None else None
@@ -583,7 +583,7 @@ def compare_and_bench(
 
         return "\n".join(lines)
 
-    # ------------ 动态导入 ------------
+    # ------------ Dynamic import ------------
     ref_mod, _ = _capture_import(ref_py)
     test_mod, _ = _capture_import(test_py)
 
@@ -592,11 +592,11 @@ def compare_and_bench(
     ModelNew   = getattr(test_mod, "ModelNew",    None)
 
     if None in (RefModel, get_inputs):
-        raise RuntimeError(f"Reference '{ref_py}' 必须定义 Model 与 get_inputs()。")
+        raise RuntimeError(f"Reference '{ref_py}' must define Model and get_inputs().")
     if ModelNew is None:
-        raise RuntimeError(f"Candidate '{test_py}' 必须定义 ModelNew 类。")
+        raise RuntimeError(f"Candidate '{test_py}' must define a ModelNew class.")
 
-    # ------------ 仅从 ref 获取初始化参数 ------------
+    # ------------ Init args come from ref only ------------
     init_args: List[Any] = []
     init_kwargs: Dict[str, Any] = {}
     get_init_inputs_ref = getattr(ref_mod, "get_init_inputs", None)
@@ -608,9 +608,9 @@ def compare_and_bench(
         elif isinstance(init_obj, (list, tuple)):
             init_args = list(init_obj)
         elif init_obj is not None:
-            raise TypeError("get_init_inputs() 必须返回 list/tuple（作为 *args）或 dict（作为 **kwargs）。")
+            raise TypeError("get_init_inputs() must return a list/tuple (used as *args) or a dict (used as **kwargs).")
 
-    # ------------ 运行 & 基准 ------------
+    # ------------ Run & benchmark ------------
     def _first_tensor(x):
         if isinstance(x, torch.Tensor):
             return x
@@ -618,32 +618,32 @@ def compare_and_bench(
             for t in x:
                 if isinstance(t, torch.Tensor):
                     return t
-        raise TypeError("Model forward 未返回 Tensor（或序列中的 Tensor）。")
+        raise TypeError("Model forward did not return a Tensor (or a Tensor inside a sequence).")
 
     try:
         ctx = torch.cuda.device(dev) if TORCH_DEVICE == "cuda" else contextlib.nullcontext()
         with ctx:
-            # 固定输入随机性
+            # Pin down input randomness
             _seed_everything(seed, device_idx)
             inp = get_inputs()
             if not isinstance(inp, (list, tuple)):
                 inp = [inp]
 
-            # 固定参数初始化：两边构造前分别设种子
+            # Pin down parameter initialization: reseed before constructing each side
             _seed_everything(seed, device_idx)
             ref_model  = RefModel(*init_args, **init_kwargs)
-            # # torch.compile 加速
+            # # torch.compile speedup
             # ref_model = torch.compile(ref_model)
             
             _seed_everything(seed, device_idx)
             test_model = ModelNew(*init_args, **init_kwargs)
-            # # torch.compile 加速
+            # # torch.compile speedup
             # test_model = torch.compile(test_model)   
             
-            # ★ 参数对齐（优先 Model→ModelNew 专用对齐，其次任务自定义，最后通用对齐）
+            # ★ Parameter alignment (Model→ModelNew dedicated aligner first, then task-specific, then generic)
             align_stats = try_align_params(ref_model, test_model, ref_mod=ref_mod, test_mod=test_mod)
 
-            # 前向（同步确保错误就地暴露）
+            # Forward pass (synchronize so errors surface where they happen)
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
             ref_out,  _ = _run_once(ref_model,  inp, dev)
@@ -651,20 +651,20 @@ def compare_and_bench(
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
 
-            # 统一取 Tensor、保证连续
+            # Normalize to a Tensor and make sure it is contiguous
             ref_out  = _first_tensor(ref_out).contiguous()
             test_out = _first_tensor(test_out).contiguous()
             if ref_out.dtype != test_out.dtype:
                 test_out = test_out.to(ref_out.dtype)
 
-            # 确保两个张量在同一设备上（修复设备不匹配问题）
+            # Make sure both tensors are on the same device (fixes device mismatch issues)
             if ref_out.device != test_out.device:
-                # 将两个张量都移到 ref_out 的设备上
+                # Move both tensors onto ref_out's device
                 test_out = test_out.to(ref_out.device)
 
             # Check memory usage
             ref_out_bytes = ref_out.element_size() * ref_out.nelement()
-            check_precision = True  # 初始化标志
+            check_precision = True  # Initialize the flag
 
             if ref_out_bytes * 8 > 40 * 1024**3:
                 import psutil
@@ -685,27 +685,27 @@ def compare_and_bench(
                     print_warning(f"Warning: Output tensor size is too large ({ref_out_bytes / 1024**3:.2f} GB). Moving to CPU for comparison to avoid OOM.")
                     ref_out = ref_out.cpu()
                     test_out = test_out.cpu()
-                    # 再次确保两个张量在同一设备上
+                    # Make sure both tensors are on the same device again
                     if ref_out.device != test_out.device:
                         test_out = test_out.to(ref_out.device)
 
-            # 误差 & allclose（仅在 check_precision 为 True 时执行）
+            # Error & allclose (only run when check_precision is True)
             if check_precision:
-                # 先计算差值（保持原始 dtype，确保精度）
+                # Compute the diff first (keep the original dtype to preserve precision)
                 diff = (test_out - ref_out).abs()
                 max_err = diff.max().item()
                 
-                # mean() 需要浮点/复数 dtype，如果 diff 是整型则转换为 float
-                # 注意：只在计算 mean 时转换，不影响 diff 本身的精度
+                # mean() requires a floating/complex dtype, so cast diff to float if it is integral
+                # NOTE: the cast only happens for the mean, it does not affect the precision of diff itself
                 if not torch.is_floating_point(diff):
                     mean_err = diff.float().mean().item()
                 else:
                     mean_err = diff.mean().item()
 
-                # 对于整型输出（如 argmax），使用 torch.equal 检查完全相等
-                # 对于浮点型输出，使用 torch.allclose 检查是否在容差范围内
+                # For integral outputs (e.g. argmax), use torch.equal to check for exact equality
+                # For floating-point outputs, use torch.allclose to check they are within tolerance
                 if not torch.is_floating_point(ref_out) and not torch.is_floating_point(test_out):
-                    # 整型输出：必须完全相等
+                    # Integral outputs: must be exactly equal
                     if not torch.equal(ref_out, test_out):
                         raise ValueError(_build_mismatch_debug_msg(
                             reason="Integer outputs are not equal",
@@ -719,7 +719,7 @@ def compare_and_bench(
                             ref_model=ref_model,
                         ))
                 else:
-                    # 浮点型输出：使用 allclose 检查
+                    # Floating-point outputs: check with allclose
                     if not torch.allclose(ref_out, test_out, atol=tol, rtol=tol):
                         raise ValueError(_build_mismatch_debug_msg(
                             reason="Outputs are not close",
@@ -733,7 +733,7 @@ def compare_and_bench(
                             ref_model=ref_model,
                         ))
 
-            # 计时
+            # Timing
             ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)
             test_t = _bench(test_model, inp, dev, warmup, repeat)
 
@@ -741,11 +741,11 @@ def compare_and_bench(
                 torch.cuda.synchronize(dev)
 
     except Exception:
-        # 抛出完整 traceback（上层捕获）
+        # Raise the full traceback (caught by the caller)
         import traceback as _tb
         raise RuntimeError(_tb.format_exc()) from None
 
-    # ------------ 结果汇总 ------------
+    # ------------ Result summary ------------
     result: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "reference_file": str(ref_py),
@@ -769,7 +769,7 @@ def compare_and_bench(
         "model_init_args": init_args,
         "model_init_kwargs": init_kwargs,
         "seed": seed,
-        "align_stats": align_stats,  # 记录对齐信息（含是否命中 Model→ModelNew 专用对齐）
+        "align_stats": align_stats,  # Alignment info (including whether the Model→ModelNew dedicated aligner was hit)
     }
     return result
 

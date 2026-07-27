@@ -21,20 +21,20 @@ def retry_with_backoff(
     backoff_factor: float = 2.0,
 ) -> Any:
     """
-    带指数退避的重试函数
+    Retry helper with exponential backoff
     
     Args:
-        func: 要重试的函数（无参数）
-        max_retries: 最大重试次数，None 表示无限重试
-        initial_delay: 初始延迟（秒）
-        max_delay: 最大延迟（秒），默认 300 秒（5 分钟）
-        backoff_factor: 退避因子
+        func: the function to retry (takes no arguments)
+        max_retries: maximum number of retries, None means retry forever
+        initial_delay: initial delay (seconds)
+        max_delay: maximum delay (seconds), defaults to 300 seconds (5 minutes)
+        backoff_factor: backoff multiplier
     
     Returns:
-        函数执行结果
+        The result of the function call
     
     Raises:
-        最后一次尝试的异常（仅在手动中断时）
+        The exception from the last attempt (only on manual interruption)
     """
     try:
         from openai import APIConnectionError, APITimeoutError, RateLimitError
