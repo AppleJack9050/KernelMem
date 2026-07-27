@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 
 from agents.query_server import query_server
 from prompts.generate_custom_cuda_memory import build_seed_prompt, default_system_prompt
+from utils.reference_profile import build_reference_profile_block
 from prompts.judger_compilation_timeout import build_compilation_timeout_prompts
 from utils.compile_and_run import compare_and_bench
 from utils.kernel_io import extract_code_block, save_kernel_code, extract_json, extract_cuda_kernel_names
@@ -411,12 +412,22 @@ def _bench_and_score(
             metrics = data
             metrics["runnable"] = True
             metrics["phase"] = phase
-            speedup = metrics["ref_latency_ms"]["avg"] / max(1e-9, metrics["test_latency_ms"]["avg"])
+            # compare_and_bench reports a geometric-mean speedup across every
+            # benchmarked shape ("score"); with no get_inputs_extra() hook that
+            # is exactly the single-shape ratio computed here as a fallback.
+            speedup = metrics.get("score")
+            if speedup is None:
+                speedup = metrics["ref_latency_ms"]["avg"] / max(1e-9, metrics["test_latency_ms"]["avg"])
             metrics["score"] = speedup
 
             ind.metrics = metrics
             ind.score = speedup
-            print(f"[{phase}] score={speedup:.4f}", flush=True)
+            per_shape = metrics.get("per_shape") or []
+            if len(per_shape) > 1:
+                brk = "  ".join(f"{s['shape']}={s['speedup']:.4f}x" for s in per_shape)
+                print(f"[{phase}] score={speedup:.4f} (geomean over {len(per_shape)} shapes: {brk})", flush=True)
+            else:
+                print(f"[{phase}] score={speedup:.4f}", flush=True)
 
             # # === Optional: on successful compile+run, copy code to root/test_kernel.py ===
             # try:
@@ -753,7 +764,19 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
         if round_idx == 0:
             print("[Seed] Generating the initial kernel ...")
-            seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu)
+            # Profile the reference BEFORE the seed. The granularity the model
+            # picks here fixes what it may rewrite for the entire run and is
+            # never revisited, so it must not be chosen without knowing where
+            # the time actually goes. Advisory: None on failure, prompt unchanged.
+            print("[ref_profile] Profiling reference model to inform granularity choice ...", flush=True)
+            ref_profile_block = build_reference_profile_block(task_path, device_idx=args.device)
+            if ref_profile_block:
+                (io_dir / f"round{round_idx:03d}_reference_profile.txt").write_text(
+                    ref_profile_block, encoding="utf-8")
+                for _l in ref_profile_block.splitlines()[:3]:
+                    print(f"[ref_profile] {_l}", flush=True)
+            seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu,
+                                            reference_profile=ref_profile_block)
             prompt_file = io_dir / f"round{round_idx:03d}_seed_prompt.txt"
             prompt_file.write_text(seed_prompt, encoding="utf-8")
             ind = _llm_to_kernel(seed_prompt, code_dir, call_llm, io_dir,
@@ -1244,7 +1267,27 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         metrics_df, sections_dict = load_ncu_metrics(csv_path, extra_keep=("Kernel Name", "Block Size", "Grid Size"),
                                                                       name_list=kernel_names, select="last")
                         metrics_block = metrics_to_prompt(metrics_df, sections_dict=sections_dict)
-                        
+
+                        # Per-shape speedups for the kernel being profiled. The NCU/nsys
+                        # data above covers ONE shape, so without this the judge cannot
+                        # tell a real improvement from one that only fits that shape.
+                        _ps = ((base_kernel.metrics or {}).get("per_shape")
+                               if base_kernel is not None else None)
+                        if _ps and len(_ps) > 1:
+                            _rows = "\n".join(
+                                f"  {s['shape']:<20} ref={s['ref_ms']:.3f} ms  "
+                                f"test={s['test_ms']:.3f} ms  speedup={s['speedup']:.4f}x"
+                                + ("   <-- profiled above" if s.get("primary") else "")
+                                for s in _ps
+                            )
+                            metrics_block += (
+                                "\n\nPER-SHAPE SPEEDUP (score = geometric mean over these shapes)\n"
+                                f"{_rows}\n"
+                                "NOTE: the profile above is from the shape marked 'profiled above' only.\n"
+                                "A method that helps that shape but regresses another is NOT an\n"
+                                "improvement — the score is the geometric mean across all of them.\n"
+                            )
+
                         # ========== Run nsys profiling to get kernel launch counts ==========
                         nsys_rep_path = None
                         nsys_csv_path = None

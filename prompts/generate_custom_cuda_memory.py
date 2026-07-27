@@ -60,6 +60,7 @@ SEED BENCHMARK ASSUMPTIONS
 - Do NOT rely on single-use, hidden aliasing, or undefined lifetime assumptions.
 - Do NOT introduce hidden global state or randomness; ModelNew.forward must be deterministic given inputs and parameters.
 
+$reference_profile
 SEED GRANULARITY SELECTION (STRICT)
 - For this SEED generation, you MUST choose EXACTLY ONE granularity level:
   (A) optimize a single hotspot op,
@@ -101,6 +102,22 @@ SCHEDULING / FUSION / FISSION (OPTIONAL, WHEN BENEFICIAL)
 CUSTOM CUDA/C++ CODE REQUIREMENT
 - If you do not otherwise replace any ops with a custom CUDA kernel, include a tiny semantically-neutral custom kernel via load_inline (e.g., identity/copy) and call it outside critical paths to satisfy the “custom CUDA/C++ code” requirement.
 - If you already replaced/fused meaningful ops, no extra dummy kernel is needed.
+
+PRECISION POLICY (STRICT)
+- Compute in the dtype of the input tensors. NEVER downcast to a narrower dtype to gain speed.
+- If the inputs are float32, ALL storage and arithmetic must stay float32. Do NOT convert
+  activations, weights or intermediates to __half / half2 / __nv_bfloat16 / fp8, and do NOT
+  call reduced-precision tensor-core paths (e.g. cuDNN/cuBLAS half engines).
+- If the inputs arrive as float16 or bfloat16, use that dtype natively — do not upcast the
+  whole pipeline to float32 either. Match what the workload gives you.
+- TF32 tensor cores ARE permitted for conv/GEMM: the reference itself runs them
+  (torch.backends.cudnn.allow_tf32 is True by default), so this matches baseline behaviour
+  and is not a downcast.
+- Reductions (e.g. GroupNorm mean/variance, dot products) must accumulate in float32 or wider
+  regardless of the storage dtype.
+- Rationale: a narrower dtype can pass a tolerance check while computing something the
+  reference did not. Speed must come from better scheduling, fusion and memory traffic,
+  not from doing less precise arithmetic.
 
 INPUTS / BENCH HARNESS INVARIANTS (STRICT)
 - You MUST NOT change or redefine get_inputs() or get_init_inputs() from the reference file.
@@ -206,8 +223,15 @@ def _load_gpu_spec() -> dict:  # noqa: D401
 def build_seed_prompt(
     arch_path: Path,
     gpu_name: str | None = None,
+    reference_profile: str | None = None,
 ) -> str:
-    """Build LLM prompt for CUDA‑kernel optimisation (seed generation)."""
+    """Build LLM prompt for CUDA‑kernel optimisation (seed generation).
+
+    *reference_profile* is an optional measured breakdown of where the
+    reference spends GPU time (see utils.reference_profile). It is injected
+    directly above the granularity choice, because that choice fixes what the
+    model may rewrite for the whole run and is otherwise made blind.
+    """
     gpu_info = _load_gpu_spec()
 
     # Auto‑detect GPU if not provided
@@ -253,11 +277,16 @@ def build_seed_prompt(
     few_shot_examples_text = "\n".join(few_shot_examples)
     kernel_src = Path(arch_path).read_text().strip()
 
+    # Blank (not omitted) when profiling was unavailable, so the prompt reads
+    # identically to before rather than carrying an empty header.
+    profile_block = f"{reference_profile.rstrip()}\n" if reference_profile else ""
+
     return test.substitute(
         few_shot_examples=few_shot_examples_text,
         arch_src=arch_src,
         kernel_src=kernel_src,
         gencode_flag=gencode_flag,
+        reference_profile=profile_block,
     )
 
 

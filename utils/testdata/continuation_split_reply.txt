@@ -1,0 +1,955 @@
+# Section A – Checklist evidence (plan-to-code mapping)
+
+**Plan item 1:** Add cuDNN v7 legacy NCHW/KCRS fp32 path with `CUDNN_DEFAULT_MATH` + `CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED`, workspace query with NOT_SUPPORTED / >1.5 GB rejection, cached byte workspace.
+**Implemented in code:** `#ifdef USE_CUDNN_LEGACY` block — `get_handle()`, `WinoPlan` / `get_wino_plan()` (descriptors + `cudnnGetConvolutionForwardWorkspaceSize`, 1.5 GB cap), `cudnn_winograd_conv()` with static `g_wino_ws` (`at::empty({ws}, kByte)`).
+
+**Plan item 2:** Delete all `contiguous(ChannelsLast)` conversions; pipeline stays NCHW.
+**Implemented in code:** `forward_nchw()` (no ChannelsLast anywhere; only plain `.contiguous()` on already-NCHW inputs, done once in `fused_resblock`). ChannelsLast code survives solely inside the legacy fallback `forward_nhwc()`.
+
+**Plan item 3:** NCHW `gn_stats` kernel, grid=(nchunks, N*G), block=256, float4 loads over the contiguous `cpg*HW` group region, block reduction, same psum/psq layout.
+**Implemented in code:** `gn_stats_nchw_kernel` + host launcher `compute_affine_nchw()`.
+
+**Plan item 4:** Keep `gn_finalize_kernel` unchanged.
+**Implemented in code:** `gn_finalize_kernel` (byte-identical to base), reused by `compute_affine_nchw()` and `compute_affine_nhwc()`.
+
+**Plan item 5:** NCHW float4 elementwise affine+SiLU using shift/mask channel indexing with divide fallback.
+**Implemented in code:** `gn_apply_nchw_kernel<false>` (`nc = (hw4shift>=0) ? (j>>hw4shift) : (j/HW4)`), launched by `launch_apply_nchw()`.
+
+**Plan item 6:** Plain NCHW float4 residual epilogue `out4 = silu(y4*a+b) + x4`, no shared memory / transpose.
+**Implemented in code:** `gn_apply_nchw_kernel<true>` (same kernel, `HAS_RES` template branch), final launch in `forward_nchw()`.
+
+**Plan item 7:** Static per-(N,C,H,W) cache, one-time timed autotune of the new NCHW path vs. the existing NHWC TF32 path, fallbacks on handle/algo failure.
+**Implemented in code:** `g_path_cache` + `autotune()` (`time_fn()` with cudaEvents) called once from `fused_resblock`; `conv3x3_nchw()` mode 0 = legacy Winograd, mode 1 = ATen NCHW, path 2 = existing NHWC; python-side 3-tier `_build()` (cuDNN-legacy → no-legacy → ATen-conv-only).
+
+**Plan item 8:** Numerics gate before keeping the Winograd path.
+**Implemented in code:** `close_enough()` in `autotune()` — elementwise check against half the harness tolerance (`5e-4 + 5e-4*|ref|`); a path that fails is discarded (deviation: gate is vs. the TF32 reference path output instead of an offline max-diff table, since the harness reference itself is TF32).
+
+**Plan item 9:** Fresh `at::empty` outputs, no aliasing with `x`, no device moves, eps double from python.
+**Implemented in code:** all allocations in `forward_nchw()` / `compute_affine_nchw()` use `at::empty`/`at::empty_like`; residual read from `x_nchw`, written to a distinct `out`; `ModelNew.forward` passes `eps_f` as double.
+
+=== KERNEL CODE STARTS BELOW ===
+
+```python
+# ==========================================================================
+# ModelNew — SOL problem 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# Optimisation applied: conv_algo_winograd
+#   * conv mainloop switched to cuDNN legacy FP32 WINOGRAD_NONFUSED on native
+#     NCHW/KCRS operands (no TF32, no layout conversion),
+#   * the whole pipeline therefore stays NCHW: all channels_last copies and the
+#     NHWC->NCHW transpose epilogue are deleted,
+#   * GroupNorm stats / affine+SiLU / residual kernels rewritten for NCHW with
+#     float4 accesses,
+#   * a one-time timed + accuracy-gated autotune keeps the previous NHWC/TF32
+#     implementation as an anti-regression fallback.
+# ==========================================================================
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_SRC = r'''
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <map>
+#include <array>
+#include <mutex>
+#include <functional>
+#include <algorithm>
+
+#ifdef USE_CUDNN_LEGACY
+#include <cudnn.h>
+#endif
+
+__device__ __forceinline__ float silu_f(float v) {
+    return v / (1.0f + expf(-v));
+}
+
+// ===========================================================================
+// (plan 4) unchanged deterministic finalize: one block per (n,g)
+// ===========================================================================
+__global__ void gn_finalize_kernel(const float* __restrict__ psum,
+                                   const float* __restrict__ psq,
+                                   const float* __restrict__ w,
+                                   const float* __restrict__ bias,
+                                   float* __restrict__ A,
+                                   float* __restrict__ B,
+                                   int nchunks, int C, int G, int cpg,
+                                   float eps, float inv_count)
+{
+    extern __shared__ double sh[];
+    const int idx = blockIdx.x;          // n*G + g
+    const int n = idx / G;
+    const int g = idx - n * G;
+    const int t = threadIdx.x;
+    const int nt = blockDim.x;
+
+    double s = 0.0, ss = 0.0;
+    const size_t base = (size_t)idx * (size_t)nchunks;
+    for (int i = t; i < nchunks; i += nt) {
+        s  += (double)psum[base + i];
+        ss += (double)psq[base + i];
+    }
+    sh[t]      = s;
+    sh[nt + t] = ss;
+    __syncthreads();
+    for (int st = nt >> 1; st > 0; st >>= 1) {
+        if (t < st) {
+            sh[t]      += sh[t + st];
+            sh[nt + t] += sh[nt + t + st];
+        }
+        __syncthreads();
+    }
+
+    const double mean = sh[0] * (double)inv_count;
+    double var = sh[nt] * (double)inv_count - mean * mean;
+    if (var < 0.0) var = 0.0;
+    const float rstd = 1.0f / sqrtf((float)var + eps);
+
+    if (t < cpg) {
+        const int c = g * cpg + t;
+        const float sc = rstd * w[c];
+        A[n * C + c] = sc;
+        B[n * C + c] = bias[c] - (float)mean * sc;
+    }
+}
+
+// ===========================================================================
+// (plan 3) NCHW GroupNorm statistics.
+// grid = (nchunks, N*G), block = 256.  The cpg channels of a group are
+// contiguous in NCHW, so a group is one contiguous run of cpg*HW floats.
+// ===========================================================================
+__global__ void gn_stats_nchw_kernel(const float* __restrict__ x,
+                                     float* __restrict__ psum,
+                                     float* __restrict__ psq,
+                                     long groupElems, long chunk, int nchunks)
+{
+    const int idx = blockIdx.y;          // n*G + g
+    const int cid = blockIdx.x;
+    const size_t oidx = (size_t)idx * (size_t)nchunks + (size_t)cid;
+
+    long e0 = (long)cid * chunk;
+    if (e0 >= groupElems) {
+        if (threadIdx.x == 0) { psum[oidx] = 0.f; psq[oidx] = 0.f; }
+        return;
+    }
+    long e1 = e0 + chunk;
+    if (e1 > groupElems) e1 = groupElems;
+
+    const float4* __restrict__ p4 =
+        reinterpret_cast<const float4*>(x + (size_t)idx * (size_t)groupElems);
+
+    float s = 0.f, ss = 0.f;
+    const long v0 = e0 >> 2, v1 = e1 >> 2;
+    for (long i = v0 + threadIdx.x; i < v1; i += blockDim.x) {
+        const float4 v = p4[i];
+        s  += v.x + v.y + v.z + v.w;
+        ss  = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s  += __shfl_down_sync(0xffffffffu, s,  off);
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    }
+
+    __shared__ float wsum[32];
+    __shared__ float wsq[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) { wsum[warp] = s; wsq[warp] = ss; }
+    __syncthreads();
+
+    if (warp == 0) {
+        const int nw = blockDim.x >> 5;
+        s  = (lane < nw) ? wsum[lane] : 0.f;
+        ss = (lane < nw) ? wsq[lane]  : 0.f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            s  += __shfl_down_sync(0xffffffffu, s,  off);
+            ss += __shfl_down_sync(0xffffffffu, ss, off);
+        }
+        if (lane == 0) { psum[oidx] = s; psq[oidx] = ss; }
+    }
+}
+
+// ===========================================================================
+// (plan 5 + 6) NCHW float4 affine + SiLU (+ optional residual) elementwise.
+// nc = j >> hw4shift  (== n*C + c) when HW/4 is a power of two, divide else.
+// ===========================================================================
+template<bool HAS_RES>
+__global__ void gn_apply_nchw_kernel(const float* __restrict__ y,
+                                     const float* __restrict__ A,
+                                     const float* __restrict__ B,
+                                     const float* __restrict__ res,
+                                     float* __restrict__ out,
+                                     long total4, long HW4, int hw4shift)
+{
+    const float4* __restrict__ y4 = reinterpret_cast<const float4*>(y);
+    const float4* __restrict__ r4 = reinterpret_cast<const float4*>(res);
+    float4* __restrict__ o4       = reinterpret_cast<float4*>(out);
+
+    const long stride = (long)gridDim.x * (long)blockDim.x;
+    for (long j = (long)blockIdx.x * blockDim.x + threadIdx.x; j < total4; j += stride) {
+        const long nc = (hw4shift >= 0) ? (j >> hw4shift) : (j / HW4);
+        const float a = __ldg(A + nc);
+        const float b = __ldg(B + nc);
+        const float4 v = y4[j];
+        float4 r;
+        r.x = silu_f(fmaf(v.x, a, b));
+        r.y = silu_f(fmaf(v.y, a, b));
+        r.z = silu_f(fmaf(v.z, a, b));
+        r.w = silu_f(fmaf(v.w, a, b));
+        if (HAS_RES) {
+            const float4 rv = r4[j];
+            r.x += rv.x; r.y += rv.y; r.z += rv.z; r.w += rv.w;
+        }
+        o4[j] = r;
+    }
+}
+
+// ===========================================================================
+// Legacy NHWC kernels (kept only for the anti-regression fallback path)
+// ===========================================================================
+__global__ void gn_stats_kernel(const float* __restrict__ x,
+                                float* __restrict__ psum,
+                                float* __restrict__ psq,
+                                int HW, int C, int G, int cpg,
+                                int chunk, int nchunks)
+{
+    const int n   = blockIdx.y;
+    const int cid = blockIdx.x;
+    const int hw0 = cid * chunk;
+    int hw1 = hw0 + chunk;
+    if (hw1 > HW) hw1 = HW;
+
+    const int c = threadIdx.x;
+    float s = 0.f, ss = 0.f;
+
+    if (hw0 < hw1) {
+        const float* p = x + ((size_t)n * (size_t)HW + (size_t)hw0) * (size_t)C + c;
+        for (int hw = hw0; hw < hw1; ++hw) {
+            float v = *p;
+            p += C;
+            s  += v;
+            ss += v * v;
+        }
+    }
+
+    #pragma unroll 1
+    for (int off = cpg >> 1; off >= 1; off >>= 1) {
+        s  += __shfl_down_sync(0xffffffffu, s,  off);
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    }
+
+    if ((c % cpg) == 0) {
+        const int g = c / cpg;
+        const size_t idx = ((size_t)n * (size_t)G + (size_t)g) * (size_t)nchunks + (size_t)cid;
+        psum[idx] = s;
+        psq[idx]  = ss;
+    }
+}
+
+__global__ void gn_apply_kernel(const float* __restrict__ x,
+                                const float* __restrict__ A,
+                                const float* __restrict__ B,
+                                float* __restrict__ out,
+                                long HWC4, int C4, int C4mask)
+{
+    const int n = blockIdx.y;
+    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(x) + (size_t)n * (size_t)HWC4;
+    float4* __restrict__ o4       = reinterpret_cast<float4*>(out)     + (size_t)n * (size_t)HWC4;
+    const float4* __restrict__ a4 = reinterpret_cast<const float4*>(A) + (size_t)n * (size_t)C4;
+    const float4* __restrict__ b4 = reinterpret_cast<const float4*>(B) + (size_t)n * (size_t)C4;
+
+    const long stride = (long)gridDim.x * (long)blockDim.x;
+    for (long j = (long)blockIdx.x * blockDim.x + threadIdx.x; j < HWC4; j += stride) {
+        const int c4 = (C4mask >= 0) ? ((int)j & C4mask) : (int)(j % (long)C4);
+        const float4 v  = x4[j];
+        const float4 av = a4[c4];
+        const float4 bv = b4[c4];
+        float4 r;
+        r.x = silu_f(v.x * av.x + bv.x);
+        r.y = silu_f(v.y * av.y + bv.y);
+        r.z = silu_f(v.z * av.z + bv.z);
+        r.w = silu_f(v.w * av.w + bv.w);
+        o4[j] = r;
+    }
+}
+
+__global__ void gn_apply_transpose_kernel(const float* __restrict__ y,
+                                          const float* __restrict__ A,
+                                          const float* __restrict__ B,
+                                          const float* __restrict__ res, // NCHW
+                                          float* __restrict__ out,       // NCHW
+                                          int HW, int C)
+{
+    __shared__ float sh[32][33];
+    const int n   = blockIdx.z;
+    const int hw0 = blockIdx.x * 32;
+    const int c0  = blockIdx.y * 32;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int c = c0 + tx;
+    const float av = A[n * C + c];
+    const float bv = B[n * C + c];
+
+    const float* p = y + ((size_t)n * (size_t)HW + (size_t)(hw0 + ty)) * (size_t)C + (size_t)c;
+    #pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const float v = p[(size_t)k * (size_t)C];
+        sh[ty + k][tx] = silu_f(v * av + bv);
+    }
+    __syncthreads();
+
+    const size_t obase = ((size_t)n * (size_t)C + (size_t)(c0 + ty)) * (size_t)HW
+                         + (size_t)(hw0 + tx);
+    #pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const size_t off = obase + (size_t)k * (size_t)HW;
+        out[off] = sh[tx][ty + k] + res[off];
+    }
+}
+
+__global__ void add_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                           float* __restrict__ o, long N4)
+{
+    const long stride = (long)gridDim.x * (long)blockDim.x;
+    const float4* a4 = reinterpret_cast<const float4*>(a);
+    const float4* b4 = reinterpret_cast<const float4*>(b);
+    float4* o4 = reinterpret_cast<float4*>(o);
+    for (long j = (long)blockIdx.x * blockDim.x + threadIdx.x; j < N4; j += stride) {
+        float4 x = a4[j], y = b4[j], r;
+        r.x = x.x + y.x; r.y = x.y + y.y; r.z = x.z + y.z; r.w = x.w + y.w;
+        o4[j] = r;
+    }
+}
+
+// ===========================================================================
+// (plan 1) cuDNN legacy FP32 WINOGRAD_NONFUSED, native NCHW / KCRS
+// ===========================================================================
+#ifdef USE_CUDNN_LEGACY
+static cudnnHandle_t g_handle = nullptr;
+static bool g_handle_ok = false;
+static bool g_handle_tried = false;
+
+static cudnnHandle_t get_handle() {
+    if (!g_handle_tried) {
+        g_handle_tried = true;
+        g_handle_ok = (cudnnCreate(&g_handle) == CUDNN_STATUS_SUCCESS);
+    }
+    return g_handle_ok ? g_handle : nullptr;
+}
+
+struct WinoPlan {
+    cudnnTensorDescriptor_t xd = nullptr, yd = nullptr;
+    cudnnFilterDescriptor_t wd = nullptr;
+    cudnnConvolutionDescriptor_t cd = nullptr;
+    size_t ws = 0;
+    bool valid = false;
+};
+
+static std::map<std::array<int,5>, WinoPlan> g_wino_plans;
+static at::Tensor g_wino_ws;
+static const size_t WS_LIMIT = (size_t)1610612736ULL;   // 1.5 GB
+
+static const WinoPlan* get_wino_plan(int N, int C, int H, int W, int K)
+{
+    std::array<int,5> key{N, C, H, W, K};
+    auto it = g_wino_plans.find(key);
+    if (it != g_wino_plans.end()) return it->second.valid ? &(it->second) : nullptr;
+
+    WinoPlan p;
+    cudnnHandle_t h = get_handle();
+    bool ok = (h != nullptr);
+
+    if (ok) ok = (cudnnCreateTensorDescriptor(&p.xd) == CUDNN_STATUS_SUCCESS);
+    if (ok) ok = (cudnnCreateTensorDescriptor(&p.yd) == CUDNN_STATUS_SUCCESS);
+    if (ok) ok = (cudnnCreateFilterDescriptor(&p.wd) == CUDNN_STATUS_SUCCESS);
+    if (ok) ok = (cudnnCreateConvolutionDescriptor(&p.cd) == CUDNN_STATUS_SUCCESS);
+    if (ok) ok = (cudnnSetTensor4dDescriptor(p.xd, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                             N, C, H, W) == CUDNN_STATUS_SUCCESS);
+    if (ok) ok = (cudnnSetTensor4dDescriptor(p.yd, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                             N, K, H, W) == CUDNN_STATUS_SUCCESS);
+    if (ok) ok = (cudnnSetFilter4dDescriptor(p.wd, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+                                             K, C, 3, 3) == CUDNN_STATUS_SUCCESS);
+    if (ok) ok = (cudnnSetConvolution2dDescriptor(p.cd, 1, 1, 1, 1, 1, 1,
+                                                  CUDNN_CROSS_CORRELATION,
+                                                  CUDNN_DATA_FLOAT) == CUDNN_STATUS_SUCCESS);
+    if (ok) ok = (cudnnSetConvolutionMathType(p.cd, CUDNN_DEFAULT_MATH) == CUDNN_STATUS_SUCCESS);
+    if (ok) {
+        cudnnStatus_t st = cudnnGetConvolutionForwardWorkspaceSize(
+            h, p.xd, p.wd, p.cd, p.yd,
+            CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED, &p.ws);
+        ok = (st == CUDNN_STATUS_SUCCESS) && (p.ws <= WS_LIMIT);
+    }
+
+    if (!ok) {
+        if (p.cd) cudnnDestroyConvolutionDescriptor(p.cd);
+        if (p.wd) cudnnDestroyFilterDescriptor(p.wd);
+        if (p.yd) cudnnDestroyTensorDescriptor(p.yd);
+        if (p.xd) cudnnDestroyTensorDescriptor(p.xd);
+        p.xd = nullptr; p.yd = nullptr; p.wd = nullptr; p.cd = nullptr;
+    }
+    p.valid = ok;
+    g_wino_plans[key] = p;
+    WinoPlan& slot = g_wino_plans[key];
+    return slot.valid ? &slot : nullptr;
+}
+
+static bool cudnn_winograd_conv(const at::Tensor& x, const at::Tensor& w, at::Tensor& out)
+{
+    if (x.dim() != 4 || w.dim() != 4) return false;
+    if (w.size(2) != 3 || w.size(3) != 3 || w.size(1) != x.size(1)) return false;
+    const int N = (int)x.size(0), C = (int)x.size(1);
+    const int H = (int)x.size(2), W = (int)x.size(3);
+    const int K = (int)w.size(0);
+
+    const WinoPlan* p = get_wino_plan(N, C, H, W, K);
+    if (p == nullptr) return false;
+
+    cudnnHandle_t h = get_handle();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (cudnnSetStream(h, stream.stream()) != CUDNN_STATUS_SUCCESS) return false;
+
+    if (p->ws > 0) {
+        if (!g_wino_ws.defined() || (size_t)g_wino_ws.numel() < p->ws) {
+            g_wino_ws = at::empty({(long)p->ws}, x.options().dtype(at::kByte));
+        }
+    }
+    void* wsp = (p->ws > 0) ? g_wino_ws.data_ptr() : nullptr;
+
+    out = at::empty({(long)N, (long)K, (long)H, (long)W}, x.options());
+    const float alpha = 1.f, beta = 0.f;
+    cudnnStatus_t st = cudnnConvolutionForward(
+        h, &alpha, p->xd, x.data_ptr<float>(), p->wd, w.data_ptr<float>(),
+        p->cd, CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED, wsp, p->ws,
+        &beta, p->yd, out.data_ptr<float>());
+    return st == CUDNN_STATUS_SUCCESS;
+}
+#endif  // USE_CUDNN_LEGACY
+
+// ---------------------------------------------------------------------------
+// conv helpers
+// ---------------------------------------------------------------------------
+static inline at::Tensor conv3x3_vendor(const at::Tensor& x, const at::Tensor& w) {
+#ifdef USE_ATEN_CONV_ONLY
+    return at::conv2d(x, w, {}, {1, 1}, {1, 1}, {1, 1}, 1);
+#else
+    return at::cudnn_convolution(x, w, {1, 1}, {1, 1}, {1, 1}, 1,
+                                 /*benchmark=*/true, /*deterministic=*/false,
+                                 /*allow_tf32=*/true);
+#endif
+}
+
+// mode 0 : legacy cuDNN fp32 Winograd (NCHW)   mode 1 : ATen vendor NCHW
+static bool conv3x3_nchw(const at::Tensor& x, const at::Tensor& w, int mode, at::Tensor& out)
+{
+    if (mode == 0) {
+#ifdef USE_CUDNN_LEGACY
+        return cudnn_winograd_conv(x, w, out);
+#else
+        return false;
+#endif
+    }
+    at::Tensor y = conv3x3_vendor(x, w);
+    if (!y.is_contiguous()) y = y.contiguous();
+    out = y;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// (plan 3 + 4) NCHW affine computation
+// ---------------------------------------------------------------------------
+static void compute_affine_nchw(const at::Tensor& y, const at::Tensor& w, const at::Tensor& bias,
+                                double eps, at::Tensor& A, at::Tensor& Bt,
+                                int Bn, int C, int HW, int G)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int cpg = C / G;
+    const long groupElems = (long)cpg * (long)HW;
+    const int NG = Bn * G;
+
+    int nchunks = (2048 + NG - 1) / NG;
+    if (nchunks < 1) nchunks = 1;
+    long chunk = (groupElems + nchunks - 1) / nchunks;
+    chunk = (chunk + 3L) & ~3L;
+    if (chunk < 4) chunk = 4;
+    nchunks = (int)((groupElems + chunk - 1) / chunk);
+
+    auto psum = at::empty({(long)NG * nchunks}, y.options());
+    auto psq  = at::empty({(long)NG * nchunks}, y.options());
+
+    dim3 grid(nchunks, NG);
+    gn_stats_nchw_kernel<<<grid, 256, 0, stream>>>(
+        y.data_ptr<float>(), psum.data_ptr<float>(), psq.data_ptr<float>(),
+        groupElems, chunk, nchunks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const int fthreads = 128;
+    const float inv_count = (float)(1.0 / ((double)HW * (double)cpg));
+    gn_finalize_kernel<<<NG, fthreads, 2 * fthreads * sizeof(double), stream>>>(
+        psum.data_ptr<float>(), psq.data_ptr<float>(),
+        w.data_ptr<float>(), bias.data_ptr<float>(),
+        A.data_ptr<float>(), Bt.data_ptr<float>(),
+        nchunks, C, G, cpg, (float)eps, inv_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// (plan 5 + 6) launcher for the NCHW elementwise epilogues
+static void launch_apply_nchw(const at::Tensor& y, const at::Tensor& A, const at::Tensor& Bt,
+                              const at::Tensor* res, at::Tensor& out,
+                              int Bn, int C, int HW)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const long HW4 = (long)HW / 4;
+    const long total4 = (long)Bn * (long)C * HW4;
+    int shift = -1;
+    if ((HW4 & (HW4 - 1)) == 0) { int s = 0; while ((1L << s) < HW4) ++s; shift = s; }
+
+    long nbl = (total4 + 255) / 256;
+    if (nbl > 16384) nbl = 16384;
+    const int nb = (int)nbl;
+
+    if (res != nullptr) {
+        gn_apply_nchw_kernel<true><<<nb, 256, 0, stream>>>(
+            y.data_ptr<float>(), A.data_ptr<float>(), Bt.data_ptr<float>(),
+            res->data_ptr<float>(), out.data_ptr<float>(), total4, HW4, shift);
+    } else {
+        gn_apply_nchw_kernel<false><<<nb, 256, 0, stream>>>(
+            y.data_ptr<float>(), A.data_ptr<float>(), Bt.data_ptr<float>(),
+            nullptr, out.data_ptr<float>(), total4, HW4, shift);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// (plan 2 + 9) full NCHW forward — no layout copies, no transpose
+// ---------------------------------------------------------------------------
+static bool forward_nchw(const at::Tensor& x_nchw,
+                         const at::Tensor& w1, const at::Tensor& n1w, const at::Tensor& n1b,
+                         const at::Tensor& w2, const at::Tensor& n2w, const at::Tensor& n2b,
+                         double eps, int convmode, at::Tensor& outref)
+{
+    const int Bn = (int)x_nchw.size(0);
+    const int C  = (int)x_nchw.size(1);
+    const int H  = (int)x_nchw.size(2);
+    const int W  = (int)x_nchw.size(3);
+    const int HW = H * W;
+    const int G  = 32;
+    if ((HW % 4) != 0) return false;
+
+    at::Tensor y1;
+    if (!conv3x3_nchw(x_nchw, w1, convmode, y1)) return false;
+
+    auto opts = x_nchw.options();
+    auto A1 = at::empty({(long)Bn, (long)C}, opts);
+    auto B1 = at::empty({(long)Bn, (long)C}, opts);
+    compute_affine_nchw(y1, n1w, n1b, eps, A1, B1, Bn, C, HW, G);
+
+    auto t1 = at::empty({(long)Bn, (long)C, (long)H, (long)W}, opts);
+    launch_apply_nchw(y1, A1, B1, nullptr, t1, Bn, C, HW);
+
+    at::Tensor y2;
+    if (!conv3x3_nchw(t1, w2, convmode, y2)) return false;
+
+    auto A2 = at::empty({(long)Bn, (long)C}, opts);
+    auto B2 = at::empty({(long)Bn, (long)C}, opts);
+    compute_affine_nchw(y2, n2w, n2b, eps, A2, B2, Bn, C, HW, G);
+
+    auto out = at::empty({(long)Bn, (long)C, (long)H, (long)W}, opts);
+    launch_apply_nchw(y2, A2, B2, &x_nchw, out, Bn, C, HW);
+
+    outref = out;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// legacy NHWC / TF32 forward (anti-regression fallback, plan 7)
+// ---------------------------------------------------------------------------
+static void compute_affine_nhwc(const at::Tensor& y, const at::Tensor& w, const at::Tensor& bias,
+                                double eps, at::Tensor& A, at::Tensor& Bt,
+                                int Bn, int C, int HW, int G)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int cpg = C / G;
+
+    int nchunks = (512 + Bn - 1) / Bn;
+    if (nchunks > HW) nchunks = HW;
+    if (nchunks < 1) nchunks = 1;
+    int chunk = (HW + nchunks - 1) / nchunks;
+    nchunks = (HW + chunk - 1) / chunk;
+
+    auto opts = y.options();
+    auto psum = at::empty({(long)Bn * G * nchunks}, opts);
+    auto psq  = at::empty({(long)Bn * G * nchunks}, opts);
+
+    dim3 grid(nchunks, Bn);
+    gn_stats_kernel<<<grid, C, 0, stream>>>(
+        y.data_ptr<float>(), psum.data_ptr<float>(), psq.data_ptr<float>(),
+        HW, C, G, cpg, chunk, nchunks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const int fthreads = 128;
+    const float inv_count = (float)(1.0 / ((double)HW * (double)cpg));
+    gn_finalize_kernel<<<Bn * G, fthreads, 2 * fthreads * sizeof(double), stream>>>(
+        psum.data_ptr<float>(), psq.data_ptr<float>(),
+        w.data_ptr<float>(), bias.data_ptr<float>(),
+        A.data_ptr<float>(), Bt.data_ptr<float>(),
+        nchunks, C, G, cpg, (float)eps, inv_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+static at::Tensor forward_nhwc(const at::Tensor& x_nchw,
+                               const at::Tensor& conv1_weight,
+                               const at::Tensor& n1w, const at::Tensor& n1b,
+                               const at::Tensor& conv2_weight,
+                               const at::Tensor& n2w, const at::Tensor& n2b,
+                               double eps)
+{
+    const int Bn = (int)x_nchw.size(0);
+    const int C  = (int)x_nchw.size(1);
+    const int H  = (int)x_nchw.size(2);
+    const int W  = (int)x_nchw.size(3);
+    const int HW = H * W;
+    const int G  = 32;
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto xc = x_nchw.contiguous(at::MemoryFormat::ChannelsLast);
+    auto w1 = conv1_weight.contiguous(at::MemoryFormat::ChannelsLast);
+    auto w2 = conv2_weight.contiguous(at::MemoryFormat::ChannelsLast);
+
+    auto affine_opts = x_nchw.options();
+    auto A1 = at::empty({(long)Bn, (long)C}, affine_opts);
+    auto B1 = at::empty({(long)Bn, (long)C}, affine_opts);
+
+    auto y1 = conv3x3_vendor(xc, w1);
+    y1 = y1.contiguous(at::MemoryFormat::ChannelsLast);
+
+    compute_affine_nhwc(y1, n1w, n1b, eps, A1, B1, Bn, C, HW, G);
+    auto t1 = at::empty_like(y1);
+    {
+        const long HWC4 = (long)HW * (long)C / 4;
+        const int C4 = C / 4;
+        const int C4mask = ((C4 & (C4 - 1)) == 0) ? (C4 - 1) : -1;
+        int blocksX = (int)((HWC4 + 255) / 256);
+        if (blocksX > 4096) blocksX = 4096;
+        dim3 grid(blocksX, Bn);
+        gn_apply_kernel<<<grid, 256, 0, stream>>>(
+            y1.data_ptr<float>(), A1.data_ptr<float>(), B1.data_ptr<float>(),
+            t1.data_ptr<float>(), HWC4, C4, C4mask);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    auto y2 = conv3x3_vendor(t1, w2);
+    y2 = y2.contiguous(at::MemoryFormat::ChannelsLast);
+
+    auto A2 = at::empty({(long)Bn, (long)C}, affine_opts);
+    auto B2 = at::empty({(long)Bn, (long)C}, affine_opts);
+    compute_affine_nhwc(y2, n2w, n2b, eps, A2, B2, Bn, C, HW, G);
+
+    if ((HW % 32) == 0 && (C % 32) == 0) {
+        auto out = at::empty({(long)Bn, (long)C, (long)H, (long)W}, affine_opts);
+        dim3 grid(HW / 32, C / 32, Bn);
+        dim3 block(32, 8);
+        gn_apply_transpose_kernel<<<grid, block, 0, stream>>>(
+            y2.data_ptr<float>(), A2.data_ptr<float>(), B2.data_ptr<float>(),
+            x_nchw.data_ptr<float>(), out.data_ptr<float>(), HW, C);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return out;
+    } else {
+        auto t2 = at::empty_like(y2);
+        const long HWC4 = (long)HW * (long)C / 4;
+        const int C4 = C / 4;
+        const int C4mask = ((C4 & (C4 - 1)) == 0) ? (C4 - 1) : -1;
+        int blocksX = (int)((HWC4 + 255) / 256);
+        if (blocksX > 4096) blocksX = 4096;
+        dim3 grid(blocksX, Bn);
+        gn_apply_kernel<<<grid, 256, 0, stream>>>(
+            y2.data_ptr<float>(), A2.data_ptr<float>(), B2.data_ptr<float>(),
+            t2.data_ptr<float>(), HWC4, C4, C4mask);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        auto o = at::empty_like(t2);
+        const long N4 = (long)Bn * HWC4;
+        int nb = (int)((N4 + 255) / 256);
+        if (nb > 8192) nb = 8192;
+        add_kernel<<<nb, 256, 0, stream>>>(t2.data_ptr<float>(), xc.data_ptr<float>(),
+                                           o.data_ptr<float>(), N4);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return o.contiguous();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (plan 7 + 8) one-time timed + accuracy-gated autotune, per-shape cache
+// ---------------------------------------------------------------------------
+static std::map<std::array<int,4>, int> g_path_cache;
+static std::mutex g_cache_mtx;
+
+static float time_fn(const std::function<void()>& f, int iters)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    f();
+    cudaStreamSynchronize(stream);
+    cudaEventRecord(e0, stream);
+    for (int i = 0; i < iters; ++i) f();
+    cudaEventRecord(e1, stream);
+    cudaEventSynchronize(e1);
+    float ms = 0.f;
+    cudaEventElapsedTime(&ms, e0, e1);
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    return ms / (float)iters;
+}
+
+static bool close_enough(const at::Tensor& a, const at::Tensor& b)
+{
+    // half of the harness budget (atol=rtol=1e-3) against the vendor TF32 path
+    auto diff = (a - b).abs();
+    auto tol  = b.abs() * 5.0e-4 + 5.0e-4;
+    return (diff <= tol).all().item<bool>();
+}
+
+static int autotune(const at::Tensor& x_nchw,
+                    const at::Tensor& w1n, const at::Tensor& n1w, const at::Tensor& n1b,
+                    const at::Tensor& w2n, const at::
+```python
+                    const at::Tensor& w2n, const at::Tensor& n2w, const at::Tensor& n2b,
+                    double eps)
+{
+    // baseline: existing NHWC / TF32 implementation (always available)
+    at::Tensor ref = forward_nhwc(x_nchw, w1n, n1w, n1b, w2n, n2w, n2b, eps);
+    float best_t = time_fn([&]{ (void)forward_nhwc(x_nchw, w1n, n1w, n1b, w2n, n2w, n2b, eps); }, 3);
+    int best_path = 2;
+
+    const int modes[2] = {0, 1};   // 0 = legacy fp32 Winograd NCHW, 1 = vendor NCHW
+    for (int mi = 0; mi < 2; ++mi) {
+        const int mode = modes[mi];
+        at::Tensor cand;
+        bool ok = false;
+        try {
+            ok = forward_nchw(x_nchw, w1n, n1w, n1b, w2n, n2w, n2b, eps, mode, cand);
+        } catch (const std::exception&) {
+            ok = false;
+        }
+        if (!ok || !cand.defined()) continue;
+
+        bool acc = false;
+        try {
+            acc = close_enough(cand, ref);          // plan item 8: numerics gate
+        } catch (const std::exception&) {
+            acc = false;
+        }
+        if (!acc) continue;
+
+        float t;
+        try {
+            t = time_fn([&]{
+                    at::Tensor tmp;
+                    (void)forward_nchw(x_nchw, w1n, n1w, n1b, w2n, n2w, n2b, eps, mode, tmp);
+                }, 3);
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (t < best_t) { best_t = t; best_path = mode; }
+    }
+    return best_path;
+}
+
+// ---------------------------------------------------------------------------
+// entry point
+// ---------------------------------------------------------------------------
+at::Tensor fused_resblock(at::Tensor x,
+                          at::Tensor conv1_weight,
+                          at::Tensor norm1_weight,
+                          at::Tensor norm1_bias,
+                          at::Tensor conv2_weight,
+                          at::Tensor norm2_weight,
+                          at::Tensor norm2_bias,
+                          double eps)
+{
+    TORCH_CHECK(x.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "input must be float32");
+    TORCH_CHECK(x.dim() == 4, "input must be 4D");
+
+    const int Bn = (int)x.size(0);
+    const int C  = (int)x.size(1);
+    const int H  = (int)x.size(2);
+    const int W  = (int)x.size(3);
+    const int G  = 32;
+    TORCH_CHECK(C % G == 0 && C % 32 == 0 && C <= 1024, "unsupported channel count");
+    const int cpg = C / G;
+    TORCH_CHECK(cpg <= 32 && (32 % cpg) == 0, "unsupported channels-per-group");
+
+    // NCHW-contiguous operands (native layout, no channels_last materialisation)
+    auto x_nchw = x.is_contiguous() ? x : x.contiguous();
+    auto w1n = conv1_weight.is_contiguous() ? conv1_weight : conv1_weight.contiguous();
+    auto w2n = conv2_weight.is_contiguous() ? conv2_weight : conv2_weight.contiguous();
+    auto n1w = norm1_weight.is_contiguous() ? norm1_weight : norm1_weight.contiguous();
+    auto n1b = norm1_bias.is_contiguous()   ? norm1_bias   : norm1_bias.contiguous();
+    auto n2w = norm2_weight.is_contiguous() ? norm2_weight : norm2_weight.contiguous();
+    auto n2b = norm2_bias.is_contiguous()   ? norm2_bias   : norm2_bias.contiguous();
+
+    const std::array<int,4> key{Bn, C, H, W};
+    int path;
+    {
+        std::lock_guard<std::mutex> lk(g_cache_mtx);
+        auto it = g_path_cache.find(key);
+        if (it == g_path_cache.end()) {
+            path = autotune(x_nchw, w1n, n1w, n1b, w2n, n2w, n2b, eps);
+            g_path_cache[key] = path;
+        } else {
+            path = it->second;
+        }
+    }
+
+    if (path == 0 || path == 1) {
+        at::Tensor out;
+        if (forward_nchw(x_nchw, w1n, n1w, n1b, w2n, n2w, n2b, eps, path, out)) return out;
+        std::lock_guard<std::mutex> lk(g_cache_mtx);
+        g_path_cache[key] = 2;   // permanent fallback if the vendor path ever fails
+    }
+    return forward_nhwc(x_nchw, w1n, n1w, n1b, w2n, n2w, n2b, eps);
+}
+'''
+
+_CPP_DECL = (
+    "at::Tensor fused_resblock(at::Tensor x, at::Tensor conv1_weight, "
+    "at::Tensor norm1_weight, at::Tensor norm1_bias, at::Tensor conv2_weight, "
+    "at::Tensor norm2_weight, at::Tensor norm2_bias, double eps);"
+)
+
+_FLAGS_C = ["-O3", "-std=c++20"]
+_FLAGS_CU = [
+    "-O3",
+    "-std=c++20",
+    "--expt-relaxed-constexpr",
+    "-lineinfo",
+    "-gencode=arch=compute_120,code=sm_120",
+]
+
+
+def _cudnn_dirs():
+    incs, libs = [], []
+    try:
+        import nvidia.cudnn  # type: ignore
+        base = os.path.dirname(nvidia.cudnn.__file__)
+        i, l = os.path.join(base, "include"), os.path.join(base, "lib")
+        if os.path.isfile(os.path.join(i, "cudnn.h")):
+            incs.append(i)
+        if os.path.isdir(l):
+            libs.append(l)
+    except Exception:
+        pass
+    tbase = os.path.dirname(torch.__file__)
+    for p in (os.path.join(tbase, "include"), os.path.join(tbase, "lib")):
+        if os.path.isfile(os.path.join(p, "cudnn.h")):
+            incs.append(p)
+    for p in ("/usr/include", "/usr/local/cuda/include", "/usr/include/x86_64-linux-gnu"):
+        if os.path.isfile(os.path.join(p, "cudnn.h")):
+            incs.append(p)
+    for p in ("/usr/lib/x86_64-linux-gnu", "/usr/local/cuda/lib64"):
+        if os.path.isdir(p):
+            libs.append(p)
+    return incs, libs
+
+
+def _build():
+    incs, libs = _cudnn_dirs()
+    ldflags = ["-L" + l for l in libs] + ["-Wl,-rpath," + l for l in libs] + ["-lcudnn"]
+
+    # (1) preferred: cuDNN legacy fp32 WINOGRAD_NONFUSED path available
+    if torch.backends.cudnn.is_available():
+        try:
+            return load_inline(
+                name="vae_resblock_wino_legacy",
+                cpp_sources=_CPP_DECL,
+                cuda_sources=_SRC,
+                functions=["fused_resblock"],
+                verbose=False,
+                extra_cflags=_FLAGS_C + ["-DUSE_CUDNN_LEGACY"],
+                extra_cuda_cflags=_FLAGS_CU + ["-DUSE_CUDNN_LEGACY"],
+                extra_include_paths=incs,
+                extra_ldflags=ldflags,
+            )
+        except Exception:
+            pass
+
+    # (2) no legacy cuDNN header/lib: NCHW path via vendor ATen conv
+    try:
+        return load_inline(
+            name="vae_resblock_wino_nolegacy",
+            cpp_sources=_CPP_DECL,
+            cuda_sources=_SRC,
+            functions=["fused_resblock"],
+            verbose=False,
+            extra_cflags=_FLAGS_C,
+            extra_cuda_cflags=_FLAGS_CU,
+        )
+    except Exception:
+        pass
+
+    # (3) last resort: plain at::conv2d for both layouts
+    return load_inline(
+        name="vae_resblock_wino_atenconv",
+        cpp_sources=_CPP_DECL,
+        cuda_sources=_SRC,
+        functions=["fused_resblock"],
+        verbose=False,
+        extra_cflags=_FLAGS_C + ["-DUSE_ATEN_CONV_ONLY"],
+        extra_cuda_cflags=_FLAGS_CU + ["-DUSE_ATEN_CONV_ONLY"],
+    )
+
+
+_EXT = _build()
+
+
+class ModelNew(nn.Module):
+    """conv3x3 -> GN -> SiLU -> conv3x3 -> GN -> SiLU -> +x, fused (NCHW Winograd)."""
+
+    def __init__(self):
+        super().__init__()
+        self._ext = _EXT
+
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        if torch.is_tensor(eps):
+            eps_f = float(eps.item())
+        else:
+            eps_f = float(eps)
+
+        C = x.size(1)
+        supported = (
+            x.is_cuda
+            and x.dtype == torch.float32
+            and x.dim() == 4
+            and C % 32 == 0
+            and (C // 32) <= 32
+            and (32 % (C // 32)) == 0
+            and C <= 1024
+        )
+        if supported:
+            return self._ext.fused_resblock(
+                x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps_f,
+            )
+
+        # Reference semantics fallback (never taken for this problem's shapes).
+        out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, 32, weight=norm1_weight, bias=norm1_bias, eps=eps_f)
+        out = F.silu(out)
+        out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, 32, weight=norm2_weight, bias=norm2_bias, eps=eps_f)
+        out = F.silu(out)
+        return out + x
+```

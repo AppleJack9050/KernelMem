@@ -1,0 +1,19 @@
+```json
+{
+  "critical_issue": "Graph output returned right after capture without replay; buffer never written, all zeros",
+  "evidence": [
+    "max_abs_err=8.424e+00, mean_abs_err=9.190e-01",
+    "ref_val=8.423773765563965, cand_val=0.0"
+  ],
+  "root_cause": "torch.cuda.graph(...) only records work; the kernels are not executed during capture, so self._static_out (allocated in the graph pool) holds uninitialized/zero data. The capture branch returns self._static_out immediately without calling self._graph.replay(), so the very first (and benchmarked) call yields zeros — max_abs_err equals |ref_val| and mean_abs_err equals mean|ref|.",
+  "trigger_condition": "First forward on supported fp32 CUDA input: signature/pointer check fails, _capture() runs, then _static_out is returned without a replay.",
+  "must_hold_invariants": [
+    "Every returned tensor must be produced by an actually executed kernel (replay or eager)",
+    "Graph-pool output must not be returned before at least one replay()",
+    "Returned buffer contents must not be overwritten by a later replay before comparison"
+  ],
+  "minimal_fix": "After self._capture(tensors, eps_f, sig) succeeds, call self._graph.replay() before `return self._static_out` (return self._static_out.clone() if buffer reuse is a concern).",
+  "patch_anchor": "# Plan item 11: return the graph-pool output directly (no clone); it is a",
+  "confidence": "high"
+}
+```

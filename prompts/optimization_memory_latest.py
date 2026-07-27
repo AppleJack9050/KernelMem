@@ -121,6 +121,17 @@ Your complete response MUST include BOTH sections:
 - After Section A, write the delimiter: `=== KERNEL CODE STARTS BELOW ===`
 - Then output the kernel code block following OUTPUT RULES below.
 
+PRECISION POLICY (STRICT) ──────────────────────────────────────────────
+- Compute in the dtype of the input tensors. NEVER downcast to a narrower dtype for speed.
+- float32 inputs => float32 storage and arithmetic throughout. No __half / half2 /
+  __nv_bfloat16 / fp8, and no reduced-precision tensor-core engines.
+- float16/bfloat16 inputs => use that dtype natively; do not upcast the pipeline either.
+- TF32 for conv/GEMM is allowed (the reference runs TF32 via cudnn.allow_tf32=True).
+- Reductions must accumulate in float32 or wider regardless of storage dtype.
+- Speed must come from scheduling, fusion and reduced memory traffic — NOT from doing
+  less precise arithmetic. A narrower dtype can pass the tolerance check while computing
+  something the reference did not; that is not a valid optimization.
+
 OUTPUT RULES FOR KERNEL CODE (Section B only) ──────────────────────────
 The kernel code block in Section B must follow **exactly** this order:
    1. Imports – `torch`, `torch.nn`, `load_inline`.

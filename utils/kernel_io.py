@@ -13,6 +13,7 @@ Keeping them here avoids duplication across evolution loops / diagnostics.
 """
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import re
 from pathlib import Path
@@ -33,6 +34,69 @@ _CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.S)
 # Match code‑fence opening; language tag is optional
 _CODE_FENCE_OPEN_RE = re.compile(r"```(?:[A-Za-z0-9_+\-]+)?\s*\n?")
 
+# A fence occupying a whole line — the shape a stream-continuation artifact takes.
+_CODE_FENCE_LINE_RE = re.compile(r"(?m)^[ \t]*```[A-Za-z0-9_+\-]*[ \t]*$")
+
+
+def _parses(code: str) -> bool:
+    try:
+        ast.parse(code)
+    except (SyntaxError, ValueError):
+        return False
+    return True
+
+
+def _splice(prev: list[str], nxt: list[str]) -> list[str]:
+    """Join two segments that were split at a stream-continuation boundary.
+
+    A continuation can cut mid-line and then re-emit that line in full, e.g.
+
+        ...const at::Tensor& w2n, const at::          <- cut here
+        ```python                                     <- fence re-opened
+        ...const at::Tensor& w2n, const at::Tensor& n2w,   <- line restarted
+
+    When the last line of *prev* is a strict prefix of the first line of *nxt*,
+    the truncated copy is dropped so the line is not duplicated.
+    """
+    if prev and nxt:
+        tail, head = prev[-1], nxt[0]
+        if tail and tail != head and head.startswith(tail):
+            return prev[:-1] + nxt
+    return prev + nxt
+
+
+def _repair_continuation_fences(text: str) -> str | None:
+    """Rebuild code split across a spurious mid-stream fence.
+
+    The LLM reply can arrive as several text blocks; a continuation may re-open
+    its ```python fence mid-file. The non-greedy block regex then reads that
+    *opening* fence as the *closing* one and silently returns a truncated file,
+    which fails later as an unterminated string literal.
+
+    Segments are spliced one at a time and the result returned as soon as it
+    parses, so a reply that legitimately holds several distinct code blocks is
+    left alone. Returns ``None`` when no repair yields valid Python.
+    """
+    fences = list(_CODE_FENCE_LINE_RE.finditer(text))
+    if len(fences) < 3:
+        return None
+
+    segments = [
+        text[fences[i].end():fences[i + 1].start()].strip("\n").splitlines()
+        for i in range(len(fences) - 1)
+    ]
+    if not segments:
+        return None
+
+    merged = segments[0]
+    for seg in segments[1:]:
+        merged = _splice(merged, seg)
+        candidate = "\n".join(merged).strip() + "\n"
+        if _parses(candidate):
+            return candidate
+    return None
+
+
 def extract_code_block(text: str) -> str:
     """Return the **first** triple‑back‑ticked block in *text*.
 
@@ -40,6 +104,8 @@ def extract_code_block(text: str) -> str:
       found, consume until end of string.
     - If the text contains no ``` fences at all, raise and dump the raw output
       to a timestamped file for debugging.
+    - If the block does not parse as Python, retry across mid-stream
+      continuation fences before giving up (see ``_repair_continuation_fences``).
     """
     if text is None:
         text = ""
@@ -61,7 +127,21 @@ def extract_code_block(text: str) -> str:
         # No closing fence: take everything to the end
         block = text[start:]
 
-    return block.strip() + "\n"
+    block = block.strip() + "\n"
+    if _parses(block):
+        return block
+
+    repaired = _repair_continuation_fences(text)
+    if repaired is not None:
+        print(f"[extract] recovered kernel across a mid-stream continuation fence "
+              f"({len(block.splitlines())} -> {len(repaired.splitlines())} lines)")
+        return repaired
+
+    # Unrepairable: return the original block so the downstream compile error
+    # (and the repair round it triggers) behaves exactly as before.
+    print(f"[extract] WARNING: extracted block does not parse as Python "
+          f"({len(block.splitlines())} lines) and could not be repaired")
+    return block
 
 
 

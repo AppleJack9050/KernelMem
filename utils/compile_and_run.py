@@ -19,6 +19,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 import os
 import signal
 import sys
@@ -740,6 +741,67 @@ def compare_and_bench(
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
 
+            # ---- optional multi-shape scoring --------------------------------
+            # A task may expose get_inputs_extra() -> list of ADDITIONAL input
+            # tuples beyond get_inputs(). The get_inputs() shape stays the sole
+            # profiling/NCU target; these only widen the score so that a kernel
+            # specialised on one shape cannot win on that shape alone. Tasks
+            # without the hook behave exactly as before.
+            def _avg(ts):
+                return sum(ts) / len(ts)
+
+            def _shape_tag(t):
+                for x in t:
+                    if torch.is_tensor(x) and x.dim() >= 2:
+                        return "x".join(str(d) for d in x.shape)
+                return "?"
+
+            per_shape = [{
+                "shape": _shape_tag(inp),
+                "ref_ms": _avg(ref_t),
+                "test_ms": _avg(test_t),
+                "speedup": _avg(ref_t) / _avg(test_t),
+                "max_abs_err": max_err,
+                "primary": True,
+            }]
+
+            get_inputs_extra = getattr(ref_mod, "get_inputs_extra", None)
+            if get_inputs_extra is not None:
+                for extra in get_inputs_extra():
+                    if not isinstance(extra, (list, tuple)):
+                        extra = [extra]
+                    e_ref, _ = _run_once(ref_model, extra, dev)
+                    e_tst, _ = _run_once(test_model, extra, dev)
+                    if TORCH_DEVICE == "cuda":
+                        torch.cuda.synchronize(dev)
+                    e_ref = _first_tensor(e_ref).contiguous()
+                    e_tst = _first_tensor(e_tst).contiguous().to(e_ref.dtype)
+                    e_err = (e_ref - e_tst).abs().max().item()
+                    if not torch.allclose(e_ref, e_tst, atol=tol, rtol=tol):
+                        raise ValueError(
+                            f"Outputs are not close on extra shape {_shape_tag(extra)} "
+                            f"(atol={tol}, rtol={tol}). max_abs_err={e_err:.3e}"
+                        )
+                    e_rt = _bench(ref_model,  extra, dev, warmup, repeat)
+                    e_tt = _bench(test_model, extra, dev, warmup, repeat)
+                    per_shape.append({
+                        "shape": _shape_tag(extra),
+                        "ref_ms": _avg(e_rt),
+                        "test_ms": _avg(e_tt),
+                        "speedup": _avg(e_rt) / _avg(e_tt),
+                        "max_abs_err": e_err,
+                        "primary": False,
+                    })
+                    del e_ref, e_tst
+                    if TORCH_DEVICE == "cuda":
+                        torch.cuda.synchronize(dev)
+                        torch.cuda.empty_cache()
+
+            # Geometric mean over shapes: each shape weighs equally, so a large
+            # shape cannot dominate the score simply by taking longer.
+            _sp = [s["speedup"] for s in per_shape]
+            score = math.exp(sum(math.log(v) for v in _sp) / len(_sp))
+
     except Exception:
         # Raise the full traceback (caught by the caller)
         import traceback as _tb
@@ -766,6 +828,10 @@ def compare_and_bench(
             "all": test_t,
         },
         "num_runs": repeat,
+        # Geometric-mean speedup across every benchmarked shape. Equals the
+        # single-shape ref/test ratio when the task has no get_inputs_extra().
+        "score": score,
+        "per_shape": per_shape,
         "model_init_args": init_args,
         "model_init_kwargs": init_kwargs,
         "seed": seed,

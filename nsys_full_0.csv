@@ -1,0 +1,8 @@
+Kernel Name,kernel_launch_count
+void cutlass__5x_cudnn::Kernel<cutlass_tensorop_s1688fprop_optimized_tf32_128x64_16x6_nhwc_align4>(…,24
+"void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…",36
+"void cudnn::engines_precompiled::convertTensor_kernel<float, float, float, (cudnnKernelDataType_t)2…",48
+"gn_silu_res_apply_nchw(const float *, const float *, float *, const float *, const float *, const f…",12
+"gn_silu_apply_nhwc(const float *, float *, const float *, const float *, const float *, int, int, i…",12
+"gn_stats_kernel(const float *, float *, int, int, int, int, int)",24
+"gn_finalize_kernel(const float *, float *, int, float, float)",24

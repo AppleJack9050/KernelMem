@@ -16,10 +16,14 @@ import statistics
 BASE = pathlib.Path(__file__).parent
 
 BASELINE = ("max-autotune", "out8_maxautotune")
+# run A's fp16 candidate was retracted and its traces deleted: it computed both
+# convs on cuDNN half tensor-core engines, exceeding the workload's max_atol
+# (2.8e-3) on 18/20 shapes. It only ever passed because the framework's own gate
+# ran at tol=1e-2. Not a valid candidate at this problem's declared fp32 precision.
 CANDS = [
-    ("agent8  fp16 (run A best)", "out8_agent_fp16"),
     ("agent8  fp32 (run A seed)", "out8_agent_seed"),
     ("agent8b fp32 (run B best)", "out8b_agent_fp32"),
+    ("agent8c fp32 (run C best)", "out8c_agent_fp32"),
 ]
 
 

@@ -178,6 +178,16 @@ MANDATORY WORKFLOW (STRICT):
   2. Choose ONE primary optimisation method for that hottest non-removable target:
     - Method must be mechanism-distinct from history.
     - Method MUST be tied to the dominant stall/bound evidence; avoid generic suggestions.
+    - PRECISION IS NOT A LEVER. The computation must stay in the dtype the workload
+      supplies — match it, do not change it in either direction.
+      * Never propose downcasting to fp16/bf16/fp8, mixed-precision tensor cores, or any
+        narrower storage/compute dtype than the inputs.
+      * Equally, never propose upcasting an fp16/bf16 workload to fp32; use the input
+        dtype natively.
+      * TF32 for conv/GEMM is fine — the reference uses it.
+      * Reductions may accumulate in fp32 or wider regardless of storage dtype.
+      Reducing bytes moved must come from fusion, layout, caching or reuse, NOT from
+      changing the dtype.
 
 HISTORY (if present):
 - The primary method must be mechanism-distinct from the latest attempt; method_name must be a short mechanism tag.

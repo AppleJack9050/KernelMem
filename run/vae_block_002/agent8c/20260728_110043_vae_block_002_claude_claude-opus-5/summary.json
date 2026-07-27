@@ -1,0 +1,24 @@
+{
+  "avg_speedup": 1.163466118715926,
+  "accuracy": 1.0,
+  "total_tokens_sum": 645065,
+  "num_tasks": 1,
+  "tasks": [
+    {
+      "task": "tasks/vae_block_002.py",
+      "best_score": 1.163466118715926,
+      "best_runnable": true,
+      "task_dir": "/home/otter77/git_project/KernelMem/run/vae_block_002/agent8c/20260728_110043_vae_block_002_claude_claude-opus-5/vae_block_002",
+      "figure": "/home/otter77/git_project/KernelMem/run/vae_block_002/agent8c/20260728_110043_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png",
+      "input_tokens_sum": 469294,
+      "output_tokens_sum": 175771,
+      "total_tokens_sum": 645065,
+      "method_matched_stats": {
+        "total_opt_rounds": 6,
+        "matched_count": 6,
+        "unmatched_count": 0
+      }
+    }
+  ],
+  "timestamp": "2026-07-28 11:41:14"
+}
