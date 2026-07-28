@@ -203,6 +203,35 @@ def _loads_lenient(candidate: str) -> Any | None:
     return None
 
 
+def _last_decodable_json(raw: str) -> Any | None:
+    """Return the last independently-decodable JSON value in *raw*, else None.
+
+    Walks every '{'/'[' and tries ``raw_decode`` from it, so a truncated or
+    otherwise broken value early in the reply cannot hide a well-formed one
+    after it. ``strict=False`` mirrors _loads_lenient: literal newlines inside
+    long prose fields are normal in judge replies.
+    """
+    decoders = (json.JSONDecoder(strict=False), json.JSONDecoder())
+    found: list[Any] = []
+    idx = 0
+    while idx < len(raw):
+        nxt = re.search(r"[{\[]", raw[idx:])
+        if not nxt:
+            break
+        start = idx + nxt.start()
+        for dec in decoders:
+            try:
+                obj, end = dec.raw_decode(raw, start)
+            except ValueError:
+                continue
+            found.append(obj)
+            idx = end
+            break
+        else:
+            idx = start + 1
+    return found[-1] if found else None
+
+
 def extract_json(raw: str) -> Any:
     """
     Extract the first JSON object/array from a string and parse it into a Python object.
@@ -231,6 +260,16 @@ def extract_json(raw: str) -> Any:
         parsed = _loads_lenient(match.group(1).strip())
         if parsed is not None:
             return parsed
+
+    # The regex above is greedy: it spans the FIRST '{' to the LAST '}', so a
+    # reply holding more than one top-level object parses as neither. That is a
+    # real failure mode -- a judge sometimes abandons a half-written object and
+    # restarts, leaving `{truncated...\n{complete...}`. Scan for individually
+    # decodable values instead and keep the LAST one, i.e. the model's final
+    # answer rather than the abandoned draft.
+    parsed = _last_decodable_json(raw)
+    if parsed is not None:
+        return parsed
 
     # Fallback: attempt to parse the whole string
     parsed = _loads_lenient(raw.strip())
