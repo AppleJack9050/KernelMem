@@ -1,0 +1,440 @@
+# ==========================================================================
+# ModelNew — 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# HEADER / PLAN
+# 1) Chosen granularity: (C) fuse many ops into one/few custom CUDA kernels.
+#
+# 2) Ops replaced (all executed inside the load_inline extension):
+#      - F.group_norm  (both instances)      -> custom 2-pass stats kernels
+#      - F.silu        (both instances)      -> fused into the GN apply kernels
+#      - residual add  (out + x)             -> fused into the 2nd apply kernel
+#      - NHWC<->NCHW layout traffic          -> gn_apply2 writes NCHW directly
+#      - NCHW->NHWC layout traffic (x, w1, w2)-> NEW custom shared-memory tiled
+#                                               transpose `tr_cs_to_sc`
+#                                               (replaces PyTorch's generic
+#                                                strided elementwise copies)
+#      - F.conv2d      (both instances)      -> at::conv2d called FROM the
+#                                               extension, fed channels-last so
+#                                               cuDNN runs its native
+#                                               sm90 nhwckrsc TF32 implicit GEMM
+#
+# 3) Fusion map:
+#      k0 tr_cs_to_sc  : (N,C,S) -> (N,S,C) 32x32 tiled transpose, +1 pad
+#      k1 gn_stats_p1  : coalesced NHWC partial sum/sumsq per (batch, chunk, grp)
+#      k2 gn_stats_p2  : deterministic tree reduction (double) -> per-(b,c)
+#      k3 gn_apply1    : (affine GN) + SiLU, float4, NHWC->NHWC
+#      k4 gn_apply2    : (affine GN) + SiLU + residual + NHWC->NCHW transpose
+#
+# Precision: everything stays float32; reductions accumulate fp32 then double.
+# ==========================================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r'''
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+#define NCH  256
+#define NGRP 32
+#define GSZ  8
+#define TP   32
+
+__device__ __forceinline__ float silu_fast(float v) {
+    return v / (1.0f + expf(-v));
+}
+
+// ---------------------------------------------------------------------------
+// PLAN ITEM 1
+// coalesced shared-memory tiled transpose:  dst(n,s,c) = src(n,c,s)
+//   grid  = (ceil(S/32), ceil(C/32), N)
+//   block = dim3(32, 8)
+//   smem  = 32*33*4 = 4224 B  (<< 227 KB/block limit, >=32 blocks/SM)
+// Both global read (32 contiguous floats along S) and global write
+// (32 contiguous floats along C) are full 128 B transactions.
+// ---------------------------------------------------------------------------
+__global__ void tr_cs_to_sc(const float* __restrict__ src,
+                            float* __restrict__ dst,
+                            int N, int C, int S)
+{
+    __shared__ float tile[32][33];
+
+    const int s0 = blockIdx.x * 32;
+    const int c0 = blockIdx.y * 32;
+    const int n  = blockIdx.z;
+
+    const size_t src_base = (size_t)n * (size_t)C * (size_t)S;
+    const size_t dst_base = (size_t)n * (size_t)S * (size_t)C;
+
+    // ---- load: coalesced along S ----
+    #pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const int c = c0 + (int)threadIdx.y + k;
+        const int s = s0 + (int)threadIdx.x;
+        if (c < C && s < S)
+            tile[threadIdx.y + k][threadIdx.x] =
+                src[src_base + (size_t)c * (size_t)S + (size_t)s];
+    }
+    __syncthreads();
+
+    // ---- store: coalesced along C ----
+    #pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const int s = s0 + (int)threadIdx.y + k;
+        const int c = c0 + (int)threadIdx.x;
+        if (s < S && c < C)
+            dst[dst_base + (size_t)s * (size_t)C + (size_t)c] =
+                tile[threadIdx.x][threadIdx.y + k];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pass 1 : per-(batch, chunk, group) partial sum / sum of squares, NHWC input
+// ---------------------------------------------------------------------------
+__global__ void gn_stats_p1(const float* __restrict__ x,
+                            float* __restrict__ part,
+                            int npix, int ppc, int nchunks)
+{
+    const int b     = blockIdx.y;
+    const int chunk = blockIdx.x;
+    const int p0    = chunk * ppc;
+    int p1 = p0 + ppc; if (p1 > npix) p1 = npix;
+
+    const float* base = x + (size_t)b * (size_t)npix * NCH;
+    const int c = threadIdx.x;
+
+    float s = 0.f, q = 0.f;
+    for (int p = p0; p < p1; ++p) {
+        float v = base[(size_t)p * NCH + c];
+        s += v;
+        q += v * v;
+    }
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+        s += __shfl_down_sync(0xffffffffu, s, off, 8);
+        q += __shfl_down_sync(0xffffffffu, q, off, 8);
+    }
+    if ((c & (GSZ - 1)) == 0) {
+        const int g = c >> 3;
+        size_t o = ((size_t)b * (size_t)nchunks + (size_t)chunk) * NGRP + g;
+        part[2 * o + 0] = s;
+        part[2 * o + 1] = q;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pass 2 : deterministic tree reduction over chunks -> per-channel scale/shift
+// ---------------------------------------------------------------------------
+__global__ void gn_stats_p2(const float* __restrict__ part,
+                            const float* __restrict__ gamma,
+                            const float* __restrict__ beta,
+                            float* __restrict__ scale,
+                            float* __restrict__ shift,
+                            int nchunks, int npix, float eps)
+{
+    const int g = blockIdx.x;
+    const int b = blockIdx.y;
+
+    __shared__ double ss[256];
+    __shared__ double sq[256];
+
+    double s = 0.0, q = 0.0;
+    for (int i = threadIdx.x; i < nchunks; i += blockDim.x) {
+        size_t o = ((size_t)b * (size_t)nchunks + (size_t)i) * NGRP + g;
+        s += (double)part[2 * o + 0];
+        q += (double)part[2 * o + 1];
+    }
+    ss[threadIdx.x] = s;
+    sq[threadIdx.x] = q;
+    __syncthreads();
+
+    for (int st = 128; st > 0; st >>= 1) {
+        if ((int)threadIdx.x < st) {
+            ss[threadIdx.x] += ss[threadIdx.x + st];
+            sq[threadIdx.x] += sq[threadIdx.x + st];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x < GSZ) {
+        const double N    = (double)npix * (double)GSZ;
+        const double mean = ss[0] / N;
+        double var        = sq[0] / N - mean * mean;
+        if (var < 0.0) var = 0.0;
+        const double rstd = 1.0 / sqrt(var + (double)eps);
+        const int c = g * GSZ + (int)threadIdx.x;
+        const double gm = (double)gamma[c];
+        scale[b * NCH + c] = (float)(rstd * gm);
+        shift[b * NCH + c] = (float)((double)beta[c] - mean * rstd * gm);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// apply 1 : y = silu(x*scale + shift), NHWC -> NHWC, float4 vectorised
+// ---------------------------------------------------------------------------
+__global__ void gn_apply1(const float* __restrict__ x,
+                          const float* __restrict__ scale,
+                          const float* __restrict__ shift,
+                          float* __restrict__ out,
+                          long nvec_per_img)
+{
+    const int b = blockIdx.y;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nvec_per_img) return;
+
+    const float4* xin = (const float4*)(x   + (size_t)b * (size_t)nvec_per_img * 4);
+    float4*       o   = (float4*)      (out + (size_t)b * (size_t)nvec_per_img * 4);
+
+    const int c4 = (int)(i & 63);
+    float4 v  = xin[i];
+    float4 sc = ((const float4*)(scale + b * NCH))[c4];
+    float4 sh = ((const float4*)(shift + b * NCH))[c4];
+
+    float4 r;
+    r.x = silu_fast(v.x * sc.x + sh.x);
+    r.y = silu_fast(v.y * sc.y + sh.y);
+    r.z = silu_fast(v.z * sc.z + sh.z);
+    r.w = silu_fast(v.w * sc.w + sh.w);
+    o[i] = r;
+}
+
+// ---------------------------------------------------------------------------
+// apply 2 : out(NCHW) = silu(y*scale + shift) + residual(NCHW)
+// ---------------------------------------------------------------------------
+__global__ void gn_apply2(const float* __restrict__ y,
+                          const float* __restrict__ res,
+                          const float* __restrict__ scale,
+                          const float* __restrict__ shift,
+                          float* __restrict__ out,
+                          int npix)
+{
+    __shared__ float sm[NCH * (TP + 1)];
+
+    const int b  = blockIdx.y;
+    const int p0 = blockIdx.x * TP;
+    int np = npix - p0; if (np > TP) np = TP;
+    if (np <= 0) return;
+
+    const float* base = y + (size_t)b * (size_t)npix * NCH;
+    const int c = threadIdx.x;
+    const float sc = scale[b * NCH + c];
+    const float sh = shift[b * NCH + c];
+
+    for (int j = 0; j < np; ++j) {
+        float v = base[(size_t)(p0 + j) * NCH + c];
+        v = v * sc + sh;
+        sm[c * (TP + 1) + j] = silu_fast(v);
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int p    = p0 + lane;
+    if (p < npix) {
+        const size_t imgbase = (size_t)b * NCH * (size_t)npix;
+        for (int cc = warp; cc < NCH; cc += 8) {
+            float v = sm[cc * (TP + 1) + lane];
+            size_t off = imgbase + (size_t)cc * (size_t)npix + (size_t)p;
+            out[off] = v + res[off];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// host entry
+// ---------------------------------------------------------------------------
+static void gn_stats(const at::Tensor& t, const at::Tensor& gamma, const at::Tensor& beta,
+                     at::Tensor& scale, at::Tensor& shift,
+                     int B, int npix, float eps, cudaStream_t stream)
+{
+    int ppc = (npix + 1023) / 1024;
+    if (ppc < 32) ppc = 32;
+    const int nchunks = (npix + ppc - 1) / ppc;
+
+    auto part = at::empty({(long)B * nchunks * NGRP * 2}, t.options());
+
+    dim3 g1(nchunks, B), b1(NCH);
+    gn_stats_p1<<<g1, b1, 0, stream>>>(t.data_ptr<float>(), part.data_ptr<float>(),
+                                       npix, ppc, nchunks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    dim3 g2(NGRP, B), b2(256);
+    gn_stats_p2<<<g2, b2, 0, stream>>>(part.data_ptr<float>(),
+                                       gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                                       scale.data_ptr<float>(), shift.data_ptr<float>(),
+                                       nchunks, npix, eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// PLAN ITEM 2 : single launch helper for the custom NCHW->NHWC transpose
+static inline void launch_tr(const float* src, float* dst,
+                             int N, int C, int S, cudaStream_t stream)
+{
+    dim3 grid((unsigned)((S + 31) / 32), (unsigned)((C + 31) / 32), (unsigned)N);
+    dim3 blk(32, 8);
+    tr_cs_to_sc<<<grid, blk, 0, stream>>>(src, dst, N, C, S);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor w1, torch::Tensor n1w, torch::Tensor n1b,
+                          torch::Tensor w2, torch::Tensor n2w, torch::Tensor n2b,
+                          double eps)
+{
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "float32 only");
+    TORCH_CHECK(x.dim() == 4 && x.size(1) == NCH, "expect (B,256,H,W)");
+
+    const int B = (int)x.size(0);
+    const int H = (int)x.size(2);
+    const int W = (int)x.size(3);
+    const int npix = H * W;
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto xc = x.is_contiguous() ? x : x.contiguous();
+
+    // ---- PLAN ITEM 2 : custom tiled transpose replaces the 3 ATen permutes ----
+    auto xl = at::empty({(long)B, (long)NCH, (long)H, (long)W},
+                        x.options().memory_format(at::MemoryFormat::ChannelsLast));
+    launch_tr(xc.data_ptr<float>(), xl.data_ptr<float>(), B, NCH, npix, stream);
+
+    // weight channels-last memory order is (O, R, S, I): per output filter this is
+    // exactly the (I, R*S) -> (R*S, I) transpose, i.e. N=O, C=I, S=R*S.
+    auto w1c = w1.is_contiguous() ? w1 : w1.contiguous();
+    auto w2c = w2.is_contiguous() ? w2 : w2.contiguous();
+    const int O1 = (int)w1c.size(0), I1 = (int)w1c.size(1);
+    const int S1 = (int)(w1c.size(2) * w1c.size(3));
+    const int O2 = (int)w2c.size(0), I2 = (int)w2c.size(1);
+    const int S2 = (int)(w2c.size(2) * w2c.size(3));
+
+    auto w1l = at::empty({w1c.size(0), w1c.size(1), w1c.size(2), w1c.size(3)},
+                         w1c.options().memory_format(at::MemoryFormat::ChannelsLast));
+    launch_tr(w1c.data_ptr<float>(), w1l.data_ptr<float>(), O1, I1, S1, stream);
+
+    auto w2l = at::empty({w2c.size(0), w2c.size(1), w2c.size(2), w2c.size(3)},
+                         w2c.options().memory_format(at::MemoryFormat::ChannelsLast));
+    launch_tr(w2c.data_ptr<float>(), w2l.data_ptr<float>(), O2, I2, S2, stream);
+
+    // ---- PLAN ITEM 3 : guarantee cuDNN keeps the nhwckrsc implicit-GEMM path ----
+    TORCH_CHECK(xl.is_contiguous(at::MemoryFormat::ChannelsLast),  "xl must be NHWC");
+    TORCH_CHECK(w1l.is_contiguous(at::MemoryFormat::ChannelsLast), "w1l must be NHWC");
+    TORCH_CHECK(w2l.is_contiguous(at::MemoryFormat::ChannelsLast), "w2l must be NHWC");
+
+    auto n1wc = n1w.is_contiguous() ? n1w : n1w.contiguous();
+    auto n1bc = n1b.is_contiguous() ? n1b : n1b.contiguous();
+    auto n2wc = n2w.is_contiguous() ? n2w : n2w.contiguous();
+    auto n2bc = n2b.is_contiguous() ? n2b : n2b.contiguous();
+
+    std::vector<int64_t> st{1, 1}, pd{1, 1}, dl{1, 1};
+
+    // ---- conv 1 (cuDNN NHWC TF32 implicit GEMM, no layout conversion) ----
+    auto y1 = at::conv2d(xl, w1l, c10::optional<at::Tensor>(),
+                         at::IntArrayRef(st), at::IntArrayRef(pd), at::IntArrayRef(dl), 1);
+    if (!y1.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y1 = y1.contiguous(at::MemoryFormat::ChannelsLast);
+
+    auto opts  = x.options();
+    auto scale = at::empty({(long)B * NCH}, opts);
+    auto shift = at::empty({(long)B * NCH}, opts);
+
+    gn_stats(y1, n1wc, n1bc, scale, shift, B, npix, (float)eps, stream);
+
+    auto y1n = at::empty({(long)B, (long)NCH, (long)H, (long)W},
+                         opts.memory_format(at::MemoryFormat::ChannelsLast));
+
+    const long nvec = (long)npix * 64L;              // float4 units per image
+    {
+        const int blk = 256;
+        dim3 g((unsigned)((nvec + blk - 1) / blk), (unsigned)B);
+        gn_apply1<<<g, blk, 0, stream>>>(y1.data_ptr<float>(),
+                                         scale.data_ptr<float>(), shift.data_ptr<float>(),
+                                         y1n.data_ptr<float>(), nvec);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // ---- conv 2 ----
+    auto y2 = at::conv2d(y1n, w2l, c10::optional<at::Tensor>(),
+                         at::IntArrayRef(st), at::IntArrayRef(pd), at::IntArrayRef(dl), 1);
+    if (!y2.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y2 = y2.contiguous(at::MemoryFormat::ChannelsLast);
+
+    auto scale2 = at::empty({(long)B * NCH}, opts);
+    auto shift2 = at::empty({(long)B * NCH}, opts);
+    gn_stats(y2, n2wc, n2bc, scale2, shift2, B, npix, (float)eps, stream);
+
+    auto out = at::empty({(long)B, (long)NCH, (long)H, (long)W}, opts);
+    {
+        dim3 g((unsigned)((npix + TP - 1) / TP), (unsigned)B);
+        gn_apply2<<<g, NCH, 0, stream>>>(y2.data_ptr<float>(), xc.data_ptr<float>(),
+                                         scale2.data_ptr<float>(), shift2.data_ptr<float>(),
+                                         out.data_ptr<float>(), npix);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return out;
+}
+'''
+
+_CPP_SRC = r'''
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor w1, torch::Tensor n1w, torch::Tensor n1b,
+                          torch::Tensor w2, torch::Tensor n2w, torch::Tensor n2b,
+                          double eps);
+'''
+
+_ext = load_inline(
+    name="vae_resblock_fused_v2",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["fused_block"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_90,code=sm_90",
+    ],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """See top-of-file header comment for the granularity/fusion plan (level C)."""
+
+    def __init__(self):
+        super().__init__()
+        self._ext = _ext
+
+    @torch.no_grad()
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        if isinstance(eps, torch.Tensor):
+            eps_f = float(eps.item())
+        else:
+            eps_f = float(eps)
+
+        # Fast path: fixed C=256 / G=32 float32 CUDA specialisation.
+        if (x.is_cuda and x.dtype == torch.float32 and x.dim() == 4
+                and x.size(1) == 256 and conv1_weight.dtype == torch.float32
+                and conv2_weight.dtype == torch.float32):
+            return self._ext.fused_block(x, conv1_weight, norm1_weight, norm1_bias,
+                                         conv2_weight, norm2_weight, norm2_bias, eps_f)
+
+        # Reference fallback (never taken by the benchmarked workloads).
+        num_groups = 32
+        residual = x
+        out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, num_groups, weight=norm1_weight, bias=norm1_bias, eps=eps_f)
+        out = F.silu(out)
+        out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, num_groups, weight=norm2_weight, bias=norm2_bias, eps=eps_f)
+        out = F.silu(out)
+        return out + residual

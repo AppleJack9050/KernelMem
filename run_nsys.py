@@ -19,6 +19,7 @@ Typical usage:
 import os
 import re
 import sys
+import shutil
 import subprocess
 import signal
 import time
@@ -33,6 +34,74 @@ __all__ = [
     "load_nsys_stats",
     "extract_kernel_launch_counts",
 ]
+
+
+def _find_qdstrm_importer() -> Optional[str]:
+    """Locate QdstrmImporter, the host-side .qdstrm -> .nsys-rep converter.
+
+    An nsys that comes from the Nsight Compute bundle collects into a .qdstrm
+    but cannot convert it: it searches for the importer in a sibling directory
+    named host-linux-x64, while the bundle ships it as
+    linux-desktop-glibc_2_11_3-x64. Find it wherever it actually is.
+    """
+    explicit = os.environ.get("NSYS_QDSTRM_IMPORTER")
+    if explicit and os.access(explicit, os.X_OK):
+        return explicit
+
+    roots = []
+    nsys_path = shutil.which("nsys")
+    if nsys_path:
+        # <bundle>/host/target-linux-x64/nsys -> search <bundle>/host/*
+        roots.append(Path(os.path.realpath(nsys_path)).parent.parent)
+    roots.append(Path("/opt/nvidia/nsight-compute"))
+
+    for root in roots:
+        for pattern in ("*/QdstrmImporter", "*/*/QdstrmImporter"):
+            try:
+                for cand in sorted(root.glob(pattern)):
+                    if os.access(cand, os.X_OK):
+                        return str(cand)
+            except OSError:
+                continue
+    return None
+
+
+def _qdstrm_to_rep(rep_path: Path) -> bool:
+    """Convert a collected .qdstrm into rep_path. Returns True on success.
+
+    The importer additionally needs libdw.so.1 / libelf.so.1, which may not be
+    installed system-wide; NSYS_IMPORTER_LIBS points at a directory holding
+    them (locally extracted copies are fine).
+    """
+    qdstrm = rep_path.with_suffix(".qdstrm")
+    if not qdstrm.exists():
+        return False
+    importer = _find_qdstrm_importer()
+    if not importer:
+        return False
+
+    env = os.environ.copy()
+    lib_dir = env.get("NSYS_IMPORTER_LIBS", "/home/elek/tools/nsys-fix/rootfs/usr/lib/x86_64-linux-gnu")
+    if os.path.isdir(lib_dir):
+        env["LD_LIBRARY_PATH"] = f"{lib_dir}:{env.get('LD_LIBRARY_PATH', '')}"
+
+    print(f"[nsys] Converting {qdstrm.name} -> {rep_path.name}", flush=True)
+    try:
+        proc = subprocess.run(
+            [importer, "-i", str(qdstrm)],
+            env=env, text=True, capture_output=True, timeout=300,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"[nsys] QdstrmImporter failed: {exc}", flush=True)
+        return False
+
+    if not rep_path.exists():
+        print(f"[nsys] QdstrmImporter produced no report: "
+              f"{(proc.stderr or proc.stdout or '').strip()[:300]}", flush=True)
+        return False
+
+    qdstrm.unlink(missing_ok=True)
+    return True
 
 
 def extract_cuda_kernel_names(py_path: Union[str, Path]) -> List[str]:
@@ -153,7 +222,10 @@ def profile_bench(
                 sys.stderr.write(stderr or "")
                 raise RuntimeError(f"nsys profile failed with return code {proc.returncode}")
             
-            # Verify output file exists
+            # Verify output file exists. A bundle-provided nsys may have
+            # collected into a .qdstrm without converting it; do that here.
+            if not rep_path.exists():
+                _qdstrm_to_rep(rep_path)
             if not rep_path.exists():
                 raise FileNotFoundError(f"nsys output file not found: {rep_path}")
             

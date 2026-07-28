@@ -776,9 +776,11 @@ def load_ncu_metrics(
 
     # Drop the units row
     if len(sub) > 0:
-        first_row_str = sub.iloc[0].astype(str).str.lower()
+        # .str.lower() propagates missing values as NaN (a float) rather than a
+        # string, so fill them before the membership test below.
+        first_row_str = sub.iloc[0].astype(str).str.lower().fillna("")
         unit_tokens = ("%", "inst", "cycle", "block", "register", "register/thread")
-        if first_row_str.apply(lambda x: any(tok in x for tok in unit_tokens)).any():
+        if first_row_str.apply(lambda x: any(tok in str(x) for tok in unit_tokens)).any():
             sub = sub.iloc[1:].reset_index(drop=True)
     
     # Filter out section data rows: they have fewer columns than metrics rows
