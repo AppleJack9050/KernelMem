@@ -221,6 +221,187 @@ def _bench(model: torch.nn.Module,
     return times
 
 
+def _first_tensor(x):
+    if isinstance(x, torch.Tensor):
+        return x
+    if isinstance(x, (list, tuple)):
+        for t in x:
+            if isinstance(t, torch.Tensor):
+                return t
+    raise TypeError("Model forward did not return a Tensor (or a Tensor inside a sequence).")
+
+
+def _shape_tag(inp) -> str:
+    """Human-readable tag for an input tuple, used to name a shape in messages."""
+    for x in inp:
+        if torch.is_tensor(x) and x.dim() >= 2:
+            return "x".join(str(d) for d in x.shape)
+    return "?"
+
+
+# ================ uninitialized-memory detection (allocator poisoning) ======
+# A kernel that reads a buffer it allocated with at::empty() but never fully
+# wrote is a real defect, yet it hides from a plain correctness check: pages
+# handed out fresh by the CUDA driver arrive zeroed, so the wrong kernel looks
+# right on a clean allocator and only misbehaves later, once the caching
+# allocator starts recycling blocks that held live data. Whether it is caught
+# then depends on allocation history, which makes the failure look random.
+#
+# Poisoning the allocator's free blocks with NaN before the kernel runs turns
+# that into a deterministic, immediate failure. NaN is used deliberately: it
+# propagates through arithmetic, so *any* read of unwritten memory reaches the
+# output regardless of how small the stray values would otherwise have been.
+# The two runs are made symmetric on purpose: the SAME size ladder is filled
+# both times, and only the fill VALUE differs (0.0 for the reference run, NaN
+# for the adversarial one). Any block the poison can reach was therefore also
+# reached by the zero-fill, so a difference between the two runs can only come
+# from memory the kernel read without writing.
+#
+# Two things that look like they should work, do not, and both were tried:
+#   * torch.cuda.empty_cache() does NOT hand back zeroed memory. The driver
+#     scrubs pages between PROCESSES, not within one, so cudaFree + cudaMalloc
+#     returns the same physical pages with the previous contents intact.
+#   * A descending (largest-first) fill misses the small pool entirely: PyTorch
+#     serves sub-1MB requests from separate segments, and the budget is gone
+#     before the ladder ever gets down there -- which is exactly where the
+#     small scratch buffers this bug class lives in are found.
+_POISON_MIN_ELEMS = 256                # 1 KB   - smallest size class filled
+_POISON_MAX_ELEMS = (128 << 20) // 4   # 128 MB - largest
+_POISON_PER_CLASS = 4                  # blocks per size class
+_POISON_FREE_FRACTION = 4              # take at most 1/N of driver-free VRAM
+
+
+def _fill_free_blocks(dev: torch.device, value: float) -> int:
+    """Write *value* into the caching allocator's free blocks; return bytes written.
+
+    Blocks are released back to *PyTorch's pool*, not to the driver, so the next
+    at::empty() of a matching size is handed one of them. The ladder ascends so
+    that the small pool is filled before the budget is spent.
+    """
+    if TORCH_DEVICE != "cuda":
+        return 0
+    try:
+        driver_free, _ = torch.cuda.mem_get_info(dev)
+    except Exception:
+        return 0
+
+    budget = driver_free // _POISON_FREE_FRACTION
+    junk: List[torch.Tensor] = []
+    used = 0
+    n = _POISON_MIN_ELEMS
+    while n <= _POISON_MAX_ELEMS:
+        for _ in range(_POISON_PER_CLASS):
+            nbytes = n * 4
+            if used + nbytes > budget:
+                n = _POISON_MAX_ELEMS  # out of budget; stop after this class
+                break
+            try:
+                junk.append(torch.full((n,), value, device=dev, dtype=torch.float32))
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                n = _POISON_MAX_ELEMS
+                break
+            used += nbytes
+        n *= 2
+
+    del junk  # -> returned to PyTorch's pool, NOT to the driver
+    return used
+
+
+def _poison_allocator(dev: torch.device) -> int:
+    """Fill free blocks with NaN; returns bytes poisoned (0 = check is inert)."""
+    return _fill_free_blocks(dev, float("nan"))
+
+
+def _fresh_allocator(dev: torch.device) -> int:
+    """Fill free blocks with 0.0 - the benign counterpart of the poisoned run.
+
+    Used before every reference run, and again after the poisoned probe so the
+    timing loop and the following shape do not inherit NaN.
+    """
+    return _fill_free_blocks(dev, 0.0)
+
+
+def _allocator_dependence_note(test_model: torch.nn.Module,
+                               inp: List[torch.Tensor],
+                               dev: torch.device,
+                               out_clean: torch.Tensor,
+                               tol: float,
+                               shape_tag: str) -> str | None:
+    """Re-run *test_model* against a poisoned allocator and report if it changed.
+
+    Returns a diagnosis string when the kernel's output depends on what the
+    allocator happened to hand it, or ``None`` when the output is stable (the
+    normal case). Purely advisory: any failure inside this check returns None
+    rather than masking or inventing a result.
+
+    Limitation, stated because it is easy to assume otherwise: the reference leg
+    is not guaranteed to run on pristine memory. Neither empty_cache() nor a
+    size-ladder zero-fill can promise that, because the driver does not scrub
+    pages within a process and a kernel launched between fill and probe
+    redistributes the pool. So the reference leg may itself carry NaN from an
+    earlier shape's probe.
+
+    This costs specificity, not soundness. A kernel that never reads unwritten
+    memory is identical in both legs and is never flagged; a kernel that does is
+    rejected either here or by the plain tolerance check that follows, which sees
+    the NaN directly. For an exact answer rather than a differential one, run
+    ``compute-sanitizer --tool initcheck`` on the candidate.
+    """
+    if not _poison_allocator(dev):
+        return None
+    try:
+        out, _ = _run_once(test_model, inp, dev)
+        if TORCH_DEVICE == "cuda":
+            torch.cuda.synchronize(dev)
+        out = _first_tensor(out).contiguous()
+        if out.dtype != out_clean.dtype:
+            out = out.to(out_clean.dtype)
+        if out.device != out_clean.device:
+            out = out.to(out_clean.device)
+        if out.shape != out_clean.shape:
+            return None
+
+        nan_now, nan_before = torch.isnan(out), torch.isnan(out_clean)
+        fresh_nan = int((nan_now & ~nan_before).sum().item())
+        differs = (~torch.isclose(out, out_clean, atol=tol, rtol=tol)) | (nan_now ^ nan_before)
+        n_differs = int(differs.sum().item())
+        if n_differs == 0:
+            return None
+        total = out.numel()
+        # Report the largest *finite* disagreement; NaN-vs-number is counted
+        # above and would otherwise render the whole line as "nan".
+        drift = (out - out_clean).abs()
+        drift = drift[torch.isfinite(drift)]
+        drift_line = (f"  largest finite disagreement : {drift.max().item():.6e}\n"
+                      if drift.numel() else
+                      "  largest finite disagreement : n/a (every difference involves NaN)\n")
+    except Exception:
+        return None
+    finally:
+        # Never leave NaN in the pool for the timing loop or the next shape.
+        _fresh_allocator(dev)
+
+    return (
+        "UNINITIALIZED GPU MEMORY: this kernel's output depends on what the CUDA "
+        f"caching allocator previously stored, on shape {shape_tag}.\n"
+        "Run twice on identical inputs, differing only in what was left in the "
+        "allocator's free blocks (the second run had them filled with NaN), it "
+        "produced different results.\n"
+        f"  output elements that changed: {n_differs} of {total} "
+        f"({100.0 * n_differs / max(1, total):.2f}%)\n"
+        f"  of those, newly NaN          : {fresh_nan}\n"
+        f"{drift_line}"
+        "A buffer allocated with at::empty()/torch::empty() is being READ at "
+        "positions that were never WRITTEN. This most often happens when a grid is "
+        "sized from one rounding of a division and the per-block work from another, "
+        "so trailing blocks exit early without storing their slot, while the "
+        "consumer kernel still sums every slot.\n"
+        "Fix the producer/consumer to agree on the exact element count, or "
+        "zero-initialise the buffer. Note that this bug is INVISIBLE on a clean "
+        "allocator, so it may reproduce only for some input shapes."
+    )
+
+
 # ======================= RNG & determinism settings =======================
 def _seed_everything(seed: int | None, device_idx: int | None = None):
     """Set the random seeds and (optionally) enable deterministic backends."""
@@ -612,15 +793,6 @@ def compare_and_bench(
             raise TypeError("get_init_inputs() must return a list/tuple (used as *args) or a dict (used as **kwargs).")
 
     # ------------ Run & benchmark ------------
-    def _first_tensor(x):
-        if isinstance(x, torch.Tensor):
-            return x
-        if isinstance(x, (list, tuple)):
-            for t in x:
-                if isinstance(t, torch.Tensor):
-                    return t
-        raise TypeError("Model forward did not return a Tensor (or a Tensor inside a sequence).")
-
     try:
         ctx = torch.cuda.device(dev) if TORCH_DEVICE == "cuda" else contextlib.nullcontext()
         with ctx:
@@ -648,6 +820,10 @@ def compare_and_bench(
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
             ref_out,  _ = _run_once(ref_model,  inp, dev)
+            # Give the candidate the cleanest allocator it could ever see, so the
+            # comparison against the poisoned run below is a controlled two-point
+            # test rather than a function of allocation history.
+            _fresh_allocator(dev)
             test_out, _ = _run_once(test_model, inp, dev)
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
@@ -721,8 +897,18 @@ def compare_and_bench(
                         ))
                 else:
                     # Floating-point outputs: check with allclose
-                    if not torch.allclose(ref_out, test_out, atol=tol, rtol=tol):
-                        raise ValueError(_build_mismatch_debug_msg(
+                    close = torch.allclose(ref_out, test_out, atol=tol, rtol=tol)
+
+                    # Regardless of the verdict, establish whether the result is
+                    # even reproducible. A kernel that reads uninitialized memory
+                    # answers differently depending on allocation history, and
+                    # saying so is far more actionable than "outputs are not
+                    # close", which sends the repair round after the arithmetic.
+                    alloc_note = _allocator_dependence_note(
+                        test_model, inp, dev, test_out, tol, _shape_tag(inp))
+
+                    if not close:
+                        msg = _build_mismatch_debug_msg(
                             reason="Outputs are not close",
                             tol=tol,
                             max_err=max_err,
@@ -732,7 +918,14 @@ def compare_and_bench(
                             diff=diff,
                             inputs=inp,
                             ref_model=ref_model,
-                        ))
+                        )
+                        if alloc_note:
+                            msg = f"{msg}\n\n{alloc_note}"
+                        raise ValueError(msg)
+
+                    # Matched the reference, but only by luck of allocation.
+                    if alloc_note:
+                        raise ValueError(alloc_note)
 
             # Timing
             ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)
@@ -750,12 +943,6 @@ def compare_and_bench(
             def _avg(ts):
                 return sum(ts) / len(ts)
 
-            def _shape_tag(t):
-                for x in t:
-                    if torch.is_tensor(x) and x.dim() >= 2:
-                        return "x".join(str(d) for d in x.shape)
-                return "?"
-
             per_shape = [{
                 "shape": _shape_tag(inp),
                 "ref_ms": _avg(ref_t),
@@ -771,17 +958,25 @@ def compare_and_bench(
                     if not isinstance(extra, (list, tuple)):
                         extra = [extra]
                     e_ref, _ = _run_once(ref_model, extra, dev)
+                    _fresh_allocator(dev)   # see the primary run above
                     e_tst, _ = _run_once(test_model, extra, dev)
                     if TORCH_DEVICE == "cuda":
                         torch.cuda.synchronize(dev)
                     e_ref = _first_tensor(e_ref).contiguous()
                     e_tst = _first_tensor(e_tst).contiguous().to(e_ref.dtype)
                     e_err = (e_ref - e_tst).abs().max().item()
+                    e_note = _allocator_dependence_note(
+                        test_model, extra, dev, e_tst, tol, _shape_tag(extra))
                     if not torch.allclose(e_ref, e_tst, atol=tol, rtol=tol):
-                        raise ValueError(
+                        msg = (
                             f"Outputs are not close on extra shape {_shape_tag(extra)} "
                             f"(atol={tol}, rtol={tol}). max_abs_err={e_err:.3e}"
                         )
+                        if e_note:
+                            msg = f"{msg}\n\n{e_note}"
+                        raise ValueError(msg)
+                    if e_note:
+                        raise ValueError(e_note)
                     e_rt = _bench(ref_model,  extra, dev, warmup, repeat)
                     e_tt = _bench(test_model, extra, dev, warmup, repeat)
                     per_shape.append({
@@ -795,7 +990,13 @@ def compare_and_bench(
                     del e_ref, e_tst
                     if TORCH_DEVICE == "cuda":
                         torch.cuda.synchronize(dev)
-                        torch.cuda.empty_cache()
+                        # Deliberately NOT torch.cuda.empty_cache(): returning
+                        # blocks to the driver means the next shape is handed
+                        # freshly-mapped (zeroed) pages, which is exactly what
+                        # hides a kernel that reads uninitialized memory. Keeping
+                        # the blocks in PyTorch's pool preserves whatever the
+                        # previous shape left there, and _allocator_dependence_note
+                        # above relies on being able to poison that pool.
 
             # Geometric mean over shapes: each shape weighs equally, so a large
             # shape cannot dominate the score simply by taking longer.

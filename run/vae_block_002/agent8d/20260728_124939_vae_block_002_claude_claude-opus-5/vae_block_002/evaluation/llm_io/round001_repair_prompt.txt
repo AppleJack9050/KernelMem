@@ -1,0 +1,218 @@
+You are a senior CUDA-extension developer.
+Your job is to FIX the Python script shown below so that it successfully passes the benchmark.
+
+IMPORTANT CONTEXT
+- The failure may come from build issues, CUDA execution crashes, numerical mismatch, or timeout.
+- Do NOT rely on error_type names; infer the failure cause from ERROR_LOG and Main Critical Problem.
+
+MANDATORY
+- ModelNew MUST include an equivalent PyTorch module ONLY as a PARAMETER HOLDER
+  (for initialization / state_dict parity with the reference).
+- ModelNew MUST source weights/bias from that module.
+- ModelNew MUST NOT call the holder module’s forward for replaced operators.
+- Do NOT create independent parameters for replaced operators (no torch.randn for weights/bias).
+- The code MUST contain at least one custom CUDA kernel (defined in the `source` CUDA string) that optimizes the computation process. Do NOT remove all CUDA kernels or replace them with pure PyTorch operations.
+
+REPAIR STRATEGY (FOLLOW STRICTLY)
+- Apply the SMALLEST change necessary to address the Main Critical Problem.
+- Do NOT refactor unrelated code or redesign the kernel unless strictly required.
+- You MUST choose exactly ONE repair path below based on observable evidence in ERROR_LOG.
+- Follow ONLY the chosen path. Do NOT apply rules from other paths.
+
+PATCH BUDGET (STRICT)
+- You may modify up to 3 code regions if and only if they are inseparable to fix the SAME root cause.
+- If WMMA is used (wmma:: appears), fixing a crash may require 2-3 coupled edits; this is allowed and still counts as "smallest change".
+
+DECISION FLOW (evaluate in order; stop at the first matching case)
+
+(1) Build / compilation failure detected in ERROR_LOG:
+    - Fix includes, function signatures, bindings, load_inline usage, or C++/CUDA syntax.
+    - Do NOT modify kernel math, indexing, or algorithmic semantics.
+
+(2) CUDA execution crash detected (e.g., illegal memory access, launch failure):
+    - Focus on bounds checks, grid/block configuration, and indexing of input/weight/output.
+    - Ensure all indices are within allocated tensor ranges.
+    - Do NOT change algorithmic semantics or introduce new optimizations.
+    - If CUDA_CODE contains "wmma::", you MUST enforce ALL of the following (otherwise the fix is invalid):
+        a) Exactly one warp participates in wmma::load_matrix_sync / wmma::mma_sync / wmma::store_matrix_sync for each tile.
+        b) The full 16x16 tiles read by load_matrix_sync are initialized (32-thread blocks must load multiple elements per thread, or use 256-thread staging with only warp0 doing WMMA).
+        c) store_matrix_sync is called warp-collectively with a warp-uniform base pointer (shared/global). DO NOT call store from a single thread. DO NOT store into per-thread local arrays.
+
+(3) Numerical mismatch detected (e.g., outputs not close, max_abs_err reported):
+    - Fix issues in the following strict priority order:
+        a) Output coverage / indexing (full tiling of all output dimensions).
+        b) Parameter parity (use parameter-holder weight/bias correctly).
+        c) Output shape formula (stride / padding / output_padding / groups / dilation / bias).
+        d) Unsupported reference arguments without explicit asserts.
+        e) dtype / layout / contiguity assumptions.
+    - Do NOT introduce new optimizations while fixing correctness.
+
+(4) Timeout or hang detected:
+    - Reduce pathological behavior (e.g., excessive kernel launches, missing parallelism).
+    - Keep semantics unchanged.
+
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple-quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────────────────────────────
+unterminated triple-quoted string literal (detected at line 129) (kernel_20260728_125738.py, line 53)
+
+────────────────────────────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────────────────────────────
+# ==========================================================================
+# ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# SEED GRANULARITY: (C) "fuse many ops into one/few kernels".
+#
+# 1) Chosen granularity: (C). Every elementwise / normalization / layout op is
+#    fused into a small number of hand-written CUDA kernels; the two 3x3
+#    convolutions stay as vendor (cuDNN) calls issued from inside the
+#    load_inline extension.
+#
+# 2) Ops replaced by custom CUDA:
+#      - GroupNorm(32) statistics (RowwiseMoments + ComputeFusedParams)  x2
+#      - GroupNorm affine apply                                          x2
+#      - SiLU                                                            x2
+#      - residual add                                                    x1
+#      - ALL NCHW<->NHWC layout conversions that cuDNN was doing
+#        internally (nchwToNhwc / nhwcToNchw copies, 168us + 94us in the
+#        reference profile) are removed: the whole block is executed in
+#        NHWC (channels_last) so the sm80_xmma NHWC implicit-GEMM sees
+#        native layout, and the only remaining transposes are one explicit
+#        NCHW->NHWC of x and one NHWC->NCHW folded into the last epilogue.
+#
+# 3) Fusion map (kernel <- ops):
+#      K1 nchw2nhwc_kernel        <- layout conversion of x (shared-mem tiled)
+#      cuDNN at::conv2d (NHWC)    <- conv1 (vendor, called in-extension)
+#      K2 gn_moments_nhwc         <- partial sum/sumsq per (n,group) (norm1)
+#      K3 gn_finalize             <- mean/rstd + fold gamma/beta -> per-(n,c) A,B
+#      K4 gn_silu_nhwc            <- (x*A+B) + SiLU, vectorized float4, NHWC->NHWC
+#      cuDNN at::conv2d (NHWC)    <- conv2 (vendor, called in-extension)
+#      K2,K3 again                <- norm2 statistics / fused params
+#      K5 gn_silu_res_nhwc2nchw   <- norm2 apply + SiLU + residual add +
+#                                    NHWC->NCHW transpose, all in ONE pass
+#    => GroupNorm+SiLU+add+layout traffic drops from ~1.4 GB to ~0.6 GB.
+#
+# 4) What stays in PyTorch / vendor land and why:
+#      - conv3x3 256->256: the profiled vendor TF32 implicit GEMM runs at
+#        ~92 TFLOPS (~88% of this GPU's TF32 peak); reimplementing it cannot
+#        win, so it is kept (invoked via at::conv2d inside the extension).
+#      - weight NCHW->channels_last packing: 2.4 MB, negligible, uses
+#        .contiguous(ChannelsLast) inside the extension.
+#      - a pure-PyTorch fallback path is kept only for shapes/dtypes the
+#        custom kernels do not cover (C%128!=0, non-fp32, non-CUDA).
+#
+# Precision: fp32 storage/arith throughout; reductions accumulate fp32 per
+# thread then fp64 for the final combine; TF32 tensor cores in conv only
+# (identical to the reference, which runs with allow_tf32=True).
+# ==========================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define GROUPS 32
+
+__device__ __forceinline__ float silu_f(float y) {
+    return y / (1.0f + expf(-y));
+}
+
+// ---------------------------------------------------------------- K1
+// NCHW -> NHWC (channels_last) tiled transpose. C must be a multiple of 32.
+__global__ void nchw2nhwc_kernel(const float* __restrict__ in,
+                                 float* __restrict__ out,
+                                 int HW, int C) {
+    __shared__ float tile[32][33];
+    const int p0 = blockIdx.x * 32;
+    const int c0 = blockIdx.y * 32;
+    const size_t off = (size_t)blockIdx.z * (size_t)C * (size_t)HW;
+    const float* inb = in + off;
+    float*       outb = out + off;
+
+#pragma unroll
+    for (int i = 0; i < 32; i += 8) {
+        int c = c0 + threadIdx.y + i;
+        int p = p0 + threadIdx.x;
+        float v = 0.0f;
+        if (p < HW) v = inb[(size_t)c * HW + p];
+        tile[threadIdx.y + i][threadIdx.x] = v;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 32; i += 8) {
+        int p = p0 + threadIdx.y + i;
+        int c = c0 + threadIdx.x;
+        if (p < HW) outb[(size_t)p * C + c] = tile[threadIdx.x][threadIdx.y + i];
+    }
+}
+
+// ---------------------------------------------------------------- K2
+// GroupNorm partial moments over an NHWC tensor.
+// grid = (NCHUNK, GROUPS, N), block = 128
+__global__ void gn_moments_nhwc(const float* __restrict__ in,
+                                float* __restrict__ psum,
+                                float* __restrict__ psumsq,
+                                int HW, int C, int CPG, int NCHUNK, int LOGSPP) {
+    const int chunk = blockIdx.x;
+    const int g     = blockIdx.y;
+    const int n     = blockIdx.z;
+    const int G     = gridDim.y;
+
+    const int spp = 1 << LOGSPP;              // float4 slots per pixel
+    const int chunkPix = (HW + NCHUNK - 1) / NCHUNK;
+    const int pb = chunk * chunkPix;
+    int pe = pb + chunkPix;
+    if (pe > HW) pe = HW;
+
+    const float* base = in + (size_t)n * (size_t)HW * (size_t)C + (size_t)g * CPG;
+
+    float s = 0.0f, ss = 0.0f;
+    if (pb < pe) {
+        const long nslots = (long)(pe - pb) * (long)spp;
+        for (long i = threadIdx.x; i < nslots; i += blockDim.x) {
+            const long p    = (long)pb + (i >> LOGSPP);
+            const int  part = (int)(i & (long)(spp - 1));
+            const float4 v = *reinterpret_cast<const float4*>(
+                base + (size_t)p * (size_t)C + (size_t)(part << 2));
+            s += v.x + v.y + v.z + v.w;
+            ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
+        }
+    }
+
+    const unsigned
+
+────────────────────────────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────────────────────────────
+critical_issue: Python SyntaxError: CUDA source string r""" opened but never closed (file truncated)
+evidence: unterminated triple-quoted string literal (detected at line 129), kernel_20260728_125738.py, line 53
+root_cause: The extension source is assigned with `_CUDA_SRC = r"""` at line 53, but the generated file ends mid-kernel (`const unsigned`) without a closing `"""` delimiter or the subsequent load_inline/ModelNew definitions. Python therefore fails at parse/compile time before any nvcc build or kernel execution can occur.
+trigger_condition: Importing/parsing the kernel file; occurs unconditionally at module load since the triple-quoted literal opened at line 53 reaches EOF unterminated.
+must_hold_invariants: Every r""" literal has a matching closing """ before EOF, gn_moments_nhwc and all remaining kernels are written completely, load_inline(...) and class ModelNew(nn.Module) with forward() exist in the file
+minimal_fix: Complete the truncated gn_moments_nhwc reduction after `const unsigned`, close the string with `"""`, then add load_inline binding and ModelNew.forward.
+patch_anchor: _CUDA_SRC = r"""
+confidence: high
+
+```python
+# <your corrected code>
+```
+# ==========================================================

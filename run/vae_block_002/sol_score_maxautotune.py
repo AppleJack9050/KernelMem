@@ -45,6 +45,14 @@ CANDIDATES = [
     ("run A fp32 seed", "out8_agent_seed"),
     ("run B fp32 best", "out8b_agent_fp32"),
     ("run C fp32 best", "out8c_agent_fp32"),
+    # Run D as the search produced it: 18/20. Its GroupNorm read uninitialized
+    # memory whenever the launched grid and the per-block pixel count disagreed
+    # (1x131x131 and 1x293x293). Failed workloads score 0.
+    ("run D fp32 best", "out8d_agent_fp32"),
+    # Same kernel, one line hand-patched so nchunk is derived back from ppc.
+    # NOT a KernelMem result -- a human fixed it. Listed to separate "the search
+    # found a slow kernel" from "the search found a fast kernel that was wrong".
+    ("run D fp32 best (hand-patched)", "out8d_fixed_fp32"),
 ]
 
 

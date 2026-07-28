@@ -1509,7 +1509,16 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         io_dir.mkdir(parents=True, exist_ok=True)  # Ensure directory exists
                         reply_file = io_dir / f"{round_idx}_optimization_strategy_reply.txt"
                         reply_file.write_text(raw, encoding="utf-8")
-                        strategy_json = extract_json(raw)
+                        try:
+                            strategy_json = extract_json(raw)
+                        except ValueError as exc:
+                            # A malformed judge reply must not kill a multi-round run.
+                            # Skip this round's optimization; best_kernel is retained
+                            # and the next round starts from it as usual.
+                            print(f"[judge] Could not parse optimization strategy "
+                                  f"({exc.__class__.__name__}); skipping round {round_idx}. "
+                                  f"Raw reply kept at {reply_file}", flush=True)
+                            continue  # `round_idx` advances via the enclosing for-loop
 
                         # Check if method was matched based on machine_check_result
                         # Read machine_check_result JSON file to determine if method was matched

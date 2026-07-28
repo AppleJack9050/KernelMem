@@ -88,11 +88,23 @@ def _repair_continuation_fences(text: str) -> str | None:
     if not segments:
         return None
 
+    # Case 1 - the continuation RESUMES the cut file. Splice segments together
+    # one at a time and stop as soon as the result parses, so a reply that
+    # legitimately holds several distinct code blocks is left alone.
     merged = segments[0]
     for seg in segments[1:]:
         merged = _splice(merged, seg)
         candidate = "\n".join(merged).strip() + "\n"
         if _parses(candidate):
+            return candidate
+
+    # Case 2 - the continuation RESTARTS the file from the top instead of
+    # resuming (a fresh header, not the truncated line repeated). Splicing then
+    # produces garbage, but one segment is a complete file on its own. Prefer
+    # the longest segment that parses; the truncated prefix never will.
+    for seg in sorted(segments, key=len, reverse=True):
+        candidate = "\n".join(seg).strip() + "\n"
+        if candidate.strip() and _parses(candidate):
             return candidate
     return None
 
@@ -165,6 +177,32 @@ def save_kernel_code(code: str, out_dir: Path | str = "kernels") -> Path:
 
 
 
+def _loads_lenient(candidate: str) -> Any | None:
+    """json.loads, tolerating raw control characters inside string values.
+
+    LLM replies routinely embed literal newlines/tabs in long prose fields such
+    as ``modification_plan``. Python's parser rejects those in strict mode, so a
+    single stray control byte would otherwise discard an entire strategy reply.
+    Falls back to stripping the offending bytes if strict=False is not enough.
+    """
+    if not candidate:
+        return None
+    for attempt in range(3):
+        try:
+            if attempt == 0:
+                return json.loads(candidate)
+            if attempt == 1:
+                return json.loads(candidate, strict=False)
+            # last resort: drop control chars that are illegal even leniently
+            cleaned = "".join(
+                ch for ch in candidate if ch >= " " or ch in "\t\n\r"
+            )
+            return json.loads(cleaned, strict=False)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def extract_json(raw: str) -> Any:
     """
     Extract the first JSON object/array from a string and parse it into a Python object.
@@ -183,26 +221,22 @@ def extract_json(raw: str) -> Any:
     # Try the ```json ...``` fenced format first
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
     if match:
-        candidate = match.group(1).strip()
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
+        parsed = _loads_lenient(match.group(1).strip())
+        if parsed is not None:
+            return parsed
 
     # Try matching the first { ... } or [ ... ]
     match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", raw)
     if match:
-        candidate = match.group(1).strip()
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
+        parsed = _loads_lenient(match.group(1).strip())
+        if parsed is not None:
+            return parsed
 
     # Fallback: attempt to parse the whole string
-    try:
-        return json.loads(raw.strip())
-    except json.JSONDecodeError:
-        raise ValueError(f"Failed to extract valid JSON from reply:\n{raw}")
+    parsed = _loads_lenient(raw.strip())
+    if parsed is not None:
+        return parsed
+    raise ValueError(f"Failed to extract valid JSON from reply:\n{raw}")
 
 def save_prompt_text(text: str, out_dir: Path, *, tag: str = "repair") -> Path:
     """

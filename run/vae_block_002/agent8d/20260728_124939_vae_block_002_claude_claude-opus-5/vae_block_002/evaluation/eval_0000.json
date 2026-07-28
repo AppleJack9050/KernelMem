@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "seed",
+  "error_type": "CompilationError",
+  "message": "unterminated triple-quoted string literal (detected at line 129) (kernel_20260728_125738.py, line 53)"
+}
