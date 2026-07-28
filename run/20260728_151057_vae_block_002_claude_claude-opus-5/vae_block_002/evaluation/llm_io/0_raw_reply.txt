@@ -1,3 +1,4 @@
+```python
 # ==========================================================================
 # ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
 #
@@ -460,3 +461,4 @@ class ModelNew(nn.Module):
                            bias=norm2_bias, eps=eps_f)
         out = F.silu(out)
         return out + residual
+```

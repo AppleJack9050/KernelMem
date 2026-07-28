@@ -51,6 +51,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--server_port", type=int, default=8000, help="Unused (kept for compatibility)")
     p.add_argument("--model_name", default="claude-opus-5", help="Claude model (non-Claude names fall back to claude-opus-5)")
     p.add_argument("--round", "-G", type=int, default=10, help="Number of generations per task")
+    p.add_argument("--num_seeds", type=int, default=3,
+                   help="Round-0 seed candidates to draw; the best-scoring one becomes the base "
+                        "(1 = previous single-sample behaviour)")
     p.add_argument("--work_dir", type=Path, default=Path("run"), help="Output root directory")
     p.add_argument("--device", type=int, default=0, help="CUDA device index for benchmarking")
     p.add_argument("--warmup", type=int, default=25, help="Warm-up iterations")
@@ -211,8 +214,14 @@ def _llm_to_kernel(
     sys_prompt: Optional[str] = None,   # New: optional system prompt
     log_path: Optional[Path] = None,
     call_type: str = "unknown",
+    io_tag: Optional[str] = None,
 ) -> KernelIndividual:
-    """LLM → code → save → KernelIndividual (no evaluation)."""
+    """LLM → code → save → KernelIndividual (no evaluation).
+
+    *io_tag* overrides the raw-reply filename stem. Several candidates may be
+    drawn within one round (best-of-N seeds), and without a distinct stem each
+    would overwrite the previous one's saved reply.
+    """
     raw = call_llm(
         prompt,
         sys_prompt=sys_prompt,
@@ -222,7 +231,7 @@ def _llm_to_kernel(
     )
     # Ensure io_dir exists before writing
     io_dir.mkdir(parents=True, exist_ok=True)
-    reply_file = io_dir / f"{round_idx}_raw_reply.txt"
+    reply_file = io_dir / f"{io_tag if io_tag else round_idx}_raw_reply.txt"
     reply_file.write_text(raw, encoding="utf-8")
     
     # For optimization calls, extract kernel code using delimiter-aware extraction
@@ -779,19 +788,54 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                             reference_profile=ref_profile_block)
             prompt_file = io_dir / f"round{round_idx:03d}_seed_prompt.txt"
             prompt_file.write_text(seed_prompt, encoding="utf-8")
-            ind = _llm_to_kernel(seed_prompt, code_dir, call_llm, io_dir,
-                                 round_idx, log_path=log_path, call_type="seed")
-            _bench_and_score(
-                ind,
-                ref_py=task_path,
-                device_idx=args.device,
-                warmup=args.warmup,
-                repeat=args.repeat,
-                tol=args.tol,
-                phase="seed",
-                metrics_dir=eval_dir,
-            )
-            
+            # Best-of-N seeds. Round 0 is a single temperature-1 draw, and the
+            # spread between draws is wide enough to dominate what the whole
+            # optimisation search adds, so one unlucky sample caps the run. Draw
+            # several and keep the best; the extra cost is small next to the
+            # rounds a run spends plateaued at the end.
+            n_seeds = max(1, int(getattr(args, "num_seeds", 1) or 1))
+            seed_cands: List[KernelIndividual] = []
+            for seed_i in range(n_seeds):
+                if n_seeds > 1:
+                    print(f"[Seed] Drawing candidate {seed_i + 1}/{n_seeds} ...", flush=True)
+                cand = _llm_to_kernel(
+                    seed_prompt, code_dir, call_llm, io_dir, round_idx,
+                    log_path=log_path, call_type="seed",
+                    io_tag=f"{round_idx}_seed{seed_i}" if n_seeds > 1 else None,
+                )
+                _bench_and_score(
+                    cand,
+                    ref_py=task_path,
+                    device_idx=args.device,
+                    warmup=args.warmup,
+                    repeat=args.repeat,
+                    tol=args.tol,
+                    phase="seed",
+                    metrics_dir=eval_dir,
+                )
+                seed_cands.append(cand)
+
+            def _seed_score(c: KernelIndividual) -> float:
+                # A candidate that did not run must never outrank one that did,
+                # whatever it left in .score.
+                runnable = bool(getattr(c, "metrics", {}).get("runnable", False))
+                return c.score if (runnable and c.score is not None) else float("-inf")
+
+            # max() keeps the first on ties, so with every candidate unrunnable
+            # this picks candidate 1 and the existing repair path takes over
+            # exactly as it did before.
+            ind = max(seed_cands, key=_seed_score)
+            if n_seeds > 1:
+                for seed_i, cand in enumerate(seed_cands):
+                    sc = _seed_score(cand)
+                    shown = f"{sc:.4f}" if sc != float("-inf") else "not runnable"
+                    mark = "  <-- selected" if cand is ind else ""
+                    print(f"[Seed] candidate {seed_i + 1}/{n_seeds}: {shown}{mark}", flush=True)
+                if _seed_score(ind) == float("-inf"):
+                    print("[Seed] No candidate was runnable; continuing with candidate 1 "
+                          "for repair", flush=True)
+
+
             # Record seed kernel in optimization tree
             if ind and hasattr(ind, 'code_path') and ind.code_path:
                 kernel_name = ind.code_path.stem

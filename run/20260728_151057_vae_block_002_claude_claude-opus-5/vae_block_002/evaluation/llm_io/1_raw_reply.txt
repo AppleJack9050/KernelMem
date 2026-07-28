@@ -1,3 +1,38 @@
+**Section A – Checklist evidence (plan-to-code mapping)**
+
+Plan item 1: Algebraic fold — precompute `scale = rstd*gamma`, `bias = beta - mean*scale`, use `fmaf`.
+Implemented in code: `gn_silu_add_t_vec_kernel`, phase-1 preamble (`sc.x/bi.x ...`) and inner `fmaf(v.x, sc.x, bi.x)`.
+
+Plan item 2: One 128-bit NHWC load per thread (4 channels, same group), float4 gamma/beta.
+Implemented in code: `gn_silu_add_t_vec_kernel` phase-1 loop `*reinterpret_cast<const float4*>(yb + (size_t)p*CH + c)` plus float4 `gamma+c` / `beta+c` loads.
+
+Plan item 3: New tile geometry 64 channels × 128 pixels, 256 threads/block, smem budget check.
+Implemented in code: `__shared__ float tile[TILE_C*TILE_P]` (64×128 = 32 KB, 7 blocks/SM) in `gn_silu_add_t_vec_kernel`; blockDim 256 at launch. *Deviation: instead of the `+1` row pad I use a quad-granular XOR swizzle (`col = pl ^ 4*(lane&7)`) so BOTH phases stay 128-bit-aligned and conflict-light (pad would break float4 alignment in phase 2).*
+
+Plan item 4: Phase 1 lane=tid&15, prow=tid>>4, 8 passes × 16 pixels, 4 scalar smem writes.
+Implemented in code: phase-1 block of `gn_silu_add_t_vec_kernel` (`lane`, `prow`, `#pragma unroll for pass<8`, four `tile[...] = ...` stores).
+
+Plan item 5: Phase 2 — float4 residual load + float4 smem read + float4 NCHW store, 4 consecutive pixels/thread.
+Implemented in code: phase-2 block (`float4 s = *(const float4*)&tile[cl*TILE_P + 4*t]`, `float4 r4 = ...res...`, `*(float4*)(ob + cc*N + p) = o`).
+
+Plan item 6: Alignment/tail guard — keep scalar kernel, launch it when `N%4!=0`; bounds-exact tail in vector kernel.
+Implemented in code: `gn_silu_add_t_scalar_kernel` kept verbatim (renamed); host dispatch `use_vec = (N%4==0) && 16B-aligned pointers`; `if (p < N)` guards in both phases.
+
+Plan item 7: Grid `((N+127)/128, CH/64, B)`, blockDim 256, exact coverage.
+Implemented in code: launch config in `fused_block` vector branch (`dim3 grd((N+127)/128, CH/64, B); 256 threads`).
+
+Plan item 8: Residual source stays the original NCHW `xc`; `out` is fresh `at::empty`.
+Implemented in code: `fused_block` passes `xc.data_ptr<float>()` as `res`, `out = at::empty(...)`.
+
+Plan item 9: Identical per-element op order except the affine fold.
+Implemented in code: SiLU kept as `a / (1.f + expf(-a))` in phase 1; only the affine is fused via `fmaf`.
+
+Plan item 10: Re-profile / bump pad if smem conflicts.
+Implemented in code: not a code change; swizzle chosen up-front (phase-2 conflict-free, phase-1 2-way) so no pad tuning is needed.
+
+=== KERNEL CODE STARTS BELOW ===
+
+```python
 # ==========================================================================
 # ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
 #
@@ -6,55 +41,33 @@
 # 1) CHOSEN GRANULARITY: (D) FULL FORWARD REWRITE.
 #    The whole reference `run()` body (2x [conv3x3 -> GroupNorm(32) -> SiLU] +
 #    residual add) is executed inside a single C++/CUDA entry point
-#    `fused_block(...)` built with load_inline.  Nothing of the reference
-#    math is left to eager PyTorch on the fast path.
+#    `fused_block(...)` built with load_inline.
 #
 # 2) OPS REPLACED
-#    - F.conv2d x2      -> at::conv2d called INSIDE the extension, but driven
-#                          with NHWC (channels_last) tensors so cuDNN enters the
-#                          sm90 NHWC TF32 implicit-GEMM kernel *directly*.
-#                          The reference profile shows 4x nchwToNhwcKernel +
-#                          2x nhwcToNchwKernel = 309 us (21% of runtime) spent
-#                          only converting layouts around that same kernel.
-#                          We pay ONE cheap NCHW->NHWC transpose for x (custom
-#                          kernel) and fold the NHWC->NCHW transpose of the
-#                          result into the final epilogue kernel, so all six
-#                          library layout kernels disappear.
-#    - F.group_norm x2  -> custom 2-stage deterministic reduction
-#                          (gn_stats_kernel -> gn_finalize_kernel) on NHWC data.
-#                          No float atomics => bit-reproducible run to run.
-#                          Reductions accumulate in float32 (input dtype = fp32).
+#    - F.conv2d x2      -> at::conv2d INSIDE the extension, driven with NHWC
+#                          (channels_last) tensors so cuDNN enters the sm90
+#                          NHWC TF32 implicit-GEMM kernel directly (all six
+#                          library layout kernels disappear).
+#    - F.group_norm x2  -> custom 2-stage deterministic reduction.
 #    - F.silu x2        -> fused into the GroupNorm apply kernels.
 #    - out + residual   -> fused into the final epilogue kernel.
 #
 # 3) FUSION MAP (kernels)
-#    K1 nchw2nhwc_kernel        : layout transpose of x (shared-mem 32x32 tile).
-#    K2 gn_stats_kernel         : per-(batch,group) partial sum / sumsq, NHWC,
-#                                 float4 loads, one group per thread lane pair.
-#    K3 gn_finalize_kernel      : partials -> mean/rstd (deterministic tree).
-#    K4 gn_silu_nhwc_kernel     : (GN affine + SiLU) on conv1 out, NHWC->NHWC,
-#                                 vectorised float4, feeds conv2 with zero
-#                                 extra layout traffic.
-#    K5 gn_silu_add_t_kernel    : (GN affine + SiLU + residual add + NHWC->NCHW
-#                                 transpose) in ONE pass over conv2's output.
-#                                 Both the NHWC read and the NCHW residual
-#                                 read/write are coalesced through a 32x33
-#                                 shared tile.
-#    cuDNN (via at::conv2d in the extension) owns the two 3x3 GEMM-convs; they
-#    are ~40% of the runtime and already at the TF32 roofline, so the win comes
-#    from removing the layout traffic and all the norm/act/add glue around them.
+#    K1 nchw2nhwc_kernel          : layout transpose of x.
+#    K2 gn_stats_kernel           : per-(batch,group) partial sum / sumsq.
+#    K3 gn_finalize_kernel        : partials -> mean/rstd.
+#    K4 gn_silu_nhwc_kernel       : GN affine + SiLU on conv1 out (float4).
+#    K5 gn_silu_add_t_vec_kernel  : GN affine + SiLU + residual + NHWC->NCHW,
+#                                   ALL global accesses 128-bit (float4):
+#                                   phase-1 reads 4 contiguous channels,
+#                                   phase-2 reads residual / writes out over
+#                                   4 contiguous W pixels, staged through a
+#                                   64x128 XOR-swizzled shared tile.
+#       gn_silu_add_t_scalar_kernel: unchanged scalar fallback for N % 4 != 0
+#                                   or non-16B-aligned pointers.
 #
-# 4) WHAT REMAINS IN PYTORCH
-#    - at::conv2d inside the extension : vendor tensor-core conv, not worth
-#      re-implementing; we only fix its layout so no transposes are emitted.
-#    - weight .contiguous(ChannelsLast): 2.4 MB each, ~2 us, needed once per
-#      call because the weights are runtime inputs (cannot be cached safely).
-#    - A pure-PyTorch fallback path in ModelNew.forward that is only taken for
-#      shapes/dtypes the specialised kernels do not cover (C != 256), so the
-#      module is never incorrect.
-#
-# PRECISION: everything stays float32 (storage + arithmetic); reductions in
-# float32; TF32 tensor cores only inside conv, exactly as the reference does.
+# PRECISION: everything stays float32; reductions in float32; TF32 tensor
+# cores only inside conv, exactly as the reference does.
 # ==========================================================================
 
 import torch
@@ -68,11 +81,15 @@ _CUDA_SRC = r'''
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <stdint.h>
 
 #define CH   256          // channels (const per problem definition)
 #define NG   32           // num groups
 #define CPG  (CH/NG)      // 8 channels per group
 #define CHUNK 128         // pixels per stats block
+
+#define TILE_C 64         // channels per epilogue block
+#define TILE_P 128        // pixels   per epilogue block
 
 // ---------------------------------------------------------------------------
 // K1 : NCHW -> NHWC transpose (per batch, C x N  ->  N x C)
@@ -109,9 +126,6 @@ __global__ void nchw2nhwc_kernel(const float* __restrict__ src,
 
 // ---------------------------------------------------------------------------
 // K2 : per (batch, chunk) partial sums / sums of squares for the 32 groups
-//      layout of `partials` : [(b * nchunks + chunk) * 2*NG + 2*g + {0,1}]
-//      EVERY block writes its full 64-float slot -> no unwritten tail even
-//      when N is not a multiple of CHUNK.
 // ---------------------------------------------------------------------------
 __global__ void gn_stats_kernel(const float* __restrict__ y,
                                 float* __restrict__ partials,
@@ -231,16 +245,17 @@ __global__ void gn_silu_nhwc_kernel(const float4* __restrict__ y,
 }
 
 // ---------------------------------------------------------------------------
-// K5 : GroupNorm affine + SiLU + residual add + NHWC->NCHW transpose
+// K5-scalar (fallback, kept verbatim) :
+//   GroupNorm affine + SiLU + residual add + NHWC->NCHW transpose
 // ---------------------------------------------------------------------------
-__global__ void gn_silu_add_t_kernel(const float* __restrict__ y,     // NHWC
-                                     const float* __restrict__ res,   // NCHW
-                                     const float* __restrict__ mean,
-                                     const float* __restrict__ rstd,
-                                     const float* __restrict__ gamma,
-                                     const float* __restrict__ beta,
-                                     float* __restrict__ out,         // NCHW
-                                     int N)
+__global__ void gn_silu_add_t_scalar_kernel(const float* __restrict__ y,   // NHWC
+                                            const float* __restrict__ res, // NCHW
+                                            const float* __restrict__ mean,
+                                            const float* __restrict__ rstd,
+                                            const float* __restrict__ gamma,
+                                            const float* __restrict__ beta,
+                                            float* __restrict__ out,       // NCHW
+                                            int N)
 {
     __shared__ float tile[32][33];
     const int p0 = blockIdx.x * 32;
@@ -284,11 +299,123 @@ __global__ void gn_silu_add_t_kernel(const float* __restrict__ y,     // NHWC
 }
 
 // ---------------------------------------------------------------------------
+// K5-vector : fully 128-bit epilogue
+//   phase 1 : float4 NHWC read (4 contiguous channels, one group)
+//             -> fused affine (fmaf with precomputed scale/bias) + SiLU
+//             -> staged into a 64(ch) x 128(px) shared tile.
+//   phase 2 : float4 shared read (4 contiguous pixels of one channel)
+//             + float4 NCHW residual read + float4 NCHW store.
+//
+//   Shared layout uses a quad-granular XOR swizzle
+//       storage_col = p_local ^ (4 * ((c_local >> 2) & 7))
+//   which keeps every access 16B aligned (float4 legal in BOTH phases),
+//   makes phase-2 reads conflict-free and phase-1 writes only 2-way.
+//   Shared memory: 64*128*4 = 32768 B per block -> up to 7 blocks/SM.
+// ---------------------------------------------------------------------------
+__global__ __launch_bounds__(256)
+void gn_silu_add_t_vec_kernel(const float* __restrict__ y,     // NHWC
+                              const float* __restrict__ res,   // NCHW
+                              const float* __restrict__ mean,
+                              const float* __restrict__ rstd,
+                              const float* __restrict__ gamma,
+                              const float* __restrict__ beta,
+                              float* __restrict__ out,         // NCHW
+                              int N)
+{
+    __shared__ float tile[TILE_C * TILE_P];
+
+    const int p0  = blockIdx.x * TILE_P;
+    const int c0  = blockIdx.y * TILE_C;
+    const int b   = blockIdx.z;
+    const int tid = threadIdx.x;                 // 0..255
+
+    const float* yb = y + (size_t)b * (size_t)N * CH;
+
+    // ------------------------- phase 1 ------------------------------------
+    {
+        const int lane = tid & 15;               // float4 index inside 64 ch
+        const int prow = tid >> 4;               // 0..15 pixel rows
+        const int cl   = 4 * lane;               // local channel base
+        const int c    = c0 + cl;                // global channel base
+        const int g    = c >> 3;                 // CPG == 8, quad in 1 group
+
+        const float m = mean[b * NG + g];
+        const float r = rstd[b * NG + g];
+        const float4 gm = *reinterpret_cast<const float4*>(gamma + c);
+        const float4 bt = *reinterpret_cast<const float4*>(beta  + c);
+
+        // algebraic fold: a = t0 * scale + bias
+        float4 sc, bi;
+        sc.x = r * gm.x;  bi.x = bt.x - m * sc.x;
+        sc.y = r * gm.y;  bi.y = bt.y - m * sc.y;
+        sc.z = r * gm.z;  bi.z = bt.z - m * sc.z;
+        sc.w = r * gm.w;  bi.w = bt.w - m * sc.w;
+
+        const int sw = 4 * (lane & 7);           // XOR swizzle for this quad
+        float* trow = &tile[(size_t)cl * TILE_P];
+
+        #pragma unroll
+        for (int pass = 0; pass < 8; ++pass) {
+            const int pl = prow + 16 * pass;     // 0..127
+            const int p  = p0 + pl;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (p < N) {
+                v = *reinterpret_cast<const float4*>(yb + (size_t)p * CH + c);
+            }
+            float a0 = fmaf(v.x, sc.x, bi.x);
+            float a1 = fmaf(v.y, sc.y, bi.y);
+            float a2 = fmaf(v.z, sc.z, bi.z);
+            float a3 = fmaf(v.w, sc.w, bi.w);
+
+            const int col = pl ^ sw;
+            trow[0 * TILE_P + col] = a0 / (1.f + expf(-a0));
+            trow[1 * TILE_P + col] = a1 / (1.f + expf(-a1));
+            trow[2 * TILE_P + col] = a2 / (1.f + expf(-a2));
+            trow[3 * TILE_P + col] = a3 / (1.f + expf(-a3));
+        }
+    }
+
+    __syncthreads();
+
+    // ------------------------- phase 2 ------------------------------------
+    {
+        const float* rb = res + (size_t)b * CH * (size_t)N;
+        float*       ob = out + (size_t)b * CH * (size_t)N;
+
+        const int t = tid & 31;                  // 0..31 -> pixel quad
+        const int w = tid >> 5;                  // warp id 0..7
+
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int cl = w + 8 * k;            // local channel (warp uniform)
+            const int f  = (cl >> 2) & 7;        // matching swizzle
+            const int p  = p0 + 4 * (t ^ f);     // logical pixel (multiple of 4)
+            if (p < N) {
+                const float4 s =
+                    *reinterpret_cast<const float4*>(&tile[(size_t)cl * TILE_P + 4 * t]);
+                const size_t off = (size_t)(c0 + cl) * (size_t)N + (size_t)p;
+                const float4 r4 = *reinterpret_cast<const float4*>(rb + off);
+                float4 o;
+                o.x = s.x + r4.x;
+                o.y = s.y + r4.y;
+                o.z = s.z + r4.z;
+                o.w = s.w + r4.w;
+                *reinterpret_cast<float4*>(ob + off) = o;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // host driver
 // ---------------------------------------------------------------------------
 static inline at::Tensor to_cl(const at::Tensor& t) {
     return t.is_contiguous(at::MemoryFormat::ChannelsLast)
            ? t : t.contiguous(at::MemoryFormat::ChannelsLast);
+}
+
+static inline bool aligned16(const void* p) {
+    return (((uintptr_t)p) & 15u) == 0u;
 }
 
 static void compute_stats(const at::Tensor& y, int64_t B, int64_t N,
@@ -382,14 +509,31 @@ torch::Tensor fused_block(torch::Tensor x,
 
     auto out = at::empty({B, C, H, W}, opts);   // plain NCHW contiguous
     {
-        dim3 blk(32, 8, 1);
-        dim3 grd((unsigned)((N + 31) / 32), (unsigned)(C / 32), (unsigned)B);
-        gn_silu_add_t_kernel<<<grd, blk, 0, stream>>>(
-            y2.data_ptr<float>(), xc.data_ptr<float>(),
-            mean2.data_ptr<float>(), rstd2.data_ptr<float>(),
-            g2.data_ptr<float>(), b2.data_ptr<float>(),
-            out.data_ptr<float>(), (int)N);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        const float* yp = y2.data_ptr<float>();
+        const float* rp = xc.data_ptr<float>();
+        float*       op = out.data_ptr<float>();
+        const float* gp = g2.data_ptr<float>();
+        const float* bp = b2.data_ptr<float>();
+
+        const bool use_vec = ((N % 4) == 0) && aligned16(yp) && aligned16(rp) &&
+                             aligned16(op) && aligned16(gp) && aligned16(bp);
+
+        if (use_vec) {
+            dim3 blk(256, 1, 1);
+            dim3 grd((unsigned)((N + TILE_P - 1) / TILE_P),
+                     (unsigned)(CH / TILE_C), (unsigned)B);
+            gn_silu_add_t_vec_kernel<<<grd, blk, 0, stream>>>(
+                yp, rp, mean2.data_ptr<float>(), rstd2.data_ptr<float>(),
+                gp, bp, op, (int)N);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        } else {
+            dim3 blk(32, 8, 1);
+            dim3 grd((unsigned)((N + 31) / 32), (unsigned)(C / 32), (unsigned)B);
+            gn_silu_add_t_scalar_kernel<<<grd, blk, 0, stream>>>(
+                yp, rp, mean2.data_ptr<float>(), rstd2.data_ptr<float>(),
+                gp, bp, op, (int)N);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
     }
     return out;
 }
@@ -407,7 +551,7 @@ torch::Tensor fused_block(torch::Tensor x,
 '''
 
 _ext = load_inline(
-    name="vae_resblock_fused_v1",
+    name="vae_resblock_fused_v2",
     cpp_sources=_CPP_SRC,
     cuda_sources=_CUDA_SRC,
     functions=["fused_block"],
@@ -425,10 +569,10 @@ _ext = load_inline(
 
 
 class ModelNew(nn.Module):
-    # See the module-level header comment for the full granularity (D) plan:
-    # full forward rewrite; convs kept as cuDNN NHWC-TF32 calls issued from
-    # inside the extension, every norm/activation/add/layout op replaced by
-    # custom CUDA kernels (K1..K5) with the final transpose+residual fused.
+    # Granularity (D): full forward rewrite; convs kept as cuDNN NHWC-TF32 calls
+    # issued from inside the extension, every norm/activation/add/layout op
+    # replaced by custom CUDA kernels (K1..K5).  The epilogue (K5) is now fully
+    # 128-bit vectorised on all three global streams.
     def __init__(self):
         super().__init__()
         torch.backends.cudnn.benchmark = True
@@ -460,3 +604,4 @@ class ModelNew(nn.Module):
                            bias=norm2_bias, eps=eps_f)
         out = F.silu(out)
         return out + residual
+```

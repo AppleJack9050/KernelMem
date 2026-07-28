@@ -13,45 +13,29 @@
 #    - F.conv2d x2      -> at::conv2d called INSIDE the extension, but driven
 #                          with NHWC (channels_last) tensors so cuDNN enters the
 #                          sm90 NHWC TF32 implicit-GEMM kernel *directly*.
-#                          The reference profile shows 4x nchwToNhwcKernel +
-#                          2x nhwcToNchwKernel = 309 us (21% of runtime) spent
-#                          only converting layouts around that same kernel.
-#                          We pay ONE cheap NCHW->NHWC transpose for x (custom
-#                          kernel) and fold the NHWC->NCHW transpose of the
-#                          result into the final epilogue kernel, so all six
-#                          library layout kernels disappear.
 #    - F.group_norm x2  -> custom 2-stage deterministic reduction
 #                          (gn_stats_kernel -> gn_finalize_kernel) on NHWC data.
-#                          No float atomics => bit-reproducible run to run.
-#                          Reductions accumulate in float32 (input dtype = fp32).
 #    - F.silu x2        -> fused into the GroupNorm apply kernels.
 #    - out + residual   -> fused into the final epilogue kernel.
 #
-# 3) FUSION MAP (kernels)
-#    K1 nchw2nhwc_kernel        : layout transpose of x (shared-mem 32x32 tile).
-#    K2 gn_stats_kernel         : per-(batch,group) partial sum / sumsq, NHWC,
-#                                 float4 loads, one group per thread lane pair.
-#    K3 gn_finalize_kernel      : partials -> mean/rstd (deterministic tree).
-#    K4 gn_silu_nhwc_kernel     : (GN affine + SiLU) on conv1 out, NHWC->NHWC,
-#                                 vectorised float4, feeds conv2 with zero
-#                                 extra layout traffic.
-#    K5 gn_silu_add_t_kernel    : (GN affine + SiLU + residual add + NHWC->NCHW
-#                                 transpose) in ONE pass over conv2's output.
-#                                 Both the NHWC read and the NCHW residual
-#                                 read/write are coalesced through a 32x33
-#                                 shared tile.
-#    cuDNN (via at::conv2d in the extension) owns the two 3x3 GEMM-convs; they
-#    are ~40% of the runtime and already at the TF32 roofline, so the win comes
-#    from removing the layout traffic and all the norm/act/add glue around them.
+# 3) THIS ROUND: nhwc_output_propagation
+#    The epilogue (K5) used to embed an NHWC->NCHW transpose, which forced a
+#    32x33 shared tile + __syncthreads and TWO NCHW row-strided streams
+#    (residual read + store, 32 rows 32 KB apart).  That capped it at 73.24%
+#    DRAM / 1.57 TB/s while the pure-NHWC sibling K4 hits 82.88% / 2.01 TB/s.
+#    We now PROPAGATE the NHWC layout to the output: the residual is sourced
+#    from `xn` (the NHWC copy of x that K1 already materialised) and the output
+#    is allocated channels_last, so K5 becomes a pure float4 NHWC elementwise
+#    kernel: no shared memory, no barrier, three fully-sequential streams.
+#    The old transposing kernel is retained behind `#define NCHW_OUT 0`.
 #
-# 4) WHAT REMAINS IN PYTORCH
-#    - at::conv2d inside the extension : vendor tensor-core conv, not worth
-#      re-implementing; we only fix its layout so no transposes are emitted.
-#    - weight .contiguous(ChannelsLast): 2.4 MB each, ~2 us, needed once per
-#      call because the weights are runtime inputs (cannot be cached safely).
-#    - A pure-PyTorch fallback path in ModelNew.forward that is only taken for
-#      shapes/dtypes the specialised kernels do not cover (C != 256), so the
-#      module is never incorrect.
+# 4) FUSION MAP (kernels)
+#    K1 nchw2nhwc_kernel        : layout transpose of x (shared-mem 32x32 tile).
+#    K2 gn_stats_kernel         : per-(batch,group) partial sum / sumsq, NHWC.
+#    K3 gn_finalize_kernel      : partials -> mean/rstd (deterministic tree).
+#    K4 gn_silu_nhwc_kernel     : (GN affine + SiLU) on conv1 out, NHWC->NHWC.
+#    K5 gn_silu_add_nhwc_kernel : (GN affine + SiLU + residual add), pure NHWC
+#                                 float4, no shared mem, no __syncthreads.
 #
 # PRECISION: everything stays float32 (storage + arithmetic); reductions in
 # float32; TF32 tensor cores only inside conv, exactly as the reference does.
@@ -74,8 +58,11 @@ _CUDA_SRC = r'''
 #define CPG  (CH/NG)      // 8 channels per group
 #define CHUNK 128         // pixels per stats block
 
+// Plan item 8: single-line flip restores the old NCHW-contiguous output path.
+#define NCHW_OUT 0
+
 // ---------------------------------------------------------------------------
-// K1 : NCHW -> NHWC transpose (per batch, C x N  ->  N x C)
+// K1 : NCHW -> NHWC transpose (per batch, C x N  ->  N x C)   [UNCHANGED]
 // ---------------------------------------------------------------------------
 __global__ void nchw2nhwc_kernel(const float* __restrict__ src,
                                  float* __restrict__ dst,
@@ -108,10 +95,7 @@ __global__ void nchw2nhwc_kernel(const float* __restrict__ src,
 }
 
 // ---------------------------------------------------------------------------
-// K2 : per (batch, chunk) partial sums / sums of squares for the 32 groups
-//      layout of `partials` : [(b * nchunks + chunk) * 2*NG + 2*g + {0,1}]
-//      EVERY block writes its full 64-float slot -> no unwritten tail even
-//      when N is not a multiple of CHUNK.
+// K2 : per (batch, chunk) partial sums / sums of squares   [UNCHANGED]
 // ---------------------------------------------------------------------------
 __global__ void gn_stats_kernel(const float* __restrict__ y,
                                 float* __restrict__ partials,
@@ -157,7 +141,7 @@ __global__ void gn_stats_kernel(const float* __restrict__ y,
 }
 
 // ---------------------------------------------------------------------------
-// K3 : reduce partials -> mean / rstd   (one block per (b,g))
+// K3 : reduce partials -> mean / rstd   (one block per (b,g))   [UNCHANGED]
 // ---------------------------------------------------------------------------
 __global__ void gn_finalize_kernel(const float* __restrict__ partials,
                                    float* __restrict__ mean,
@@ -193,7 +177,7 @@ __global__ void gn_finalize_kernel(const float* __restrict__ partials,
 }
 
 // ---------------------------------------------------------------------------
-// K4 : GroupNorm affine + SiLU, NHWC -> NHWC, float4 vectorised
+// K4 : GroupNorm affine + SiLU, NHWC -> NHWC, float4 vectorised   [UNCHANGED]
 // ---------------------------------------------------------------------------
 __global__ void gn_silu_nhwc_kernel(const float4* __restrict__ y,
                                     float4* __restrict__ out,
@@ -231,7 +215,57 @@ __global__ void gn_silu_nhwc_kernel(const float4* __restrict__ y,
 }
 
 // ---------------------------------------------------------------------------
-// K5 : GroupNorm affine + SiLU + residual add + NHWC->NCHW transpose
+// K5 (NEW) : GroupNorm affine + SiLU + residual add, PURE NHWC float4.
+//            Plan items 2 / 5: no shared memory, no __syncthreads, three
+//            fully-coalesced sequential streams (y, res, out).
+// ---------------------------------------------------------------------------
+__global__ void gn_silu_add_nhwc_kernel(const float4* __restrict__ y,
+                                        const float4* __restrict__ res,
+                                        const float* __restrict__ mean,
+                                        const float* __restrict__ rstd,
+                                        const float4* __restrict__ gamma,
+                                        const float4* __restrict__ beta,
+                                        float4* __restrict__ out,
+                                        long total /* = N*64 float4 per batch */)
+{
+    const int b = blockIdx.y;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    const int v = (int)(idx & 63);
+    const int g = v >> 1;                    // 4 channels/thread -> one group
+    const float m = mean[b * NG + g];
+    const float r = rstd[b * NG + g];
+    const float4 gm = gamma[v];
+    const float4 bt = beta[v];
+
+    const long off = (long)b * total + idx;
+    float4 val = y[off];
+    float4 r4  = res[off];
+
+    // fold the affine into one FMA per component: a = val*sc + sh
+    const float scx = r * gm.x, shx = fmaf(-m, scx, bt.x);
+    const float scy = r * gm.y, shy = fmaf(-m, scy, bt.y);
+    const float scz = r * gm.z, shz = fmaf(-m, scz, bt.z);
+    const float scw = r * gm.w, shw = fmaf(-m, scw, bt.w);
+
+    const float a0 = fmaf(val.x, scx, shx);
+    const float a1 = fmaf(val.y, scy, shy);
+    const float a2 = fmaf(val.z, scz, shz);
+    const float a3 = fmaf(val.w, scw, shw);
+
+    float4 o;
+    o.x = a0 / (1.f + expf(-a0)) + r4.x;
+    o.y = a1 / (1.f + expf(-a1)) + r4.y;
+    o.z = a2 / (1.f + expf(-a2)) + r4.z;
+    o.w = a3 / (1.f + expf(-a3)) + r4.w;
+    out[off] = o;
+}
+
+#if NCHW_OUT
+// ---------------------------------------------------------------------------
+// K5-legacy : GN affine + SiLU + residual add + NHWC->NCHW transpose
+//             (retained behind the NCHW_OUT switch, plan item 8)
 // ---------------------------------------------------------------------------
 __global__ void gn_silu_add_t_kernel(const float* __restrict__ y,     // NHWC
                                      const float* __restrict__ res,   // NCHW
@@ -282,6 +316,7 @@ __global__ void gn_silu_add_t_kernel(const float* __restrict__ y,     // NHWC
         }
     }
 }
+#endif  // NCHW_OUT
 
 // ---------------------------------------------------------------------------
 // host driver
@@ -331,6 +366,7 @@ torch::Tensor fused_block(torch::Tensor x,
     auto opts = x.options();
 
     // ---- K1 : x (NCHW) -> xn (NHWC) --------------------------------------
+    // Plan item 4: xc is consumed ONLY here; the epilogue no longer reads it.
     auto xn = at::empty({B, C, H, W},
                         opts.memory_format(at::MemoryFormat::ChannelsLast));
     {
@@ -380,6 +416,8 @@ torch::Tensor fused_block(torch::Tensor x,
     auto rstd2 = at::empty({B, (int64_t)NG}, opts);
     compute_stats(y2, B, N, mean2, rstd2, (float)eps, stream);
 
+#if NCHW_OUT
+    // ---- legacy epilogue : NHWC->NCHW transpose fused ---------------------
     auto out = at::empty({B, C, H, W}, opts);   // plain NCHW contiguous
     {
         dim3 blk(32, 8, 1);
@@ -391,6 +429,26 @@ torch::Tensor fused_block(torch::Tensor x,
             out.data_ptr<float>(), (int)N);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
+#else
+    // ---- K5 : pure NHWC epilogue (plan items 1/2/3) -----------------------
+    // Output is channels_last; residual is read from the NHWC copy xn.
+    auto out = at::empty({B, C, H, W},
+                         opts.memory_format(at::MemoryFormat::ChannelsLast));
+    {
+        const long total = (long)N * 64;        // exact in float4 units
+        const int threads = 256;
+        dim3 grd((unsigned)((total + threads - 1) / threads), (unsigned)B, 1);
+        gn_silu_add_nhwc_kernel<<<grd, threads, 0, stream>>>(
+            reinterpret_cast<const float4*>(y2.data_ptr<float>()),
+            reinterpret_cast<const float4*>(xn.data_ptr<float>()),
+            mean2.data_ptr<float>(), rstd2.data_ptr<float>(),
+            reinterpret_cast<const float4*>(g2.data_ptr<float>()),
+            reinterpret_cast<const float4*>(b2.data_ptr<float>()),
+            reinterpret_cast<float4*>(out.data_ptr<float>()),
+            total);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+#endif
     return out;
 }
 '''
@@ -407,7 +465,7 @@ torch::Tensor fused_block(torch::Tensor x,
 '''
 
 _ext = load_inline(
-    name="vae_resblock_fused_v1",
+    name="vae_resblock_fused_v2_nhwcout",
     cpp_sources=_CPP_SRC,
     cuda_sources=_CUDA_SRC,
     functions=["fused_block"],
@@ -427,8 +485,9 @@ _ext = load_inline(
 class ModelNew(nn.Module):
     # See the module-level header comment for the full granularity (D) plan:
     # full forward rewrite; convs kept as cuDNN NHWC-TF32 calls issued from
-    # inside the extension, every norm/activation/add/layout op replaced by
-    # custom CUDA kernels (K1..K5) with the final transpose+residual fused.
+    # inside the extension, every norm/activation/add op replaced by custom
+    # CUDA kernels (K1..K5).  This round propagates NHWC all the way to the
+    # output so the epilogue no longer transposes (no shared mem, no barrier).
     def __init__(self):
         super().__init__()
         torch.backends.cudnn.benchmark = True

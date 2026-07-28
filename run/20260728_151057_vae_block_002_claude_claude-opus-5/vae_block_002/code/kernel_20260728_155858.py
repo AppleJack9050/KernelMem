@@ -1,60 +1,40 @@
 # ==========================================================================
 # ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
+#            round N: L2 CACHE BLOCKING on the batch axis
 #
-# HEADER / PLANNING NOTES (required)
+# HEADER / PLANNING NOTES
 #
-# 1) CHOSEN GRANULARITY: (D) FULL FORWARD REWRITE.
-#    The whole reference `run()` body (2x [conv3x3 -> GroupNorm(32) -> SiLU] +
-#    residual add) is executed inside a single C++/CUDA entry point
-#    `fused_block(...)` built with load_inline.  Nothing of the reference
-#    math is left to eager PyTorch on the fast path.
+# 1) CHOSEN GRANULARITY: (D) FULL FORWARD REWRITE (unchanged from base).
+#    The whole reference run() body (2x [conv3x3 -> GroupNorm(32) -> SiLU] +
+#    residual add) executes inside one C++/CUDA entry point `fused_block`.
 #
-# 2) OPS REPLACED
-#    - F.conv2d x2      -> at::conv2d called INSIDE the extension, but driven
-#                          with NHWC (channels_last) tensors so cuDNN enters the
-#                          sm90 NHWC TF32 implicit-GEMM kernel *directly*.
-#                          The reference profile shows 4x nchwToNhwcKernel +
-#                          2x nhwcToNchwKernel = 309 us (21% of runtime) spent
-#                          only converting layouts around that same kernel.
-#                          We pay ONE cheap NCHW->NHWC transpose for x (custom
-#                          kernel) and fold the NHWC->NCHW transpose of the
-#                          result into the final epilogue kernel, so all six
-#                          library layout kernels disappear.
-#    - F.group_norm x2  -> custom 2-stage deterministic reduction
-#                          (gn_stats_kernel -> gn_finalize_kernel) on NHWC data.
-#                          No float atomics => bit-reproducible run to run.
-#                          Reductions accumulate in float32 (input dtype = fp32).
-#    - F.silu x2        -> fused into the GroupNorm apply kernels.
-#    - out + residual   -> fused into the final epilogue kernel.
+# 2) THIS ROUND'S CHANGE: l2_cache_blocking
+#    The producer/consumer chain (K1 -> conv1 -> K2/K3 -> K4 -> conv2 ->
+#    K2/K3 -> K5) was scheduled whole-tensor, so every intermediate (67 MB for
+#    8x256x64x128) was evicted from the 50 MB L2 before its consumer ran:
+#    gn_stats_kernel measured lts__t_sector_hit_rate = 1.65% while
+#    gn_silu_nhwc_kernel, which trails gn_stats on the SAME buffer, got 49.98%
+#    — the reuse channel exists and is purely capacity limited.
+#    We now run the entire chain on batch chunks of CB images sized so the
+#    live slabs (xn, y1, z1, y2) stay L2-resident (<= ~24 MB each), turning the
+#    conv-output re-reads from DRAM misses into L2 hits.  Chunking is
+#    mathematically exact: GroupNorm stats are per (batch, group), conv/SiLU/
+#    residual-add have no cross-batch dependency.
+#    Shapes whose single slab already blows the budget (4x256x256x256, 67 MB)
+#    take the guarded whole-tensor path (CB == B => exactly one iteration =
+#    bit-identical to the previous kernel).
 #
-# 3) FUSION MAP (kernels)
-#    K1 nchw2nhwc_kernel        : layout transpose of x (shared-mem 32x32 tile).
-#    K2 gn_stats_kernel         : per-(batch,group) partial sum / sumsq, NHWC,
-#                                 float4 loads, one group per thread lane pair.
+# 3) FUSION MAP (kernels) — unchanged bodies
+#    K1 nchw2nhwc_kernel        : layout transpose of the x chunk.
+#    K2 gn_stats_kernel         : per-(batch,group) partial sum / sumsq, NHWC.
 #    K3 gn_finalize_kernel      : partials -> mean/rstd (deterministic tree).
-#    K4 gn_silu_nhwc_kernel     : (GN affine + SiLU) on conv1 out, NHWC->NHWC,
-#                                 vectorised float4, feeds conv2 with zero
-#                                 extra layout traffic.
-#    K5 gn_silu_add_t_kernel    : (GN affine + SiLU + residual add + NHWC->NCHW
-#                                 transpose) in ONE pass over conv2's output.
-#                                 Both the NHWC read and the NCHW residual
-#                                 read/write are coalesced through a 32x33
-#                                 shared tile.
-#    cuDNN (via at::conv2d in the extension) owns the two 3x3 GEMM-convs; they
-#    are ~40% of the runtime and already at the TF32 roofline, so the win comes
-#    from removing the layout traffic and all the norm/act/add glue around them.
+#    K4 gn_silu_nhwc_kernel     : GN affine + SiLU, NHWC->NHWC, float4.
+#    K5 gn_silu_add_t_kernel    : GN affine + SiLU + residual + NHWC->NCHW.
+#    cuDNN (at::conv2d, NHWC TF32) owns the two 3x3 convs.
 #
-# 4) WHAT REMAINS IN PYTORCH
-#    - at::conv2d inside the extension : vendor tensor-core conv, not worth
-#      re-implementing; we only fix its layout so no transposes are emitted.
-#    - weight .contiguous(ChannelsLast): 2.4 MB each, ~2 us, needed once per
-#      call because the weights are runtime inputs (cannot be cached safely).
-#    - A pure-PyTorch fallback path in ModelNew.forward that is only taken for
-#      shapes/dtypes the specialised kernels do not cover (C != 256), so the
-#      module is never incorrect.
-#
-# PRECISION: everything stays float32 (storage + arithmetic); reductions in
-# float32; TF32 tensor cores only inside conv, exactly as the reference does.
+# PRECISION: float32 storage and arithmetic throughout; fp32 deterministic
+# tree reductions, no atomics; TF32 tensor cores only inside conv, exactly as
+# the reference does.
 # ==========================================================================
 
 import torch
@@ -68,6 +48,7 @@ _CUDA_SRC = r'''
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 
 #define CH   256          // channels (const per problem definition)
 #define NG   32           // num groups
@@ -109,9 +90,6 @@ __global__ void nchw2nhwc_kernel(const float* __restrict__ src,
 
 // ---------------------------------------------------------------------------
 // K2 : per (batch, chunk) partial sums / sums of squares for the 32 groups
-//      layout of `partials` : [(b * nchunks + chunk) * 2*NG + 2*g + {0,1}]
-//      EVERY block writes its full 64-float slot -> no unwritten tail even
-//      when N is not a multiple of CHUNK.
 // ---------------------------------------------------------------------------
 __global__ void gn_stats_kernel(const float* __restrict__ y,
                                 float* __restrict__ partials,
@@ -284,32 +262,98 @@ __global__ void gn_silu_add_t_kernel(const float* __restrict__ y,     // NHWC
 }
 
 // ---------------------------------------------------------------------------
-// host driver
+// host helpers
 // ---------------------------------------------------------------------------
 static inline at::Tensor to_cl(const at::Tensor& t) {
     return t.is_contiguous(at::MemoryFormat::ChannelsLast)
            ? t : t.contiguous(at::MemoryFormat::ChannelsLast);
 }
 
-static void compute_stats(const at::Tensor& y, int64_t B, int64_t N,
-                          at::Tensor& mean, at::Tensor& rstd, float eps,
-                          cudaStream_t stream)
-{
-    const int nchunks = (int)((N + CHUNK - 1) / CHUNK);
-    auto partials = at::empty({B * (int64_t)nchunks * (2 * NG)}, y.options());
+// --- plan item 9 : persisting-L2 access-policy window ----------------------
+static bool   g_l2_init   = false;
+static size_t g_persist_max = 0;   // bytes we may pin in L2
+static size_t g_window_max  = 0;   // max accessPolicyWindow size
 
-    dim3 grd((unsigned)nchunks, (unsigned)B, 1);
+static void init_l2_limits()
+{
+    if (g_l2_init) return;
+    g_l2_init = true;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11080
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    int p = 0, w = 0;
+    cudaDeviceGetAttribute(&p, cudaDevAttrMaxPersistingL2CacheSize, dev);
+    cudaDeviceGetAttribute(&w, cudaDevAttrMaxAccessPolicyWindowSize, dev);
+    if (p > 0 && w > 0) {
+        if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, (size_t)p)
+            == cudaSuccess) {
+            g_persist_max = (size_t)p;
+            g_window_max  = (size_t)w;
+        }
+    }
+    cudaGetLastError();   // never let a probe failure poison the stream
+#endif
+}
+
+static bool set_persist_window(cudaStream_t stream, void* base, size_t bytes)
+{
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11080
+    if (g_persist_max == 0 || bytes == 0) return false;
+    if (bytes > g_window_max || bytes > g_persist_max) return false;
+    cudaStreamAttrValue v = {};
+    v.accessPolicyWindow.base_ptr  = base;
+    v.accessPolicyWindow.num_bytes = bytes;
+    v.accessPolicyWindow.hitRatio  = 1.0f;
+    v.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    v.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+    bool ok = (cudaStreamSetAttribute(
+                   stream, cudaLaunchAttributeAccessPolicyWindow, &v)
+               == cudaSuccess);
+    cudaGetLastError();
+    return ok;
+#else
+    (void)stream; (void)base; (void)bytes; return false;
+#endif
+}
+
+static void clear_persist_window(cudaStream_t stream)
+{
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11080
+    cudaStreamAttrValue v = {};
+    v.accessPolicyWindow.base_ptr  = nullptr;
+    v.accessPolicyWindow.num_bytes = 0;
+    v.accessPolicyWindow.hitRatio  = 0.0f;
+    v.accessPolicyWindow.hitProp   = cudaAccessPropertyNormal;
+    v.accessPolicyWindow.missProp  = cudaAccessPropertyNormal;
+    cudaStreamSetAttribute(stream, cudaLaunchAttributeAccessPolicyWindow, &v);
+    cudaCtxResetPersistingL2Cache();
+    cudaGetLastError();
+#else
+    (void)stream;
+#endif
+}
+
+// stats over a chunk of `cb` images; `partials` is supplied by the caller and
+// reused across chunks (plan item 3).
+static void compute_stats(const float* yptr, int64_t cb, int64_t N,
+                          at::Tensor& partials,
+                          float* meanp, float* rstdp, float eps,
+                          int nchunks, cudaStream_t stream)
+{
+    dim3 grd((unsigned)nchunks, (unsigned)cb, 1);
     gn_stats_kernel<<<grd, 256, 0, stream>>>(
-        y.data_ptr<float>(), partials.data_ptr<float>(), (int)N, nchunks);
+        yptr, partials.data_ptr<float>(), (int)N, nchunks);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     const float invcount = 1.0f / (float)((double)CPG * (double)N);
-    gn_finalize_kernel<<<(unsigned)(B * NG), 128, 0, stream>>>(
-        partials.data_ptr<float>(), mean.data_ptr<float>(),
-        rstd.data_ptr<float>(), nchunks, invcount, eps);
+    gn_finalize_kernel<<<(unsigned)(cb * NG), 128, 0, stream>>>(
+        partials.data_ptr<float>(), meanp, rstdp, nchunks, invcount, eps);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// ---------------------------------------------------------------------------
+// host driver
+// ---------------------------------------------------------------------------
 torch::Tensor fused_block(torch::Tensor x,
                           torch::Tensor conv1_weight,
                           torch::Tensor norm1_weight,
@@ -329,18 +373,25 @@ torch::Tensor fused_block(torch::Tensor x,
     auto stream = at::cuda::getCurrentCUDAStream();
     auto xc   = x.is_contiguous() ? x : x.contiguous();
     auto opts = x.options();
+    auto out  = at::empty({B, C, H, W}, opts);   // plain NCHW contiguous
 
-    // ---- K1 : x (NCHW) -> xn (NHWC) --------------------------------------
-    auto xn = at::empty({B, C, H, W},
-                        opts.memory_format(at::MemoryFormat::ChannelsLast));
-    {
-        dim3 blk(32, 8, 1);
-        dim3 grd((unsigned)((N + 31) / 32), (unsigned)(C / 32), (unsigned)B);
-        nchw2nhwc_kernel<<<grd, blk, 0, stream>>>(
-            xc.data_ptr<float>(), xn.data_ptr<float>(), (int)N);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    // ---------------- plan item 1 : L2 blocking policy --------------------
+    const int64_t slab_bytes = C * H * W * 4;
+    const int64_t L2_BUDGET  = (int64_t)24 * 1024 * 1024;   // per live slab
+    const int64_t PAIR_LIMIT = (int64_t)40 * 1024 * 1024;   // 2 slabs
+    int64_t CB = B;
+    bool blocking = false;
+    if (2 * slab_bytes <= PAIR_LIMIT) {
+        int64_t cb0 = L2_BUDGET / slab_bytes;
+        if (cb0 < 1) cb0 = 1;
+        if (cb0 > B) cb0 = B;
+        // plan item 7 : make CB as large as the budget allows, balanced
+        const int64_t nchunk = (B + cb0 - 1) / cb0;
+        CB = (B + nchunk - 1) / nchunk;
+        blocking = (CB < B);
     }
 
+    // ---------------- plan item 3 : loop-invariant host work --------------
     auto w1 = to_cl(conv1_weight);
     auto w2 = to_cl(conv2_weight);
     auto g1 = norm1_weight.is_contiguous() ? norm1_weight : norm1_weight.contiguous();
@@ -348,49 +399,92 @@ torch::Tensor fused_block(torch::Tensor x,
     auto g2 = norm2_weight.is_contiguous() ? norm2_weight : norm2_weight.contiguous();
     auto b2 = norm2_bias.is_contiguous()   ? norm2_bias   : norm2_bias.contiguous();
 
-    // ---- conv1 (cuDNN, NHWC TF32) ----------------------------------------
-    auto y1 = at::conv2d(xn, w1, {}, {1, 1}, {1, 1}, {1, 1}, 1);
-    y1 = to_cl(y1);
+    const int nchunks = (int)((N + CHUNK - 1) / CHUNK);      // plan item 10
+    auto partials = at::empty({CB * (int64_t)nchunks * (2 * NG)}, opts);
+    auto mean  = at::empty({CB, (int64_t)NG}, opts);
+    auto rstd  = at::empty({CB, (int64_t)NG}, opts);
+    auto mean2 = at::empty({CB, (int64_t)NG}, opts);
+    auto rstd2 = at::empty({CB, (int64_t)NG}, opts);
 
-    auto mean = at::empty({B, (int64_t)NG}, opts);
-    auto rstd = at::empty({B, (int64_t)NG}, opts);
-    compute_stats(y1, B, N, mean, rstd, (float)eps, stream);
+    // ---------------- plan item 4 : chunk-sized intermediates once --------
+    auto xn_buf = at::empty({CB, C, H, W},
+                            opts.memory_format(at::MemoryFormat::ChannelsLast));
+    auto z1_buf = at::empty({CB, C, H, W},
+                            opts.memory_format(at::MemoryFormat::ChannelsLast));
 
-    auto z1 = at::empty({B, C, H, W},
-                        opts.memory_format(at::MemoryFormat::ChannelsLast));
-    {
-        const long total = (long)N * 64;
-        const int threads = 256;
-        dim3 grd((unsigned)((total + threads - 1) / threads), (unsigned)B, 1);
-        gn_silu_nhwc_kernel<<<grd, threads, 0, stream>>>(
-            reinterpret_cast<const float4*>(y1.data_ptr<float>()),
-            reinterpret_cast<float4*>(z1.data_ptr<float>()),
-            mean.data_ptr<float>(), rstd.data_ptr<float>(),
-            reinterpret_cast<const float4*>(g1.data_ptr<float>()),
-            reinterpret_cast<const float4*>(b1.data_ptr<float>()),
-            total);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    // ---------------- plan item 9 : pin the resident slabs in L2 ----------
+    bool win = false;
+    if (blocking) {
+        init_l2_limits();
+        char* p_xn = reinterpret_cast<char*>(xn_buf.data_ptr<float>());
+        char* p_z1 = reinterpret_cast<char*>(z1_buf.data_ptr<float>());
+        const size_t nb = (size_t)CB * (size_t)slab_bytes;
+        char* lo = std::min(p_xn, p_z1);
+        char* hi = std::max(p_xn + nb, p_z1 + nb);
+        win = set_persist_window(stream, (void*)lo, (size_t)(hi - lo));
     }
 
-    // ---- conv2 (cuDNN, NHWC TF32) ----------------------------------------
-    auto y2 = at::conv2d(z1, w2, {}, {1, 1}, {1, 1}, {1, 1}, 1);
-    y2 = to_cl(y2);
+    // ---------------- plan item 2 / 6 : the chunk loop ---------------------
+    for (int64_t b0 = 0; b0 < B; b0 += CB) {
+        const int64_t cb = std::min<int64_t>(CB, B - b0);
 
-    auto mean2 = at::empty({B, (int64_t)NG}, opts);
-    auto rstd2 = at::empty({B, (int64_t)NG}, opts);
-    compute_stats(y2, B, N, mean2, rstd2, (float)eps, stream);
+        auto xs = xc.narrow(0, b0, cb);           // NCHW slab (input/residual)
+        auto os = out.narrow(0, b0, cb);          // NCHW slab (output)
+        auto xn = (cb == CB) ? xn_buf : xn_buf.narrow(0, 0, cb);
+        auto z1 = (cb == CB) ? z1_buf : z1_buf.narrow(0, 0, cb);
 
-    auto out = at::empty({B, C, H, W}, opts);   // plain NCHW contiguous
-    {
-        dim3 blk(32, 8, 1);
-        dim3 grd((unsigned)((N + 31) / 32), (unsigned)(C / 32), (unsigned)B);
-        gn_silu_add_t_kernel<<<grd, blk, 0, stream>>>(
-            y2.data_ptr<float>(), xc.data_ptr<float>(),
-            mean2.data_ptr<float>(), rstd2.data_ptr<float>(),
-            g2.data_ptr<float>(), b2.data_ptr<float>(),
-            out.data_ptr<float>(), (int)N);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        // ---- K1 : x (NCHW) -> xn (NHWC) ----------------------------------
+        {
+            dim3 blk(32, 8, 1);
+            dim3 grd((unsigned)((N + 31) / 32), (unsigned)(C / 32), (unsigned)cb);
+            nchw2nhwc_kernel<<<grd, blk, 0, stream>>>(
+                xs.data_ptr<float>(), xn.data_ptr<float>(), (int)N);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+
+        // ---- conv1 (cuDNN, NHWC TF32) ------------------------------------
+        auto y1 = at::conv2d(xn, w1, {}, {1, 1}, {1, 1}, {1, 1}, 1);
+        y1 = to_cl(y1);
+
+        compute_stats(y1.data_ptr<float>(), cb, N, partials,
+                      mean.data_ptr<float>(), rstd.data_ptr<float>(),
+                      (float)eps, nchunks, stream);
+
+        {
+            const long total = (long)N * 64;
+            const int threads = 256;
+            dim3 grd((unsigned)((total + threads - 1) / threads), (unsigned)cb, 1);
+            gn_silu_nhwc_kernel<<<grd, threads, 0, stream>>>(
+                reinterpret_cast<const float4*>(y1.data_ptr<float>()),
+                reinterpret_cast<float4*>(z1.data_ptr<float>()),
+                mean.data_ptr<float>(), rstd.data_ptr<float>(),
+                reinterpret_cast<const float4*>(g1.data_ptr<float>()),
+                reinterpret_cast<const float4*>(b1.data_ptr<float>()),
+                total);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+
+        // ---- conv2 (cuDNN, NHWC TF32) ------------------------------------
+        auto y2 = at::conv2d(z1, w2, {}, {1, 1}, {1, 1}, {1, 1}, 1);
+        y2 = to_cl(y2);
+
+        compute_stats(y2.data_ptr<float>(), cb, N, partials,
+                      mean2.data_ptr<float>(), rstd2.data_ptr<float>(),
+                      (float)eps, nchunks, stream);
+
+        {
+            dim3 blk(32, 8, 1);
+            dim3 grd((unsigned)((N + 31) / 32), (unsigned)(C / 32), (unsigned)cb);
+            gn_silu_add_t_kernel<<<grd, blk, 0, stream>>>(
+                y2.data_ptr<float>(), xs.data_ptr<float>(),
+                mean2.data_ptr<float>(), rstd2.data_ptr<float>(),
+                g2.data_ptr<float>(), b2.data_ptr<float>(),
+                os.data_ptr<float>(), (int)N);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
     }
+
+    if (win) clear_persist_window(stream);
     return out;
 }
 '''
@@ -407,7 +501,7 @@ torch::Tensor fused_block(torch::Tensor x,
 '''
 
 _ext = load_inline(
-    name="vae_resblock_fused_v1",
+    name="vae_resblock_fused_l2blk",
     cpp_sources=_CPP_SRC,
     cuda_sources=_CUDA_SRC,
     functions=["fused_block"],
@@ -425,10 +519,10 @@ _ext = load_inline(
 
 
 class ModelNew(nn.Module):
-    # See the module-level header comment for the full granularity (D) plan:
-    # full forward rewrite; convs kept as cuDNN NHWC-TF32 calls issued from
-    # inside the extension, every norm/activation/add/layout op replaced by
-    # custom CUDA kernels (K1..K5) with the final transpose+residual fused.
+    # Granularity (D): full forward rewrite; convs kept as cuDNN NHWC-TF32
+    # calls issued from inside the extension, every norm/activation/add/layout
+    # op replaced by custom CUDA kernels (K1..K5).  This round adds L2 cache
+    # blocking on the batch axis inside fused_block.
     def __init__(self):
         super().__init__()
         torch.backends.cudnn.benchmark = True
