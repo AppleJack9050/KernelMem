@@ -685,25 +685,50 @@ def _nsys_launch_table_block(full_df, top_n: int = 15) -> str:
     layout-transform kernel launching more often than the convolution it feeds
     means the block is paying repeated NCHW<->NHWC conversions on large tensors.
     """
-    df = full_df.sort_values("kernel_launch_count", ascending=False).head(top_n)
+    has_time = "time_pct" in full_df.columns and full_df["time_pct"].notna().any()
+    sort_col = "time_pct" if has_time else "kernel_launch_count"
+    df = full_df.sort_values(sort_col, ascending=False).head(top_n)
     total = int(full_df["kernel_launch_count"].sum())
+
     lines = [
         "",
-        "# Kernel launch counts — ALL kernels in the forward pass (Nsight Systems)",
+        "# GPU time by kernel — ALL kernels in the forward pass (Nsight Systems)",
         "",
         "Includes library kernels (cuDNN/cuBLAS/PyTorch) that NCU does not profile.",
-        "Look for kernels that do no math — layout transforms, copies, casts — and",
-        "for launch counts that exceed the number of real operations in the block.",
+        "NCU's per-kernel metrics cover ONLY the kernels in this candidate's source,",
+        "so this table is the sole view of how the forward pass actually divides its",
+        "time. Read the percentages before choosing a target: optimizing a kernel",
+        "that holds 4% of the time caps the whole round at 4%, however well it goes.",
+        "Look also for kernels that do no math — layout transforms, copies, casts.",
         "",
-        "| kernel | launches |",
-        "|---|---|",
     ]
+    if has_time:
+        lines += ["| kernel | GPU time % | total (us) | launches |", "|---|---|---|---|"]
+    else:
+        lines += ["| kernel | launches |", "|---|---|"]
+
     for _, r in df.iterrows():
         name = str(r["Kernel Name"])
         if len(name) > 90:
             name = name[:87] + "..."
-        lines.append(f"| `{name}` | {int(r['kernel_launch_count'])} |")
+        if has_time:
+            pct = r["time_pct"]
+            _tt = r["total_time_ns"]
+            us = _tt / 1e3 if _tt == _tt else float("nan")  # NaN-safe; pandas is not imported here
+            lines.append(f"| `{name}` | {pct:.1f}% | {us:,.0f} | {int(r['kernel_launch_count'])} |")
+        else:
+            lines.append(f"| `{name}` | {int(r['kernel_launch_count'])} |")
+
     lines.append("")
+    if has_time:
+        top = df.iloc[0]
+        top_name = str(top["Kernel Name"])[:60]
+        lines.append(
+            f"Hottest kernel: `{top_name}` at **{top['time_pct']:.1f}%** of forward GPU time. "
+            f"By Amdahl, a round that leaves it untouched is capped at "
+            f"{100.0 - float(top['time_pct']):.1f}% even if it drives everything else to zero."
+        )
+        lines.append("")
     lines.append(f"Total kernel launches in the forward pass: **{total}**")
     lines.append("")
     return "\n".join(lines)

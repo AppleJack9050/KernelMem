@@ -1,0 +1,6 @@
+task,best_score,best_runnable,task_dir,figure
+tasks/vae_block_002.py,1.566145,1,/home/elek/KernelMem/run/20260729_130742_vae_block_002_claude_claude-opus-5/vae_block_002,/home/elek/KernelMem/run/20260729_130742_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png
+
+avg_speedup,1.566145
+accuracy,1.000000
+total_tokens_sum,1020570

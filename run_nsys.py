@@ -256,19 +256,40 @@ def profile_bench(
         raise
 
 
+_KERNEL_TIME_STATS: Dict[str, Dict[str, float]] = {}
+
+
+def get_last_kernel_time_stats() -> Dict[str, Dict[str, float]]:
+    """Per-kernel TIME from the most recent extract_kernel_launch_counts() call.
+
+    Maps unfiltered kernel name -> {"time_pct", "total_ns", "instances"}.
+
+    Why this exists: the launch-count table alone renders a convolution that is
+    ~68% of the forward and a stats kernel that is ~4% as the same number (both
+    "24 launches"). nsys already reports Time (%) and Total Time in the same
+    table and we were discarding both, so the only time-attributed numbers
+    reaching the judge came from NCU -- which profiles our own kernels only.
+    That systematically pointed optimization rounds at the glue.
+    """
+    return dict(_KERNEL_TIME_STATS)
+
+
 def extract_kernel_launch_counts(
     rep_path: Union[str, Path],
     kernel_names: Optional[List[str]] = None,
 ) -> Dict[str, int]:
     """
     Extract kernel launch counts from nsys stats output.
-    
+
     Args:
         rep_path: Path to .nsys-rep file
         kernel_names: Optional list of kernel names to filter (if None, extract all)
-    
+
     Returns:
         Dictionary mapping kernel names to launch counts
+
+    Side effect: records per-kernel time in the module-level cache readable via
+    get_last_kernel_time_stats(), always unfiltered regardless of kernel_names.
     """
     rep_path = Path(rep_path)
     if not rep_path.exists():
@@ -303,12 +324,15 @@ def extract_kernel_launch_counts(
         # --------  ---------------  ---------  ---------  ...  ---
         #   84.2          148,357          1  148,357.0  ...  kernel_name
         launch_counts: Dict[str, int] = {}
-        
+        _KERNEL_TIME_STATS.clear()
+
         lines = result.stdout.split('\n')
         in_table = False
         header_found = False
         name_col_idx = None
         instances_col_idx = None
+        time_pct_col_idx = None
+        total_time_col_idx = None
         
         for line in lines:
             line_stripped = line.strip()
@@ -337,7 +361,18 @@ def extract_kernel_launch_counts(
                             break
                     else:
                         instances_col_idx = 2  # Fallback: typically 3rd column
-                    
+
+                    # Time (%) and Total Time (ns) sit left of Instances; they are
+                    # what makes the table a time breakdown rather than a call log.
+                    for i, part in enumerate(header_parts):
+                        if "Time (%)" in part or part.strip().startswith("Time"):
+                            time_pct_col_idx = i
+                            break
+                    for i, part in enumerate(header_parts):
+                        if "Total Time" in part:
+                            total_time_col_idx = i
+                            break
+
                     # Name is typically the last column
                     name_col_idx = len(header_parts) - 1
                 except Exception:
@@ -390,7 +425,26 @@ def extract_kernel_launch_counts(
                 
                 if not kernel_name:
                     continue
-                
+
+                # Record time for EVERY kernel before any name filtering: the
+                # filtered path feeds machine_check's scalar count, but the time
+                # breakdown must stay whole or the library kernels vanish again.
+                def _num(idx):
+                    if idx is None or idx >= len(parts):
+                        return None
+                    try:
+                        return float(parts[idx].strip().replace(',', '').rstrip('%'))
+                    except ValueError:
+                        return None
+
+                _tp, _tt = _num(time_pct_col_idx), _num(total_time_col_idx)
+                if _tp is not None or _tt is not None:
+                    _KERNEL_TIME_STATS[kernel_name] = {
+                        "time_pct": _tp if _tp is not None else float("nan"),
+                        "total_ns": _tt if _tt is not None else float("nan"),
+                        "instances": float(instances),
+                    }
+
                 # Filter by kernel_names if provided
                 if kernel_names:
                     # Try to match kernel name (flexible matching)
@@ -448,18 +502,29 @@ def load_nsys_stats(
     
     # Extract launch counts
     launch_counts = extract_kernel_launch_counts(rep_path, kernel_names)
-    
-    # Create DataFrame
+    time_stats = get_last_kernel_time_stats()
+
+    # Create DataFrame. Time columns are attached only for the UNFILTERED table
+    # (kernel_names is None): the filtered CSV feeds machine_check's scalar
+    # kernel_launch_count and its schema is left exactly as it was.
     data = []
     for kernel_name, count in launch_counts.items():
-        data.append({
+        row = {
             "Kernel Name": kernel_name,
             "kernel_launch_count": count,
-        })
-    
+        }
+        if kernel_names is None:
+            ts = time_stats.get(kernel_name, {})
+            row["time_pct"] = ts.get("time_pct", float("nan"))
+            row["total_time_ns"] = ts.get("total_ns", float("nan"))
+        data.append(row)
+
+    cols = ["Kernel Name", "kernel_launch_count"]
+    if kernel_names is None:
+        cols += ["time_pct", "total_time_ns"]
     if not data:
         # Create empty DataFrame with correct columns
-        df = pd.DataFrame(columns=["Kernel Name", "kernel_launch_count"])
+        df = pd.DataFrame(columns=cols)
     else:
         df = pd.DataFrame(data)
     
