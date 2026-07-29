@@ -1,0 +1,19 @@
+```json
+{
+  "critical_issue": "Weight cache keyed on data_ptr returns stale channels_last conv weights after allocator address reuse",
+  "evidence": [
+    "Outputs are not close on extra shape 2x256x64x64",
+    "max_abs_err=5.190e+00"
+  ],
+  "root_cause": "_cl_weight caches the converted weight under key (w.data_ptr(), shape, dtype) but never keeps a reference to w. conv1_weight/conv2_weight are always [256,256,3,3] fp32 for every workload, so after the first shape's weights are freed the caching allocator hands the identical address to the next shape's new weights. The key collides, the previous shape's weights are returned, and the whole block computes with wrong conv kernels.",
+  "trigger_condition": "Second and later workloads (first extra shape 2x256x64x64) whose conv weight tensors reuse the freed address of the previous workload's weights of identical shape/dtype.",
+  "must_hold_invariants": [
+    "Conv must use a channels_last copy of THIS call's conv1_weight/conv2_weight",
+    "Any pointer-keyed cache must hold a strong reference to the source tensor",
+    "Captured graph entry must be rebuilt when input source tensors change"
+  ],
+  "minimal_fix": "Store (w, c) in _wcache and return c only if cached w is w (identity check); otherwise recompute — or delete _wcache and call w.contiguous(memory_format=torch.channels_last) each forward.",
+  "patch_anchor": "key = (w.data_ptr(), tuple(w.shape), w.dtype)",
+  "confidence": "medium"
+}
+```

@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "opt",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/otter77/git_project/KernelMem/utils/compile_and_run.py\", line 977, in compare_and_bench\n    raise ValueError(msg)\nValueError: Outputs are not close on extra shape 2x256x64x64 (atol=0.01, rtol=0.01). max_abs_err=5.190e+00\n"
+}

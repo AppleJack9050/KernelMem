@@ -93,6 +93,8 @@ OLD CODE (read-only)
 ────────────────────────────────────────────────────────────────
 $OLD_CODE
 
+$REFERENCE_KERNEL
+
 ────────────────────────────────────────────────────────────────
 Main Critical Problem
 ────────────────────────────────────────────────────────────────
@@ -159,6 +161,8 @@ def build_error_prompt(
     error_log: str,
     problem: Optional[Any] = None,
     gpu_name: Optional[str] = None,
+    reference_kernel: Optional[str] = None,
+    reference_kernel_score: Optional[float] = None,
 ) -> str:
     """
     Build the error-repair prompt with GPU context + architecture source.
@@ -202,9 +206,33 @@ def build_error_prompt(
         f"• {k}: {v}" for k, v in info.items() if k != "GPU Architecture"
     )
     problem_text = _format_problem(problem)
+
+    # A kernel that already passed every shape earlier in this run. Without it the
+    # repair sees only the broken lineage, so a fix found in another branch is
+    # invisible here and gets regressed rather than reused.
+    if reference_kernel and reference_kernel.strip():
+        score_txt = (f" — speedup {reference_kernel_score:.4f}"
+                     if isinstance(reference_kernel_score, (int, float)) else "")
+        reference_kernel_text = (
+            "────────────────────────────────────────────────────────────────\n"
+            f"KNOWN-GOOD KERNEL (read-only{score_txt})\n"
+            "────────────────────────────────────────────────────────────────\n"
+            "This kernel PASSED every correctness check on ALL evaluated shapes\n"
+            "earlier in this run. OLD CODE above did not. Before writing your fix,\n"
+            "diff the two: a guard this kernel has and OLD CODE lacks (identity\n"
+            "check, strong reference, defensive clone, wider cache key) is the most\n"
+            "likely cause of the failure. Reuse its solution rather than inventing\n"
+            "a new one. Do NOT copy it wholesale — keep OLD CODE's optimizations.\n"
+            "\n"
+            f"{reference_kernel.strip()}"
+        )
+    else:
+        reference_kernel_text = ""
+
     # Substitute all fields
     return COMPILE_ERROR.substitute(
         ERROR_LOG=error_log.strip(),
         OLD_CODE=old_code.strip(),
+        REFERENCE_KERNEL=reference_kernel_text,
         Problem=_escape_template(_sanitize_text(problem_text.strip())),
     )

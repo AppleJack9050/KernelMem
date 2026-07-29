@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "opt",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/otter77/git_project/KernelMem/utils/compile_and_run.py\", line 924, in compare_and_bench\n    raise ValueError(msg)\nValueError: Outputs are not close (atol=0.01, rtol=0.01). max_abs_err=8.424e+00, mean_abs_err=9.190e-01\nin[0]: shape=(8, 256, 64, 128), dtype=torch.float32, contiguous=True, device=cpu\nin[1]: shape=(256, 256, 3, 3), dtype=torch.float32, contiguous=True, device=cpu\nin[2]: shape=(256,), dtype=torch.float32, contiguous=True, device=cpu\nin[3]: shape=(256,), dtype=torch.float32, contiguous=True, device=cpu\nin[4]: shape=(256, 256, 3, 3), dtype=torch.float32, contiguous=True, device=cpu\nin[5]: shape=(256,), dtype=torch.float32, contiguous=True, device=cpu\nin[6]: shape=(256,), dtype=torch.float32, contiguous=True, device=cpu\nin[7]: type=float (non-tensor)\nref_out: shape=(8, 256, 64, 128), dtype=torch.float32, device=cuda:0\ntest_out: shape=(8, 256, 64, 128), dtype=torch.float32, device=cuda:0\nmax_err_index=(2, 85, 12, 68), ref_val=8.423773765563965, cand_val=8.423773765563965\n"
+}

@@ -1,0 +1,19 @@
+{
+  "summary": [
+    {
+      "task": "vae_block_002.py",
+      "best_score": 1.0455114790778444,
+      "best_runnable": true,
+      "best_kernel": "kernel_20260729_114958",
+      "task_dir": "run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002",
+      "figure": "run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png",
+      "rounds_completed": 8,
+      "rounds_runnable": 5,
+      "total_tokens": 565794
+    }
+  ],
+  "avg_speedup": 1.0455114790778444,
+  "accuracy": 0.625,
+  "total_tokens_sum": 565794,
+  "reconstructed": true
+}

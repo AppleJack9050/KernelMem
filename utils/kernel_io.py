@@ -65,6 +65,31 @@ def _splice(prev: list[str], nxt: list[str]) -> list[str]:
     return prev + nxt
 
 
+def _is_usable_block(block: str, text: str) -> bool:
+    """True when *block* can plausibly be the kernel file the caller wants.
+
+    Parsing cleanly is not enough. A stray mid-stream ```python fence is read as
+    the *closing* fence, so the extracted block can be a valid-Python fragment
+    while the real file sits further down the reply. Two such fragments show up
+    in practice and both parse without error:
+
+      * a header of pure ``#`` comments — ``ast`` gives it an empty body;
+      * a prefix that drops a ``class ModelNew`` the reply plainly contains.
+
+    Either way the caller should try ``_repair_continuation_fences`` rather than
+    accept the fragment, which would otherwise be written to disk and fail much
+    later as "must define a ModelNew class", burning a whole round.
+    """
+    try:
+        if not ast.parse(block).body:
+            return False
+    except (SyntaxError, ValueError):
+        return False
+    if "class ModelNew" in text and "class ModelNew" not in block:
+        return False
+    return True
+
+
 def _repair_continuation_fences(text: str) -> str | None:
     """Rebuild code split across a spurious mid-stream fence.
 
@@ -140,7 +165,7 @@ def extract_code_block(text: str) -> str:
         block = text[start:]
 
     block = block.strip() + "\n"
-    if _parses(block):
+    if _parses(block) and _is_usable_block(block, text):
         return block
 
     repaired = _repair_continuation_fences(text)

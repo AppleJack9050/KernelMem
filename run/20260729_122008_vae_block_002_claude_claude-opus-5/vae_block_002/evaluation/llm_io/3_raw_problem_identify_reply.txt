@@ -1,0 +1,20 @@
+```json
+{
+  "critical_issue": "Weight cache keyed by raw data_ptr returns stale channels_last filters after allocator reuses the address",
+  "evidence": [
+    "this kernel's output depends on what the CUDA caching allocator previously stored, on shape 8x256x64x128",
+    "output elements that changed: 15895638 of 16777216 (94.75%)",
+    "of those, newly NaN          : 0"
+  ],
+  "root_cause": "cached_cl() memoises the ChannelsLast weight copy in a global map keyed only by w.data_ptr(), plus sizes/device/version. Freed weight tensors are recycled by the caching allocator, so a new conv1_weight/conv2_weight with different values lands at the same pointer with identical sizes and version 0 -> false cache hit. Both convs then run with the previous run's filter values, changing ~95% of outputs with no NaNs.",
+  "trigger_condition": "Two runs with fresh weight tensors of the same shape; allocator reuses the freed weight block address, so the stale cached ChannelsLast copy is returned.",
+  "must_hold_invariants": [
+    "Convolution weights used must be derived from the current call's w1/w2 tensor contents",
+    "No global cache may be keyed on a recyclable device pointer",
+    "Scratch buffers must be fully written before being read"
+  ],
+  "minimal_fix": "Delete cached_cl/g_wc and call w1.contiguous(at::MemoryFormat::ChannelsLast) and w2.contiguous(...) per forward, as in the known-good kernel.",
+  "patch_anchor": "static const at::Tensor& cached_cl(const at::Tensor& w) {",
+  "confidence": "high"
+}
+```

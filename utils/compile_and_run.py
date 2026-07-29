@@ -721,6 +721,17 @@ def compare_and_bench(
         lines.append(f"{reason} (atol={tol}, rtol={tol}). "
                      f"max_abs_err={max_err:.3e}, mean_abs_err={mean_err:.3e}")
 
+        # How much of the tensor is wrong separates a boundary/indexing slip from
+        # a wholesale-wrong result; the max alone cannot distinguish them.
+        try:
+            bad = diff > (tol + tol * ref_out.abs())
+            n_bad = int(bad.sum().item())
+            n_tot = int(bad.numel())
+            pct = (100.0 * n_bad / n_tot) if n_tot else 0.0
+            lines.append(f"mismatched_elements={n_bad}/{n_tot} ({pct:.2f}%)")
+        except Exception as _e:
+            lines.append(f"[debug] failed to count mismatched elements: {_e}")
+
         # Input tensor info
         for i, x in enumerate(inputs):
             if isinstance(x, torch.Tensor):
@@ -762,6 +773,20 @@ def compare_and_bench(
             lines.append(f"max_err_index={tuple(int(c) for c in coord)}, ref_val={ref_val}, cand_val={test_val}")
         except Exception as _e:
             lines.append(f"[debug] failed to extract max_err index/value: {_e}")
+
+        # State the evaluation contract explicitly. Every shape is scored with
+        # freshly allocated tensors and earlier ones are freed first, so the
+        # caching allocator routinely hands a new tensor the address of a dead
+        # one. A cache keyed on data_ptr() then returns another tensor's data,
+        # which reads as an arithmetic bug and sends the repair after the math.
+        lines.append(
+            "NOTE ON EVALUATION: this candidate is scored on several input shapes, "
+            "each with FRESHLY ALLOCATED tensors, and tensors from earlier shapes are "
+            "freed first. PyTorch's caching allocator therefore reuses addresses across "
+            "calls. Any cache keyed on data_ptr() MUST hold a strong reference to the "
+            "source tensor and verify identity (cached_src is src), or it will silently "
+            "return a stale entry belonging to a freed tensor."
+        )
 
         return "\n".join(lines)
 
@@ -964,13 +989,25 @@ def compare_and_bench(
                         torch.cuda.synchronize(dev)
                     e_ref = _first_tensor(e_ref).contiguous()
                     e_tst = _first_tensor(e_tst).contiguous().to(e_ref.dtype)
-                    e_err = (e_ref - e_tst).abs().max().item()
+                    e_diff = (e_ref - e_tst).abs()
+                    e_err = e_diff.max().item()
+                    e_mean = e_diff.mean().item()
                     e_note = _allocator_dependence_note(
                         test_model, extra, dev, e_tst, tol, _shape_tag(extra))
                     if not torch.allclose(e_ref, e_tst, atol=tol, rtol=tol):
-                        msg = (
-                            f"Outputs are not close on extra shape {_shape_tag(extra)} "
-                            f"(atol={tol}, rtol={tol}). max_abs_err={e_err:.3e}"
+                        # Same diagnostic depth as the primary shape. This path used
+                        # to report only max_abs_err, which is the least actionable
+                        # number available and left the repair round guessing.
+                        msg = _build_mismatch_debug_msg(
+                            reason=f"Outputs are not close on extra shape {_shape_tag(extra)}",
+                            tol=tol,
+                            max_err=e_err,
+                            mean_err=e_mean,
+                            ref_out=e_ref,
+                            test_out=e_tst,
+                            diff=e_diff,
+                            inputs=extra,
+                            ref_model=ref_model,
                         )
                         if e_note:
                             msg = f"{msg}\n\n{e_note}"

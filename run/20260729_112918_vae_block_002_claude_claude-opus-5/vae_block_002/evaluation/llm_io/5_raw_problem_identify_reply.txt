@@ -1,0 +1,19 @@
+```json
+{
+  "critical_issue": "CUDA-graph static buffers aliased: returns graph output tensor and captures caller's input, giving stale results",
+  "evidence": [
+    "max_abs_err=8.424e+00, mean_abs_err=9.190e-01",
+    "max_err_index=(2, 85, 12, 68), ref_val=8.423773765563965, cand_val=8.423773765563965"
+  ],
+  "root_cause": "forward returns entry[\"out\"], the graph's static output buffer, and captures the caller's tensor `xr` as the static input instead of a private clone. A later replay (extra shapes / repeated bench calls, or freed input storage reused by the allocator) overwrites that buffer, so the previously returned tensor no longer matches the reference — yet re-reading it at print time shows identical values, proving mutation-after-return aliasing.",
+  "trigger_condition": "Harness calls forward more than once (bench loop / get_inputs_extra) and keeps the earlier result, or the original input storage is freed and reused before replay.",
+  "must_hold_invariants": [
+    "Each forward returns a tensor not mutated by any later replay (clone graph output)",
+    "Graph static input buffers are privately owned, filled via copy_ before every replay",
+    "Replay only used when captured shape/dtype/eps exactly match current call"
+  ],
+  "minimal_fix": "Capture with xr = x.clone() as the static input, copy_ x into it each call, and return entry[\"out\"].clone() instead of the static buffer.",
+  "patch_anchor": "entry[\"out\"] = self._run(xr, w1cl, w2cl, n1w, n1b, n2w, n2b, eps_f)",
+  "confidence": "high"
+}
+```

@@ -1,0 +1,6 @@
+Kernel Name,kernel_launch_count
+k_gn_apply_add_nchw,12
+k_nchw2nhwc,12
+k_gn_stats,24
+k_gn_apply_nhwc_v4,12
+k_gn_finish,24

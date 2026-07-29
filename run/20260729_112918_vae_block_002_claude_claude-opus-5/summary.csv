@@ -1,0 +1,6 @@
+task,best_score,best_runnable,task_dir,figure
+vae_block_002.py,1.045511,1,run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002,run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png
+
+avg_speedup,1.045511
+accuracy,0.625000
+total_tokens_sum,565794

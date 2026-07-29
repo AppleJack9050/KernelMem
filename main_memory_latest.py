@@ -6,6 +6,8 @@ import random
 import time
 import json
 import csv
+import os
+import signal
 import importlib.util
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +79,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--filter_from_summary", type=Path, default=None,
                    help="Path to summary.json file. If provided, only tasks with best_runnable=false will be selected from this summary.")
     
+    p.add_argument("--resume", type=Path, default=None,
+                   help="Path to an existing batch folder (run/<stamp>_<task>_<tag>). Reuses that "
+                        "folder and continues each task from its checkpoint.json instead of "
+                        "starting a new run. Combine with a larger --round to extend a finished run.")
     p.add_argument("--subproc_id", type=int, default=0, help="Identifier for sub-process (e.g., when running multiple in parallel)")
     
     return p
@@ -703,6 +709,143 @@ def _nsys_launch_table_block(full_df, top_n: int = 15) -> str:
     return "\n".join(lines)
 
 
+# ------------------- stop / resume ---------------------
+# A hard kill mid-loop skips everything the post-loop writer produces --
+# figures/, optimization_tree.json and summary.json are written only after the
+# round loop exits, so an interrupted run loses all three even though every
+# per-round artifact survived. These helpers make a stop graceful (finish the
+# round, write the artifacts) and make the run resumable from where it stopped.
+
+_STOP_REQUESTED = False
+_CHECKPOINT_NAME = "checkpoint.json"
+
+
+def _install_stop_handler() -> None:
+    """Turn SIGINT/SIGTERM into a graceful stop at the next round boundary.
+
+    The signal usually lands in the middle of an LLM call or a benchmark, so the
+    flag is only *checked* between rounds: the in-flight round runs to
+    completion, its artifacts are saved, then the loop exits normally and the
+    post-loop writer runs. Signalling twice restores the default handler so an
+    unresponsive run can still be killed outright.
+    """
+    def _handler(signum, _frame):
+        global _STOP_REQUESTED
+        if _STOP_REQUESTED:
+            print("\n[stop] Second signal - aborting immediately.", flush=True)
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        _STOP_REQUESTED = True
+        print(f"\n[stop] Signal {signum} received. Finishing the current round, then writing "
+              f"artifacts and a resumable checkpoint. Signal again to abort now.", flush=True)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass  # not the main thread, or the platform lacks this signal
+
+
+def _ckpt_entry(ind: Optional[KernelIndividual], eval_dir: Path) -> Optional[Dict[str, Any]]:
+    """Serialize the pointers needed to rebuild *ind*, not the object itself.
+
+    Code and metrics already live on disk, so the checkpoint stores paths and
+    stays small; ``eval_{id:04d}.json`` is where ``save_metrics`` put them.
+    """
+    if ind is None or not getattr(ind, "code_path", None):
+        return None
+    eval_path = eval_dir / f"eval_{ind.id:04d}.json"
+    return {
+        "code_path": str(ind.code_path),
+        "eval_path": str(eval_path) if eval_path.exists() else None,
+        "score": float(ind.score) if isinstance(ind.score, (int, float)) else None,
+    }
+
+
+def _restore_individual(entry: Optional[Dict[str, Any]],
+                        cache: Dict[str, KernelIndividual]) -> Optional[KernelIndividual]:
+    """Rebuild a KernelIndividual from a checkpoint entry, reusing *cache*.
+
+    base/best/current routinely point at the SAME kernel file. Rebuilding each
+    independently would yield distinct objects for one kernel and silently break
+    the identity tests the loop depends on (``best_kernel is not
+    current_kernel``), so equal paths must resolve to one shared object.
+    """
+    if not entry or not entry.get("code_path"):
+        return None
+    path = Path(entry["code_path"])
+    if not path.exists():
+        print(f"[resume] WARNING: kernel file is gone, dropping the reference: {path}")
+        return None
+    key = str(path)
+    if key in cache:
+        return cache[key]
+
+    ind = KernelIndividual(path.read_text(encoding="utf-8"))
+    ind.code_path = path
+    ind.score = entry.get("score")
+    eval_path = entry.get("eval_path")
+    if eval_path and Path(eval_path).exists():
+        try:
+            ind.metrics = json.loads(Path(eval_path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[resume] WARNING: could not read metrics {eval_path}: {exc}")
+    if ind.metrics is None:
+        # Score survived, so treat it as the runnable kernel it was; an unreadable
+        # metrics file must not demote a kernel that previously passed.
+        ind.metrics = {"runnable": ind.score is not None}
+    cache[key] = ind
+    return ind
+
+
+def _save_checkpoint(task_root: Path, eval_dir: Path, *, task_path: Path,
+                     next_round: int, total_rounds: int, state: Dict[str, Any]) -> None:
+    """Write a resumable snapshot of the loop's state. Called every round.
+
+    Written to a temp file and renamed, so a kill during the write leaves the
+    previous checkpoint intact rather than a truncated one.
+    """
+    data = {
+        "version": 1,
+        "task": str(task_path),
+        "next_round": int(next_round),
+        "total_rounds": int(total_rounds),
+        "base": _ckpt_entry(state.get("base_kernel"), eval_dir),
+        "best": _ckpt_entry(state.get("best_kernel"), eval_dir),
+        "current": _ckpt_entry(state.get("current_kernel"), eval_dir),
+        "repair_chain": _ckpt_entry(state.get("repair_chain_kernel"), eval_dir),
+        "base_score": None if state["base_score"] == float("-inf") else float(state["base_score"]),
+        "best_score": None if state["best_score"] == float("-inf") else float(state["best_score"]),
+        "optimization_tree": state.get("optimization_tree") or {},
+        "scores": [float(s) for s in state.get("scores") or []],
+        "err_flags": [bool(e) for e in state.get("err_flags") or []],
+        "last_score_for_curve": float(state.get("last_score_for_curve") or 0.0),
+        "opt_history_files": {str(k): str(v) for k, v in (state.get("opt_history_files") or {}).items()},
+        # Ids name the eval_XXXX.json files; rewinding this would overwrite
+        # results from rounds that already finished.
+        "next_individual_id": int(KernelIndividual._next_id),
+        "timestamp": datetime.now().isoformat(),
+    }
+    try:
+        tmp = task_root / (_CHECKPOINT_NAME + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(task_root / _CHECKPOINT_NAME)
+    except Exception as exc:
+        print(f"[checkpoint] WARNING: failed to save checkpoint: {exc}", flush=True)
+
+
+def _load_checkpoint(task_root: Path) -> Optional[Dict[str, Any]]:
+    path = task_root / _CHECKPOINT_NAME
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[resume] WARNING: checkpoint unreadable ({exc}); starting from round 0.")
+        return None
+
+
 def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # --- per-task directories under the SAME batch_dir
     task_root = (batch_dir / task_path.stem).resolve()
@@ -768,7 +911,46 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     err_flags: List[bool] = []
     last_score_for_curve = 0.0  # default baseline for plotting on early failures
 
-    for round_idx in range(args.round):
+    # ---- resume: rebuild the loop's state from the last completed round ----
+    start_round = 0
+    if getattr(args, "resume", None):
+        ckpt = _load_checkpoint(task_root)
+        if ckpt is None:
+            print(f"[resume] No checkpoint under {task_root}; starting from round 0.")
+        elif ckpt.get("task") != str(task_path):
+            print(f"[resume] WARNING: checkpoint belongs to {ckpt.get('task')}, not "
+                  f"{task_path}; starting from round 0.")
+        else:
+            _cache: Dict[str, KernelIndividual] = {}
+            base_kernel = _restore_individual(ckpt.get("base"), _cache)
+            best_kernel = _restore_individual(ckpt.get("best"), _cache)
+            current_kernel = _restore_individual(ckpt.get("current"), _cache)
+            repair_chain_kernel = _restore_individual(ckpt.get("repair_chain"), _cache)
+            base_score = float(ckpt["base_score"]) if ckpt.get("base_score") is not None else float("-inf")
+            best_score = float(ckpt["best_score"]) if ckpt.get("best_score") is not None else float("-inf")
+            optimization_tree = ckpt.get("optimization_tree") or {}
+            scores = list(ckpt.get("scores") or [])
+            err_flags = list(ckpt.get("err_flags") or [])
+            last_score_for_curve = float(ckpt.get("last_score_for_curve") or 0.0)
+            opt_history_files = {int(k): Path(v) for k, v in (ckpt.get("opt_history_files") or {}).items()}
+            # Restoring individuals bumps the id counter, so set it afterwards;
+            # rewinding would overwrite eval_XXXX.json files already on disk.
+            KernelIndividual._next_id = max(int(ckpt.get("next_individual_id") or 0),
+                                            KernelIndividual._next_id)
+            start_round = int(ckpt.get("next_round") or 0)
+            _best_txt = f"{best_score:.4f}" if best_score != float("-inf") else "none"
+            print(f"[resume] Restored {task_root/_CHECKPOINT_NAME}: continuing at round "
+                  f"{start_round}/{args.round}, best={_best_txt}", flush=True)
+            if start_round >= args.round:
+                print(f"[resume] This run already completed {start_round} rounds. Raise --round "
+                      f"above {start_round} to extend it; artifacts will be rewritten as-is.",
+                      flush=True)
+
+    for round_idx in range(start_round, args.round):
+        if _STOP_REQUESTED:
+            print(f"[stop] Stopping before round {round_idx}. Completed {round_idx} of "
+                  f"{args.round} rounds; resume with --resume {batch_dir}", flush=True)
+            break
         print(f"[{task_path.name}] Round {round_idx}")
 
         if round_idx == 0:
@@ -943,10 +1125,26 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     except Exception as e:
                         print(f"[repair] Warning: Failed to load repair history: {e}")
 
+                # Carry the best kernel that actually passed into the repair. Repair
+                # chains branch off the broken lineage, so without this a fix found
+                # in one branch is invisible to a repair in another and gets
+                # regressed instead of reused. Skipped when the best kernel IS the
+                # one being repaired (nothing to diff against).
+                known_good_code = None
+                known_good_score = None
+                if (best_kernel is not None
+                        and getattr(best_kernel, "code", None)
+                        and best_kernel is not current_kernel
+                        and best_score != float("-inf")):
+                    known_good_code = best_kernel.code
+                    known_good_score = best_score
+
                 problem_system_prompt, problem_prompt = build_correctness_prompts(error_log=error_log,
                                                                                   arch_path=task_path,
                                                                                   cuda_code=current_kernel.code,
-                                                                                  repair_history=repair_history if repair_history else None)
+                                                                                  repair_history=repair_history if repair_history else None,
+                                                                                  reference_kernel=known_good_code,
+                                                                                  reference_kernel_score=known_good_score)
                 prompt_file = io_dir / f"round{round_idx:03d}_problem_identify_prompt.txt"
                 prompt_file.write_text(problem_prompt, encoding="utf-8")
                 raw = call_llm(problem_prompt, problem_system_prompt, log_path=log_path,
@@ -961,7 +1159,13 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     error_log=error_log,
                     problem=problem_json,
                     gpu_name=args.gpu,
+                    reference_kernel=known_good_code,
+                    reference_kernel_score=known_good_score,
                 )
+                if known_good_code:
+                    print(f"[repair] Including known-good kernel "
+                          f"{best_kernel.code_path.stem} (speedup {known_good_score:.4f}) in repair context",
+                          flush=True)
                 prompt_file = io_dir / f"round{round_idx:03d}_repair_prompt.txt"
                 prompt_file.write_text(repair_prompt, encoding="utf-8")
                 
@@ -1779,6 +1983,28 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             scores.append(last_score_for_curve)
             err_flags.append(True)
 
+        # Round finished (whatever its outcome) -- snapshot so a stop or a crash
+        # after this point resumes from the NEXT round rather than replaying this one.
+        _save_checkpoint(
+            task_root, eval_dir,
+            task_path=task_path,
+            next_round=round_idx + 1,
+            total_rounds=args.round,
+            state={
+                "base_kernel": base_kernel,
+                "best_kernel": best_kernel,
+                "current_kernel": current_kernel,
+                "repair_chain_kernel": repair_chain_kernel,
+                "base_score": base_score,
+                "best_score": best_score,
+                "optimization_tree": optimization_tree,
+                "scores": scores,
+                "err_flags": err_flags,
+                "last_score_for_curve": last_score_for_curve,
+                "opt_history_files": opt_history_files,
+            },
+        )
+
     # plot per-task curve
     fig_path = fig_dir / f"{task_path.stem}_score.png"
     _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f})")
@@ -1878,6 +2104,7 @@ def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_spe
 # --------------------------- main ----------------------
 def main():
     args = _build_arg_parser().parse_args()
+    _install_stop_handler()
 
     all_tasks = _collect_tasks(args.arch_py)
 
@@ -1888,24 +2115,32 @@ def main():
             print("[ERROR] No tasks found after filtering from summary.json. Exiting.")
             return
 
-    # ---- Create ONE batch folder for this run ----
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_tag = _build_run_tag(args.server_type, args.model_name)
-    # batch name hints: single file uses file stem; directory uses 'batch'
-    if args.arch_py.is_file():
-        batch_name = f"{stamp}_{args.arch_py.stem}_{run_tag}"
+    # ---- Resume reuses the existing batch folder; a fresh run makes a new one ----
+    if args.resume:
+        batch_dir = Path(args.resume).resolve()
+        if not batch_dir.is_dir():
+            print(f"[ERROR] --resume path is not a directory: {batch_dir}")
+            return
+        print(f"[BATCH] Resuming into existing folder: {batch_dir}")
     else:
-        # include sampling info for traceability
-        if args.filter_from_summary:
-            pick_note = "filtered_from_summary"
-        elif args.first_n and args.first_n > 0:
-            pick_note = f"first{args.first_n}"
+        # ---- Create ONE batch folder for this run ----
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_tag = _build_run_tag(args.server_type, args.model_name)
+        # batch name hints: single file uses file stem; directory uses 'batch'
+        if args.arch_py.is_file():
+            batch_name = f"{stamp}_{args.arch_py.stem}_{run_tag}"
         else:
-            pick_note = f"num{args.num_tasks}_seed{args.shuffle_seed}"
-        batch_name = f"{stamp}_batch_{pick_note}_{run_tag}"
-    batch_dir = (args.work_dir / batch_name).resolve()
-    batch_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[BATCH] Output folder: {batch_dir}")
+            # include sampling info for traceability
+            if args.filter_from_summary:
+                pick_note = "filtered_from_summary"
+            elif args.first_n and args.first_n > 0:
+                pick_note = f"first{args.first_n}"
+            else:
+                pick_note = f"num{args.num_tasks}_seed{args.shuffle_seed}"
+            batch_name = f"{stamp}_batch_{pick_note}_{run_tag}"
+        batch_dir = (args.work_dir / batch_name).resolve()
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[BATCH] Output folder: {batch_dir}")
 
     # single file → run once (still inside the same batch folder)
     if args.arch_py.is_file():

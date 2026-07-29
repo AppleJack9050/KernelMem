@@ -1,15 +1,9 @@
 Kernel Name,kernel_launch_count
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x128x32_warpgroupsize1x1x…,28
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x64x32_warpgroupsize1x1x1_…,2
-"gn_silu_add_t_kernel(const float *, const float *, const float *, const float *, const float *, con…",12
-"gn_stats_kernel(const float *, float *, int, int)",24
-"nchw2nhwc_kernel(const float *, float *, int)",12
-"gn_silu_nhwc_kernel(const float4 *, float4 *, const float *, const float *, const float4 *, const f…",12
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x64x32_warpgroupsize1x1x1…,2
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x192x32_warpgroupsize1x1x1…,2
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize256x128x32_warpgroupsize2x1x…,2
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x128x32_warpgroupsize1x1x1…,2
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x256x32_warpgroupsize1x1x1…,2
+void cutlass__5x_cudnn::Kernel<cutlass_tensorop_s1688fprop_optimized_tf32_128x64_16x6_nhwc_align4>(…,24
+"void cudnn::engines_precompiled::convertTensor_kernel<float, float, float, (cudnnKernelDataType_t)2…",48
+"gn_apply_transpose_kernel(const float *, const float *, const float *, const float *, float *, int,…",12
+"nchw_to_nhwc_kernel(const float *, float *, int, int)",12
+"gn_apply_nhwc_kernel(const float *, const float *, const float *, float *, long, int, int)",12
+"gn_stats_kernel(const float *, float *, int, int, int, int, int, int)",24
 "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…",24
-"gn_finalize_kernel(const float *, float *, float *, int, float, float)",24
-void cask_plugin__5x_cudnn::xmma__5x_cudnn::init_device_workspace_kernel<xmma__5x_cudnn::implicit_g…,6
+"gn_finalize_kernel(const float *, const float *, const float *, float *, float *, int, int, int, in…",24

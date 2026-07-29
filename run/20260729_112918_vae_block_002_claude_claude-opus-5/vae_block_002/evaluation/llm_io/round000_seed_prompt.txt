@@ -1,0 +1,382 @@
+
+You write custom CUDA kernels to accelerate the given architecture by replacing ANY subset of PyTorch ops with custom CUDA kernels (partial replacement is allowed), and you MAY also replace the entire forward computation if beneficial (full forward-level replacement).
+You may decide to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or apply algorithmic changes.
+You MAY restructure the computation graph conservatively: fuse or reorder steps ONLY when the benefit is clear and semantics are straightforward.
+For the parts you replace, you are NOT required to preserve intermediate tensors or per-op boundaries; ONLY the final ModelNew.forward output must match.
+
+Primary objective: maximize speedup under the correctness contract.
+This ModelNew will be evaluated in a standalone benchmark harness (kernelbench-style): end-to-end forward correctness + latency. Intermediate boundaries may change ONLY for replaced parts, but reference semantics must hold.
+
+SEED BENCHMARK ASSUMPTIONS
+- Assume inputs may be reused across runs and must remain unmodified.
+- Do NOT rely on single-use, hidden aliasing, or undefined lifetime assumptions.
+- Do NOT introduce hidden global state or randomness; ModelNew.forward must be deterministic given inputs and parameters.
+
+REFERENCE PROFILE (measured on this GPU, not estimated)
+The unmodified reference takes 2190.4 us of GPU time per forward.
+Where that time actually goes:
+
+   % time         us  calls  kernel
+    73.3%     1605.4      2  sm80_xmma_fprop_implicit_gemm_tf32f32_tf32f32_f32_nhwckrs…   <-- vendor GEMM/conv
+     7.2%      158.3      4  cudnn::engines_precompiled::nchwToNhwcKernel
+     5.3%      117.1      2  at::native::vectorized_elementwise_kernel
+     5.0%      108.5      2  at::native::elementwise_kernel
+     4.6%      101.8      1  at::native::vectorized_elementwise_kernel
+     4.4%       95.5      2  at::native::(anonymous namespace)::RowwiseMomentsCUDAKern…
+     0.2%        3.8      2  at::native::(anonymous namespace)::ComputeFusedParamsCUDA…
+
+Vendor GEMM/convolution kernels are 73.3% of GPU time.
+These are tuned tensor-core implementations. Ordinary library kernels
+(elementwise, reductions, norms, layout conversions) are straightforward
+to replace with your own CUDA; a vendor GEMM/conv is not.
+
+USE THIS WHEN CHOOSING GRANULARITY:
+- Leaving the vendor GEMM/conv in place fixes 73.3% of the runtime.
+  By Amdahl's law your speedup is then capped at 1/0.733 = 1.36x,
+  and only if you drive ALL other work to zero. Judge whether that cap is
+  worth the effort before committing to a granularity.
+- Do NOT assume the vendor kernel is slow. It is often at or near the
+  hardware roofline, in which case reimplementing it wins nothing by itself.
+  The gain from owning it comes from FUSING the surrounding work into its
+  prologue/epilogue so intermediates are never written to global memory.
+- Owning that operator requires granularity (D). If you choose (A)/(B)/(C),
+  you are accepting the 1.36x cap for the entire run — later rounds
+  cannot revisit this decision.
+
+SEED GRANULARITY SELECTION (STRICT)
+- For this SEED generation, you MUST choose EXACTLY ONE granularity level:
+  (A) optimize a single hotspot op,
+  (B) replace several ops + schedule multiple kernels,
+  (C) fuse many ops into one/few kernels,
+  (D) fully rewrite forward.
+- All modifications MUST be consistent with the chosen granularity.
+- Do NOT mix multiple granularity strategies in this seed implementation.
+- In the output code, include a short header comment in ModelNew describing:
+  1) chosen granularity (A/B/C/D),
+  2) which ops are replaced,
+  3) which ops are fused into which kernel(s) / library calls,
+  4) what remains in PyTorch and why (one line each).
+  All planning notes MUST be inside Python code comments; do not output any extra prose.
+  If this header comment is missing or incomplete, the output is invalid.
+
+CRITICAL CONSTRAINT
+- You MUST preserve parameter parity with the reference PyTorch module(s).
+- You MAY keep an equivalent PyTorch module ONLY as a PARAMETER HOLDER (for initialization / state_dict parity).
+- You MUST NOT call the parameter-holder module’s forward for replaced operators.
+- Replaced computations MUST be performed by your custom CUDA kernel(s) and/or vendor library calls invoked from within your load_inline extension.
+- Do NOT create independent parameters with torch.randn / random init for replaced operators.
+  Instead, source weights/bias from the parameter-holder module (e.g., self.op.weight / self.op.bias).
+
+ALLOWED ACCELERATION TOOLBOX (IMPORTANT)
+You MUST build any native code via torch.utils.cpp_extension.load_inline, but inside that extension you MAY:
+1) Call NVIDIA vendor libraries directly:
+  - cuBLAS / cuBLASLt (including cublasLtMatmul and epilogues like bias/activation/scale where supported)
+  - cuDNN (including fused Conv/ConvTranspose variants where supported)
+2) Use CUDA kernels you write yourself (custom kernels, fused post-ops, reductions, etc.).
+3) Specialize for fixed shapes when the harness uses fixed shapes: hardcode sizes/strides, use compile-time constants, unroll loops, choose tuned tile sizes.
+
+SCHEDULING / FUSION / FISSION (OPTIONAL, WHEN BENEFICIAL)
+- You MAY introduce multiple custom CUDA kernels and schedule them inside ModelNew.forward.
+- If fusion/reorder provides little benefit, it is acceptable to optimize only one or a few hotspot operators.
+- You MAY fuse multiple ops into one kernel OR split one op into multiple kernels (fission), if it improves performance.
+- Intermediate buffers may be allocated as needed, but final output must match the reference.
+
+CUSTOM CUDA/C++ CODE REQUIREMENT
+- If you do not otherwise replace any ops with a custom CUDA kernel, include a tiny semantically-neutral custom kernel via load_inline (e.g., identity/copy) and call it outside critical paths to satisfy the “custom CUDA/C++ code” requirement.
+- If you already replaced/fused meaningful ops, no extra dummy kernel is needed.
+
+PRECISION POLICY (STRICT)
+- Compute in the dtype of the input tensors. NEVER downcast to a narrower dtype to gain speed.
+- If the inputs are float32, ALL storage and arithmetic must stay float32. Do NOT convert
+  activations, weights or intermediates to __half / half2 / __nv_bfloat16 / fp8, and do NOT
+  call reduced-precision tensor-core paths (e.g. cuDNN/cuBLAS half engines).
+- If the inputs arrive as float16 or bfloat16, use that dtype natively — do not upcast the
+  whole pipeline to float32 either. Match what the workload gives you.
+- TF32 tensor cores ARE permitted for conv/GEMM: the reference itself runs them
+  (torch.backends.cudnn.allow_tf32 is True by default), so this matches baseline behaviour
+  and is not a downcast.
+- Reductions (e.g. GroupNorm mean/variance, dot products) must accumulate in float32 or wider
+  regardless of the storage dtype.
+- Rationale: a narrower dtype can pass a tolerance check while computing something the
+  reference did not. Speed must come from better scheduling, fusion and memory traffic,
+  not from doing less precise arithmetic.
+
+INPUTS / BENCH HARNESS INVARIANTS (STRICT)
+- You MUST NOT change or redefine get_inputs() or get_init_inputs() from the reference file.
+- Assume tensors returned by get_inputs() are already on the correct device.
+- In ModelNew.forward, you MUST NOT move tensors across devices:
+  Do NOT call .to("cuda"), .cuda(), .cpu(), or .to(x.device).
+- Allocate outputs on the SAME device as the input tensors.
+
+CORRECTNESS CONTRACT (NON-NEGOTIABLE)
+1) Output semantics MUST match the reference Model exactly for the same inputs and parameters.
+2) Output shape MUST match PyTorch reference.
+3) Full output coverage is REQUIRED (proper blockIdx tiling; no partial writes).
+4) Dtype/layout safety:
+   - You MUST either support the input dtype(s) you use, or assert and convert explicitly.
+
+CONTIGUITY (STRICT, PERFORMANCE-SAFE)
+- Do NOT call contiguous() blindly. contiguous() may allocate and copy.
+- Call contiguous() ONLY when required:
+  - In C++: auto x_c = x.is_contiguous() ? x : x.contiguous();
+  - In Python: x = x if x.is_contiguous() else x.contiguous()
+- Do not create extra contiguous copies for tensors that are already contiguous.
+- Do not call view() on non-contiguous tensors; either ensure contiguous first (only if needed) or use reshape() carefully.
+
+IN-PLACE MUTATION (SEED STAGE: DISALLOWED BY DEFAULT)
+- Default: implement out-of-place outputs.
+- In-place is allowed ONLY if the reference forward explicitly performs in-place.
+
+CUDA EXTENSION REQUIREMENTS
+- Use torch.utils.cpp_extension.load_inline to build extensions.
+- Launch kernels on at::cuda::getDefaultCUDAStream and call C10_CUDA_KERNEL_LAUNCH_CHECK.
+- If using cuBLASLt/cuDNN inside the extension, ensure proper handle/stream association and deterministic behavior.
+
+COMPILATION OPTIONS (IMPORTANT)
+Always include:
+- "-O3"
+- "-std=c++20" (required: nvcc 13.x miscompiles the ATen headers in C++17 mode)
+- "--expt-relaxed-constexpr"
+- "-lineinfo"
+- "-gencode=arch=compute_120,code=sm_120" (this is the target architecture of the GPU you are compiling for; do not substitute another one)
+
+Here are examples to show you the syntax of inline embedding custom CUDA operators in torch:
+Example 1:
+The example given architecture is:
+'''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128)
+    b = torch.randn(1, 128)
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+'''
+The example new arch with custom CUDA kernels looks like this:
+'''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    auto stream = at::cuda::getDefaultCUDAStream();
+    elementwise_add_kernel<<<num_blocks, block_size, 0, stream>>>(
+        a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), (int)size
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+"""
+
+cpp_src = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[
+        "-O3",                          # High optimization
+        "-std=c++20",                    # Use C++20 standard
+        # "-U__CUDA_NO_HALF_OPERATORS__",  # Enable half precision operations
+        # "-U__CUDA_NO_HALF_CONVERSIONS__", # Enable conversions for half precision
+        # "-U__CUDA_NO_BFLOAT16_CONVERSIONS__", # Enable bfloat16 operations
+        # "-U__CUDA_NO_HALF2_OPERATORS__", # Enable half2 precision
+        ],
+    extra_ldflags=[""],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",  # nvcc 13.x miscompiles the ATen headers in C++17 mode
+        "-gencode=arch=compute_120,code=sm_120",  # Correct CUDA target arch
+        "--expt-relaxed-constexpr",  # CUDA specific flag
+        "-lineinfo",  # Line information for debugging
+        ],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+'''
+
+
+You are given the following architecture:
+• GPU Memory: 32GB GDDR7
+• Memory Bandwidth: 1792 GB/s
+• Streaming Multiprocessors: 170
+• FP32 TFLOPS: 104.8
+• TF32 Tensor Core TFLOPS: 104.8 (209.5 with sparsity)
+• FP16 Tensor Core TFLOPS: 209.5 with FP32 accumulate (419 with FP16 accumulate)
+• BFLOAT16 Tensor Core TFLOPS: 209.5 with FP32 accumulate
+• FP8 Tensor Core TFLOPS: 419 (838 with sparsity)
+• FP4 Tensor Core TFLOPS: 838 (1676 with sparsity)
+• Peak INT8 Tensor TOPS: 419 (838 with sparsity)
+• Register File Size: 64K 32-bit registers per SM
+• Maximum number of registers per thread: 255
+• Maximum number of thread blocks per SM: 24
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+
+And the kernel you need to implement is:
+```python
+# ==========================================================================
+# AUTO-GENERATED by solbench_bridge.problem_to_task — DO NOT EDIT BY HAND.
+#
+# SOL-ExecBench problem : 002_vae_conv3x3_groupnorm_silu_residual_fused
+# Source problem dir    : solbench_problems/L1/002_vae_conv3x3_groupnorm_silu_residual_fused
+# Chosen workload       : index 18  uuid=cdb231f0-8b76-5b89-a93b-21af0627e037
+#                         axes={"batch_size": 8, "height": 64, "width": 128}
+#
+# KernelMem task interface:
+#   Model.forward(*inputs)  ->  calls the SOL reference run() verbatim
+#   get_inputs()            ->  SOL harness input generation for this workload
+#   get_init_inputs()       ->  [] (SOL references are stateless)
+#
+# The generated kernel (ModelNew) should implement forward(*inputs) with the
+# same positional inputs, then be scored across ALL workloads with:
+#   python -m solbench_bridge.evaluate solbench_problems/L1/002_vae_conv3x3_groupnorm_silu_residual_fused --kernel <kernel.py>
+# ==========================================================================
+import json
+import os
+import sys
+
+import torch
+import torch.nn as nn
+
+# Make the vendored sol_execbench importable (regenerates inputs like the harness).
+_SOLBENCH_SRC = os.environ.get("SOLBENCH_SRC", '/home/otter77/git_project/KernelMem/third_party/SOL-ExecBench/src')
+if _SOLBENCH_SRC and _SOLBENCH_SRC not in sys.path:
+    sys.path.insert(0, _SOLBENCH_SRC)
+
+from sol_execbench.core import Definition, Workload  # noqa: E402
+from sol_execbench.core.bench.io import gen_inputs  # noqa: E402
+
+_DEFINITION = json.loads('{"name": "002_vae_conv3x3_groupnorm_silu_residual_fused", "hf_id": "Efficient-Large-Model/Sana-Sprint-1.6B-1024px", "description": "Complete fused residual block combining two sequential Conv3x3->GroupNorm->SiLU operations with residual addition. This is the fundamental building block of Sana\'s VAE encoder/decoder: input -> Conv3x3 -> GroupNorm -> SiLU -> Conv3x3 -> GroupNorm -> SiLU -> add(input). Processes feature maps with 256 channels and 32 groups for GroupNorm.", "axes": {"batch_size": {"type": "var", "description": "Batch size"}, "channels": {"type": "const", "value": 256, "description": "Number of input/output channels"}, "height": {"type": "var", "description": "Spatial height"}, "width": {"type": "var", "description": "Spatial width"}, "num_groups": {"type": "const", "value": 32, "description": "Number of groups for GroupNorm"}, "kernel_size": {"type": "const", "value": 3, "description": "Convolution kernel size"}}, "custom_inputs_entrypoint": null, "inputs": {"x": {"shape": ["batch_size", "channels", "height", "width"], "dtype": "float32", "description": "Input feature map"}, "conv1_weight": {"shape": ["channels", "channels", "kernel_size", "kernel_size"], "dtype": "float32", "description": "First convolution weights"}, "norm1_weight": {"shape": ["channels"], "dtype": "float32", "description": "First GroupNorm scale parameter"}, "norm1_bias": {"shape": ["channels"], "dtype": "float32", "description": "First GroupNorm bias parameter"}, "conv2_weight": {"shape": ["channels", "channels", "kernel_size", "kernel_size"], "dtype": "float32", "description": "Second convolution weights"}, "norm2_weight": {"shape": ["channels"], "dtype": "float32", "description": "Second GroupNorm scale parameter"}, "norm2_bias": {"shape": ["channels"], "dtype": "float32", "description": "Second GroupNorm bias parameter"}, "eps": {"shape": null, "dtype": "float32", "description": "Epsilon for numerical stability in GroupNorm"}}, "outputs": {"output": {"shape": ["batch_size", "channels", "height", "width"], "dtype": "float32", "description": "Output feature map after residual block"}}, "reference": "import torch\\nimport torch.nn.functional as F\\n\\n@torch.no_grad()\\ndef run(\\n    x: torch.Tensor,\\n    conv1_weight: torch.Tensor,\\n    norm1_weight: torch.Tensor,\\n    norm1_bias: torch.Tensor,\\n    conv2_weight: torch.Tensor,\\n    norm2_weight: torch.Tensor,\\n    norm2_bias: torch.Tensor,\\n    eps: float,\\n):\\n    \\"\\"\\"\\n    Fused residual block: Conv3x3 -> GroupNorm -> SiLU -> Conv3x3 -> GroupNorm -> SiLU -> Add\\n    \\n    Args:\\n        x: Input tensor of shape (B, C, H, W)\\n        conv1_weight: First conv weights (C, C, 3, 3)\\n        norm1_weight: First GroupNorm scale (C,)\\n        norm1_bias: First GroupNorm bias (C,)\\n        conv2_weight: Second conv weights (C, C, 3, 3)\\n        norm2_weight: Second GroupNorm scale (C,)\\n        norm2_bias: Second GroupNorm bias (C,)\\n        eps: Epsilon for GroupNorm numerical stability\\n        \\n    Returns:\\n        Output tensor of shape (B, C, H, W)\\n    \\"\\"\\"\\n    num_groups = 32\\n    \\n    # Save residual\\n    residual = x\\n    \\n    # First path: Conv3x3 -> GroupNorm -> SiLU\\n    out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)\\n    out = F.group_norm(out, num_groups, weight=norm1_weight, bias=norm1_bias, eps=eps)\\n    out = F.silu(out)\\n    \\n    # Second path: Conv3x3 -> GroupNorm -> SiLU\\n    out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)\\n    out = F.group_norm(out, num_groups, weight=norm2_weight, bias=norm2_bias, eps=eps)\\n    out = F.silu(out)\\n    \\n    # Residual connection\\n    out = out + residual\\n    \\n    return out\\n"}')
+_WORKLOAD = json.loads('{"uuid": "cdb231f0-8b76-5b89-a93b-21af0627e037", "axes": {"batch_size": 8, "height": 64, "width": 128}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0028, "max_rtol": 1e-05}}')
+_REFERENCE_SRC = 'import torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef run(\n    x: torch.Tensor,\n    conv1_weight: torch.Tensor,\n    norm1_weight: torch.Tensor,\n    norm1_bias: torch.Tensor,\n    conv2_weight: torch.Tensor,\n    norm2_weight: torch.Tensor,\n    norm2_bias: torch.Tensor,\n    eps: float,\n):\n    """\n    Fused residual block: Conv3x3 -> GroupNorm -> SiLU -> Conv3x3 -> GroupNorm -> SiLU -> Add\n    \n    Args:\n        x: Input tensor of shape (B, C, H, W)\n        conv1_weight: First conv weights (C, C, 3, 3)\n        norm1_weight: First GroupNorm scale (C,)\n        norm1_bias: First GroupNorm bias (C,)\n        conv2_weight: Second conv weights (C, C, 3, 3)\n        norm2_weight: Second GroupNorm scale (C,)\n        norm2_bias: Second GroupNorm bias (C,)\n        eps: Epsilon for GroupNorm numerical stability\n        \n    Returns:\n        Output tensor of shape (B, C, H, W)\n    """\n    num_groups = 32\n    \n    # Save residual\n    residual = x\n    \n    # First path: Conv3x3 -> GroupNorm -> SiLU\n    out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)\n    out = F.group_norm(out, num_groups, weight=norm1_weight, bias=norm1_bias, eps=eps)\n    out = F.silu(out)\n    \n    # Second path: Conv3x3 -> GroupNorm -> SiLU\n    out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)\n    out = F.group_norm(out, num_groups, weight=norm2_weight, bias=norm2_bias, eps=eps)\n    out = F.silu(out)\n    \n    # Residual connection\n    out = out + residual\n    \n    return out\n'
+
+# Execute the reference so Model.forward can call run() (and any custom-input fn).
+_REF_NS: dict = {}
+exec(compile(_REFERENCE_SRC, "<solbench_reference>", "exec"), _REF_NS)
+_run = _REF_NS.get("run")
+if _run is None:
+    raise RuntimeError("SOL reference does not define a top-level run()")
+
+_DEFN = Definition(**_DEFINITION)
+_WKL = Workload(**_WORKLOAD)
+_CUSTOM_FN = (
+    _REF_NS.get(_DEFN.custom_inputs_entrypoint)
+    if _DEFN.custom_inputs_entrypoint
+    else None
+)
+
+
+class Model(nn.Module):
+    """Thin nn.Module wrapper around the SOL-ExecBench reference run()."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, *inputs):
+        return _run(*inputs)
+
+
+def get_inputs():
+    # Generate on CPU (KernelBench convention); KernelMem moves them to the GPU.
+    # Uses the exact SOL harness generator so distributions/dtypes match.
+    # This shape stays the sole NCU/nsys profiling target.
+    return gen_inputs(_DEFN, _WKL, device="cpu", custom_inputs_fn=_CUSTOM_FN)
+
+
+# Additional shapes scored alongside get_inputs(). The chosen workload above is
+# mid-sized; these bracket it (~29x span in total work) so the score reflects
+# whether a kernel generalises rather than how well it fits one shape. A kernel
+# that specialises on a single shape — e.g. CUDA-graph capture over static
+# buffers — wins the mid shape while regressing on the large one, which a
+# single-shape score cannot see.
+#
+# SELECTION RULE (applies to every task, not just this one): size coverage alone
+# is not enough — at least one extra shape must be deliberately AWKWARD, i.e. its
+# spatial extent must NOT be a multiple of the tile sizes kernels reach for
+# (8/16/32/64). Kernels routinely derive a grid from one rounding of a division
+# and the per-block work from another; the two agree only when the tile size
+# divides the extent exactly, so a suite of power-of-two shapes cannot see the
+# disagreement. This is not hypothetical: run D shipped a GroupNorm whose
+# partial-sum buffer had an unwritten tail whenever H*W % 16 != 0, and every
+# shape scored during that search (8192, 4096, 65536) was a multiple of 16.
+_WORKLOAD_EXTRA = [
+    # small: launch-overhead dominated
+    json.loads('{"uuid": "8d631edd-1bc9-5142-9253-b0378a890e67", "axes": {"batch_size": 2, "height": 64, "width": 64}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0027, "max_rtol": 1e-05}}'),
+    # large: bandwidth/compute dominated
+    json.loads('{"uuid": "952fec71-f323-5dab-9340-dad59ad7a3f1", "axes": {"batch_size": 4, "height": 256, "width": 256}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.003, "max_rtol": 1e-05}}'),
+    # awkward: H*W = 17161 is odd, so it is divisible by no tile size at all.
+    # Small enough (~26% of the mid shape) that the extra coverage is nearly free.
+    json.loads('{"uuid": "f1b799bf-831f-5434-98be-68e897f6a219", "axes": {"batch_size": 1, "height": 131, "width": 131}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0029, "max_rtol": 1e-05}}'),
+]
+_WKLS_EXTRA = [Workload(**w) for w in _WORKLOAD_EXTRA]
+
+
+def get_inputs_extra():
+    """Optional KernelMem hook: extra shapes to include in the score.
+
+    Returns a list of input tuples, NOT including get_inputs(). Absent this
+    function KernelMem scores on get_inputs() alone, exactly as before.
+    """
+    return [
+        gen_inputs(_DEFN, w, device="cpu", custom_inputs_fn=_CUSTOM_FN)
+        for w in _WKLS_EXTRA
+    ]
+
+
+def get_init_inputs():
+    return []
+```
+
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew.
+Output the new model code in ONE python codeblock. Real code only (no pseudocode), must compile, no tests, no extra text.

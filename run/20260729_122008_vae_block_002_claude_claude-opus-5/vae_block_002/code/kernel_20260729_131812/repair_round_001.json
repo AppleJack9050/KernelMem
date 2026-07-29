@@ -1,0 +1,30 @@
+{
+  "round": 6,
+  "repair_round": 1,
+  "kernel_to_repair": "/home/otter77/git_project/KernelMem/run/20260729_122008_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_131812.py",
+  "kernel_to_repair_name": "kernel_20260729_131812",
+  "error_log": "Candidate '/home/otter77/git_project/KernelMem/run/20260729_122008_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_131812.py' must define a ModelNew class.",
+  "problem_identification": {
+    "critical_issue": "Candidate file defines no ModelNew class; only header comments, module load fails",
+    "evidence": [
+      "must define a ModelNew class"
+    ],
+    "root_cause": "The generated kernel file was emitted as only the descriptive header block (the 'gridsync_fused_groupnorm' comment banner) with no Python body: no imports, no load_inline extension build, and no `class ModelNew(nn.Module)`. The harness imports the module and looks up ModelNew, finds nothing, and aborts before any CUDA code is compiled or run.",
+    "trigger_condition": "Harness imports kernel_20260729_131812.py and does getattr(module, 'ModelNew'); attribute missing because the file body was truncated after the comment banner.",
+    "must_hold_invariants": [
+      "Module defines a top-level `class ModelNew(nn.Module)`",
+      "ModelNew.forward accepts the 8 positional inputs (x, w1, g1, b1, w2, g2, b2, eps)",
+      "Extension is built at import time via load_inline before ModelNew is used"
+    ],
+    "minimal_fix": "Append the full Python body (imports, _CUDA_SRC/_CPP_SRC, load_inline, and `class ModelNew(nn.Module)` with forward calling fused_resblock) as in the known-good kernel.",
+    "patch_anchor": "#   KF  gn_fused_kernel<true>     : stats + finalize + (affine+SiLU+residual+",
+    "confidence": "high"
+  },
+  "repair_strategy": null,
+  "timestamp": "2026-07-29T13:18:25.784008",
+  "runnable": true,
+  "speedup": 1.1246675461727706,
+  "test_passed": true,
+  "repaired_kernel": "/home/otter77/git_project/KernelMem/run/20260729_122008_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_131945.py",
+  "test_timestamp": "2026-07-29T13:20:14.641639"
+}

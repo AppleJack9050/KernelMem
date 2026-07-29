@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "opt",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/otter77/git_project/KernelMem/utils/compile_and_run.py\", line 953, in compare_and_bench\n    raise ValueError(alloc_note)\nValueError: UNINITIALIZED GPU MEMORY: this kernel's output depends on what the CUDA caching allocator previously stored, on shape 8x256x64x128.\nRun twice on identical inputs, differing only in what was left in the allocator's free blocks (the second run had them filled with NaN), it produced different results.\n  output elements that changed: 15895638 of 16777216 (94.75%)\n  of those, newly NaN          : 0\n  largest finite disagreement : 5.867585e+00\nA buffer allocated with at::empty()/torch::empty() is being READ at positions that were never WRITTEN. This most often happens when a grid is sized from one rounding of a division and the per-block work from another, so trailing blocks exit early without storing their slot, while the consumer kernel still sums every slot.\nFix the producer/consumer to agree on the exact element count, or zero-initialise the buffer. Note that this bug is INVISIBLE on a clean allocator, so it may reproduce only for some input shapes.\n"
+}

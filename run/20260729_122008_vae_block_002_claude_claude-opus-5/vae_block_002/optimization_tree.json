@@ -1,0 +1,267 @@
+{
+  "task": "tasks/vae_block_002.py",
+  "base_kernel": "kernel_20260729_130422",
+  "base_score": 1.1272446555678781,
+  "best_kernel": "kernel_20260729_130422",
+  "best_score": 1.1272446555678781,
+  "kernels": {
+    "kernel_20260729_122738": {
+      "parent": null,
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_122008_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_122738.py",
+      "speedup": 1.115251992101378,
+      "runnable": true,
+      "phase": "seed",
+      "round": 0,
+      "ncu_passed": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T12:28:07",
+      "max_abs_err": 0.0003380775451660156,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.2690236806869506,
+          "test_ms": 1.9416355168819428,
+          "speedup": 1.1686146349088,
+          "max_abs_err": 0.0003380775451660156,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.30690432131290435,
+          "test_ms": 0.294471361041069,
+          "speedup": 1.0422212884400033,
+          "max_abs_err": 0.0002789497375488281,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.446002225875855,
+          "test_ms": 8.436016969680786,
+          "speedup": 1.1197229995891398,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.6178236836194992,
+          "test_ms": 0.5446460789442062,
+          "speedup": 1.134358085928292,
+          "max_abs_err": 0.0001844167709350586,
+          "primary": false
+        }
+      ]
+    },
+    "kernel_20260729_123544": {
+      "parent": "kernel_20260729_122738",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_122008_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_123544.py",
+      "speedup": 1.0322239419027648,
+      "runnable": true,
+      "phase": "opt",
+      "round": 1,
+      "ncu_passed": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T12:36:13",
+      "max_abs_err": 0.0003383159637451172,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.2500358390808106,
+          "test_ms": 2.277724165916443,
+          "speedup": 0.9878438630761545,
+          "max_abs_err": 0.0003383159637451172,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.3071459209918976,
+          "test_ms": 0.3408809593319893,
+          "speedup": 0.9010357210734183,
+          "max_abs_err": 0.00021982192993164062,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.433846769332886,
+          "test_ms": 8.359041919708252,
+          "speedup": 1.128579909031267,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.6218953621387482,
+          "test_ms": 0.550280641913414,
+          "speedup": 1.1301421761381945,
+          "max_abs_err": 0.0001844167709350586,
+          "primary": false
+        }
+      ]
+    },
+    "<failed_round_002>": {
+      "parent": "kernel_20260729_122738",
+      "kernel_path": null,
+      "speedup": null,
+      "runnable": false,
+      "phase": "opt",
+      "round": 2,
+      "ncu_passed": null,
+      "method_matched": null,
+      "timestamp": null,
+      "max_abs_err": null,
+      "per_shape": null
+    },
+    "kernel_20260729_125453": {
+      "parent": "kernel_20260729_125242",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_122008_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_125453.py",
+      "speedup": 1.114356541472635,
+      "runnable": true,
+      "phase": "repair",
+      "round": 3,
+      "ncu_passed": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T12:55:22",
+      "max_abs_err": 0.0003380775451660156,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.219174723625183,
+          "test_ms": 1.9468767964839935,
+          "speedup": 1.1398639747686923,
+          "max_abs_err": 0.0003380775451660156,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.30916608035564425,
+          "test_ms": 0.2903103992342949,
+          "speedup": 1.0649500712722724,
+          "max_abs_err": 0.0002789497375488281,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.355168657302857,
+          "test_ms": 8.395146265029908,
+          "speedup": 1.1143544569642503,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.6192480003833771,
+          "test_ms": 0.5432172781229019,
+          "speedup": 1.1399637407028012,
+          "max_abs_err": 0.0001844167709350586,
+          "primary": false
+        }
+      ]
+    },
+    "kernel_20260729_130422": {
+      "parent": "kernel_20260729_122738",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_122008_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_130422.py",
+      "speedup": 1.1272446555678781,
+      "runnable": true,
+      "phase": "opt",
+      "round": 4,
+      "ncu_passed": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T13:04:49",
+      "max_abs_err": 0.0003383159637451172,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.256202895641327,
+          "test_ms": 1.8270838379859924,
+          "speedup": 1.2348655539136921,
+          "max_abs_err": 0.0003383159637451172,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.30716192096471784,
+          "test_ms": 0.29415359944105146,
+          "speedup": 1.044222887458745,
+          "max_abs_err": 0.0002789497375488281,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.49386848449707,
+          "test_ms": 8.544895372390748,
+          "speedup": 1.111057312085123,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.6197075217962265,
+          "test_ms": 0.5498742389678956,
+          "speedup": 1.126998644198002,
+          "max_abs_err": 0.0001844167709350586,
+          "primary": false
+        }
+      ]
+    },
+    "<failed_round_005>": {
+      "parent": "kernel_20260729_122738",
+      "kernel_path": null,
+      "speedup": null,
+      "runnable": false,
+      "phase": "opt",
+      "round": 5,
+      "ncu_passed": null,
+      "method_matched": null,
+      "timestamp": null,
+      "max_abs_err": null,
+      "per_shape": null
+    },
+    "kernel_20260729_131945": {
+      "parent": "kernel_20260729_131812",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_122008_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_131945.py",
+      "speedup": 1.1246675461727706,
+      "runnable": true,
+      "phase": "repair",
+      "round": 6,
+      "ncu_passed": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T13:20:14",
+      "max_abs_err": 0.0003383159637451172,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.2662351965904235,
+          "test_ms": 1.8340649616718292,
+          "speedup": 1.2356351841129185,
+          "max_abs_err": 0.0003383159637451172,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.30577696084976197,
+          "test_ms": 0.29257120072841647,
+          "speedup": 1.045136910565589,
+          "max_abs_err": 0.0002789497375488281,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.412895975112916,
+          "test_ms": 8.54162112236023,
+          "speedup": 1.1020034534746415,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.6209017658233642,
+          "test_ms": 0.5522969561815262,
+          "speedup": 1.1242172510168413,
+          "max_abs_err": 0.0001844167709350586,
+          "primary": false
+        }
+      ]
+    }
+  },
+  "timestamp": "2026-07-29T13:30:34.389378",
+  "reconstructed_kernels_note": "kernels[] rebuilt from eval_*.json (checkpoint used for this resume carried an empty tree)"
+}

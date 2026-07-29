@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "opt",
+  "error_type": "RuntimeError",
+  "message": "Candidate '/home/otter77/git_project/KernelMem/run/20260729_122008_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_131812.py' must define a ModelNew class."
+}

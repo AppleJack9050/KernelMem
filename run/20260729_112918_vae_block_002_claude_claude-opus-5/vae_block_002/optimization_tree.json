@@ -1,0 +1,288 @@
+{
+  "task": "tasks/vae_block_002.py",
+  "base_kernel": "kernel_20260729_113510",
+  "base_score": 1.0445414941481574,
+  "best_kernel": "kernel_20260729_114958",
+  "best_score": 1.0455114790778444,
+  "kernels": {
+    "kernel_20260729_113510": {
+      "parent": null,
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_113510.py",
+      "speedup": 1.0445414941481574,
+      "runnable": true,
+      "ncu_passed": null,
+      "phase": "seed",
+      "round": 0,
+      "strategy": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T11:35:42",
+      "max_abs_err": 0.0003380775451660156,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.23161150932312,
+          "test_ms": 2.073142075538635,
+          "speedup": 1.0764392540454866,
+          "max_abs_err": 0.0003380775451660156,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.30589472115039823,
+          "test_ms": 0.30411968141794204,
+          "speedup": 1.0058366486646972,
+          "max_abs_err": 0.0002789497375488281,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.350160636901855,
+          "test_ms": 9.025064973831176,
+          "speedup": 1.0360214207890266,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.6152035200595856,
+          "test_ms": 0.5796979188919067,
+          "speedup": 1.0612484537387126,
+          "max_abs_err": 0.0001844167709350586,
+          "primary": false
+        }
+      ]
+    },
+    "kernel_20260729_114030": {
+      "parent": "kernel_20260729_113510",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_114030.py",
+      "speedup": 1.0201394621557152,
+      "runnable": true,
+      "ncu_passed": null,
+      "phase": "opt",
+      "round": 1,
+      "strategy": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T11:40:35",
+      "max_abs_err": 0.0003380775451660156,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.2692566323280334,
+          "test_ms": 2.230780794620514,
+          "speedup": 1.0172476999086164,
+          "max_abs_err": 0.0003380775451660156,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.3088783985376358,
+          "test_ms": 0.30949600130319593,
+          "speedup": 0.9980044887075776,
+          "max_abs_err": 0.0002789497375488281,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.465624322891236,
+          "test_ms": 9.343014392852783,
+          "speedup": 1.013123166130649,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.6174768030643463,
+          "test_ms": 0.586413437128067,
+          "speedup": 1.0529717840171102,
+          "max_abs_err": 0.0001844167709350586,
+          "primary": false
+        }
+      ]
+    },
+    "<failed_round_002>": {
+      "parent": "kernel_20260729_113510",
+      "kernel_path": null,
+      "speedup": null,
+      "runnable": false,
+      "ncu_passed": null,
+      "phase": "opt",
+      "round": 2,
+      "strategy": null,
+      "method_matched": null,
+      "timestamp": null,
+      "max_abs_err": null,
+      "per_shape": null
+    },
+    "kernel_20260729_114958": {
+      "parent": "kernel_20260729_114509",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_114958.py",
+      "speedup": 1.0455114790778444,
+      "runnable": true,
+      "ncu_passed": null,
+      "phase": "repair",
+      "round": 3,
+      "strategy": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T11:50:04",
+      "max_abs_err": 0.0003414154052734375,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.2597328066825866,
+          "test_ms": 2.2381376004219056,
+          "speedup": 1.0096487393163898,
+          "max_abs_err": 0.0003414154052734375,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.31539743959903715,
+          "test_ms": 0.3037945610284805,
+          "speedup": 1.0381931741347696,
+          "max_abs_err": 0.00024896860122680664,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.603467197418214,
+          "test_ms": 9.543984642028809,
+          "speedup": 1.0062324655393369,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.6191865593194962,
+          "test_ms": 0.5465792000293732,
+          "speedup": 1.1328395944928402,
+          "max_abs_err": 0.0003132820129394531,
+          "primary": false
+        }
+      ]
+    },
+    "<failed_round_004>": {
+      "parent": "kernel_20260729_113510",
+      "kernel_path": null,
+      "speedup": null,
+      "runnable": false,
+      "ncu_passed": null,
+      "phase": "opt",
+      "round": 4,
+      "strategy": null,
+      "method_matched": null,
+      "timestamp": null,
+      "max_abs_err": null,
+      "per_shape": null
+    },
+    "<failed_round_005>": {
+      "parent": "kernel_20260729_115414",
+      "kernel_path": null,
+      "speedup": null,
+      "runnable": false,
+      "ncu_passed": null,
+      "phase": "repair",
+      "round": 5,
+      "strategy": null,
+      "method_matched": null,
+      "timestamp": null,
+      "max_abs_err": null,
+      "per_shape": null
+    },
+    "kernel_20260729_115830": {
+      "parent": "kernel_20260729_115414",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_115830.py",
+      "speedup": 0.976007607025306,
+      "runnable": true,
+      "ncu_passed": null,
+      "phase": "repair",
+      "round": 6,
+      "strategy": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T11:58:35",
+      "max_abs_err": 0.0003380775451660156,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.2763043093681334,
+          "test_ms": 2.3166620922088623,
+          "speedup": 0.9825793399147611,
+          "max_abs_err": 0.0003380775451660156,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.30738336086273194,
+          "test_ms": 0.3161372798681259,
+          "speedup": 0.9723097541389437,
+          "max_abs_err": 0.0002789497375488281,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.534837160110474,
+          "test_ms": 10.26359580039978,
+          "speedup": 0.9289957774583328,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.621880961060524,
+          "test_ms": 0.6082476806640625,
+          "speedup": 1.0224140277552347,
+          "max_abs_err": 0.0001844167709350586,
+          "primary": false
+        }
+      ]
+    },
+    "kernel_20260729_120308": {
+      "parent": "kernel_20260729_113510",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_120308.py",
+      "speedup": 1.015536812448319,
+      "runnable": true,
+      "ncu_passed": null,
+      "phase": "opt",
+      "round": 7,
+      "strategy": null,
+      "method_matched": null,
+      "timestamp": "2026-07-29T12:03:13",
+      "max_abs_err": 0.0003380775451660156,
+      "per_shape": [
+        {
+          "shape": "8x256x64x128",
+          "ref_ms": 2.2607084798812864,
+          "test_ms": 2.22716383934021,
+          "speedup": 1.015061595356637,
+          "max_abs_err": 0.0003380775451660156,
+          "primary": true
+        },
+        {
+          "shape": "2x256x64x64",
+          "ref_ms": 0.3062601599097252,
+          "test_ms": 0.3024067208170891,
+          "speedup": 1.0127425709396416,
+          "max_abs_err": 0.0002789497375488281,
+          "primary": false
+        },
+        {
+          "shape": "4x256x256x256",
+          "ref_ms": 9.350142421722412,
+          "test_ms": 9.480412769317628,
+          "speedup": 0.986259000450189,
+          "max_abs_err": 0.0002758502960205078,
+          "primary": false
+        },
+        {
+          "shape": "1x256x131x131",
+          "ref_ms": 0.6162972790002823,
+          "test_ms": 0.5874758374691009,
+          "speedup": 1.0490597905359764,
+          "max_abs_err": 0.0001844167709350586,
+          "primary": false
+        }
+      ]
+    }
+  },
+  "reconstructed": true,
+  "reconstruction_note": "Rebuilt from eval_*.json and *_round_*.json after the run was capped at 8 rounds; the loop was stopped before its own post-loop writer ran. ncu_passed and method_matched are null because they are only observable during the live round."
+}

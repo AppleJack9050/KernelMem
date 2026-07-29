@@ -1,0 +1,30 @@
+{
+  "round": 6,
+  "repair_round": 2,
+  "kernel_to_repair": "/home/otter77/git_project/KernelMem/run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_115414.py",
+  "kernel_to_repair_name": "kernel_20260729_115414",
+  "error_log": "Traceback (most recent call last):\n  File \"/home/otter77/git_project/KernelMem/utils/compile_and_run.py\", line 977, in compare_and_bench\n    raise ValueError(msg)\nValueError: Outputs are not close on extra shape 2x256x64x64 (atol=0.01, rtol=0.01). max_abs_err=5.357e+00\n",
+  "problem_identification": {
+    "critical_issue": "Stale data_ptr-keyed channels_last weight cache returns another shape's freed weights",
+    "evidence": [
+      "Outputs are not close on extra shape 2x256x64x64 (atol=0.01, rtol=0.01). max_abs_err=5.357e+00"
+    ],
+    "root_cause": "_cl_weight caches the channels_last copy under key=w.data_ptr() but keeps no reference to w. After the first (main) shape is scored, its conv weights are freed and the caching allocator hands the same address to the next workload's conv1_weight/conv2_weight, so the cache hit returns the OLD weights. The graph is then captured/replayed with wrong filters, producing large errors only on the extra shapes.",
+    "trigger_condition": "Second and later workloads (extra shapes) whose freshly allocated weight tensors reuse a data_ptr previously cached from a released weight tensor.",
+    "must_hold_invariants": [
+      "Weight conversion must reflect the tensor passed to the current forward call",
+      "Any cache key must keep the source tensor alive or be identity/content safe",
+      "Captured graph statics must be refreshed from the current call's weights"
+    ],
+    "minimal_fix": "In _cl_weight, drop the data_ptr cache: change `key = w.data_ptr()` lookup to store/compare the source tensor itself (cache entry (w, wc), hit only if cached_src is w), else recompute contiguous(channels_last).",
+    "patch_anchor": "key = w.data_ptr()\n        cached = self._wcache.get(key)",
+    "confidence": "medium"
+  },
+  "repair_strategy": null,
+  "timestamp": "2026-07-29T11:57:09.508342",
+  "runnable": true,
+  "speedup": 0.976007607025306,
+  "test_passed": true,
+  "repaired_kernel": "/home/otter77/git_project/KernelMem/run/20260729_112918_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260729_115830.py",
+  "test_timestamp": "2026-07-29T11:58:36.310472"
+}

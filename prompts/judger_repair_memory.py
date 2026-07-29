@@ -109,11 +109,14 @@ $CUDA_CODE
 
 $REPAIR_HISTORY
 
+$REFERENCE_KERNEL
+
 Task:
 - Follow the priority rules to identify the single most critical issue.
 - Base your judgment on observable evidence in ERROR_LOG, not on error_type labels.
 - First extract 1–2 evidence substrings from ERROR_LOG, then derive root_cause and minimal_fix from them.
 - If repair history is provided, analyze previous repair attempts to avoid repeating the same mistakes and understand what has been tried.
+- If a known-good kernel is provided, diff the candidate against it. A construct the known-good kernel guards (identity checks, strong references, defensive clones) and the candidate does not is prime suspect for the failure.
 
 Follow the Rules and produce the JSON exactly in the specified format."""
 )
@@ -121,10 +124,12 @@ Follow the Rules and produce the JSON exactly in the specified format."""
 # -----------------------------
 # Build both at once (returns tuple)
 # -----------------------------
-def build_correctness_prompts(*, error_log: str, arch_path: Path, cuda_code: str, repair_history: Optional[List[Dict[str, Any]]] = None):
+def build_correctness_prompts(*, error_log: str, arch_path: Path, cuda_code: str, repair_history: Optional[List[Dict[str, Any]]] = None,
+                              reference_kernel: Optional[str] = None,
+                              reference_kernel_score: Optional[float] = None):
     """
     Return (system_prompt_str, instruction_str).
-    
+
     Parameters
     ----------
     error_log : str
@@ -136,6 +141,15 @@ def build_correctness_prompts(*, error_log: str, arch_path: Path, cuda_code: str
     repair_history : Optional[List[Dict[str, Any]]]
         List of previous repair attempts for the same repair chain.
         Each dict should contain: error_log, problem_identification, runnable, speedup, test_passed.
+    reference_kernel : Optional[str]
+        Source of a kernel that passed every correctness check earlier in this
+        run. Repair prompts are otherwise built only from the broken lineage, so
+        a fix discovered in one branch is invisible to a repair happening in
+        another and gets silently regressed. Showing the known-good source lets
+        the audit diff against a version that demonstrably works.
+    reference_kernel_score : Optional[float]
+        Speedup of ``reference_kernel``, quoted so the model knows the known-good
+        kernel is a real alternative and not merely a slower fallback.
     """
     pytorch_code = Path(arch_path).read_text().strip()
     
@@ -181,11 +195,27 @@ def build_correctness_prompts(*, error_log: str, arch_path: Path, cuda_code: str
     else:
         repair_history_text = "# Repair History\n(No previous repair attempts for this repair chain.)\n"
     
+    if reference_kernel and reference_kernel.strip():
+        score_txt = (f" (speedup {reference_kernel_score:.4f})"
+                     if isinstance(reference_kernel_score, (int, float)) else "")
+        reference_kernel_text = (
+            f"# Known-Good Kernel{score_txt}\n"
+            "This kernel passed EVERY correctness check on ALL evaluated shapes earlier\n"
+            "in this run. It is not the kernel under audit; it is a working reference.\n"
+            "Where it and the candidate differ, assume the known-good kernel is right\n"
+            "unless the error log says otherwise — the difference is often the bug.\n"
+            "\n"
+            f"{reference_kernel.strip()}\n"
+        )
+    else:
+        reference_kernel_text = "# Known-Good Kernel\n(No previously passing kernel is available for this run.)\n"
+
     system_prompt = system_prompt_tmpl.substitute()
     instruction = instruction_tmpl.substitute(
         ERROR_LOG=error_log.strip(),
         PYTORCH_CODE=pytorch_code.strip(),
         CUDA_CODE=cuda_code.strip(),
         REPAIR_HISTORY=repair_history_text.strip(),
+        REFERENCE_KERNEL=reference_kernel_text.strip(),
     )
     return system_prompt, instruction

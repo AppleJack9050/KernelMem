@@ -1,0 +1,552 @@
+# ==========================================================================
+# ModelNew — fused VAE residual block (batch-split stream pipelining)
+#   Conv3x3 -> GN -> SiLU -> Conv3x3 -> GN -> SiLU -> + x
+#
+# Custom kernels (unchanged numerics):
+#   K0 nchw_to_nhwc_kernel        : NCHW -> NHWC shared-mem tiled transpose
+#   K1 gn_stats_kernel            : NHWC partial sum/sumsq per (n, chunk, group)
+#   K2 gn_finalize_kernel         : reduce -> mean/rstd -> per-(n,c) affine A,B
+#   K3 gn_apply_nhwc_kernel       : (v*A+B) + SiLU, float4 vectorised
+#   K4 gn_apply_transpose_kernel  : (v*A+B) + SiLU + residual + NHWC->NCHW
+#
+# NEW: the block is split along N into up to 4 independent chunks; the
+# memory-bound custom kernels run on one CUDA stream while the compute-bound
+# cuDNN/cutlass convs of the neighbouring chunk run on a second stream, linked
+# by events. Batch splitting is algebraically exact (GN is per-sample, conv is
+# per-sample, residual is elementwise), so results are bit-identical.
+# ==========================================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <algorithm>
+#include <vector>
+#include <optional>
+
+#define TILE 32
+#define TBY  8
+#define STAT_BS 256
+#define MAX_CHUNKS 4
+
+__device__ __forceinline__ float silu_f(float z) {
+    return z / (1.0f + __expf(-z));
+}
+
+// ---------------------------------------------------------------- K0
+__global__ void nchw_to_nhwc_kernel(const float* __restrict__ in,
+                                    float* __restrict__ out,
+                                    int HW, int C) {
+    __shared__ float tile[TILE][TILE + 1];
+    const int n  = blockIdx.z;
+    const int s0 = blockIdx.x * TILE;
+    const int c0 = blockIdx.y * TILE;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+
+    const float* pin = in + (size_t)n * (size_t)C * (size_t)HW;
+    {
+        int s = s0 + tx;
+        #pragma unroll
+        for (int k = 0; k < TILE / TBY; ++k) {
+            int c = c0 + ty + k * TBY;
+            float v = 0.0f;
+            if (s < HW && c < C) v = pin[(size_t)c * (size_t)HW + (size_t)s];
+            tile[ty + k * TBY][tx] = v;      // tile[c_local][s_local]
+        }
+    }
+    __syncthreads();
+    {
+        float* pout = out + (size_t)n * (size_t)HW * (size_t)C;
+        int c = c0 + tx;
+        #pragma unroll
+        for (int k = 0; k < TILE / TBY; ++k) {
+            int s = s0 + ty + k * TBY;
+            if (s < HW && c < C)
+                pout[(size_t)s * (size_t)C + (size_t)c] = tile[tx][ty + k * TBY];
+        }
+    }
+}
+
+// ---------------------------------------------------------------- K1
+// partial layout: [N, nblk, G, 2]
+__global__ void gn_stats_kernel(const float* __restrict__ in,
+                                float* __restrict__ partial,
+                                int HW, int C, int G, int D,
+                                int nblk, int chunk) {
+    __shared__ float ssum[STAT_BS];
+    __shared__ float ssq [STAT_BS];
+
+    const int n = blockIdx.y;
+    const int b = blockIdx.x;
+    const int s0 = b * chunk;
+    int s1 = s0 + chunk;
+    if (s1 > HW) s1 = HW;
+
+    const float* p = in + (size_t)n * (size_t)HW * (size_t)C;
+    const int tid = threadIdx.x;
+
+    for (int cbase = 0; cbase < C; cbase += STAT_BS) {
+        int c = cbase + tid;
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        float q0 = 0.f, q1 = 0.f, q2 = 0.f, q3 = 0.f;
+        if (c < C && s0 < s1) {
+            const float* q = p + (size_t)s0 * (size_t)C + (size_t)c;
+            int si = s0;
+            for (; si + 4 <= s1; si += 4) {
+                float v0 = q[0];
+                float v1 = q[(size_t)C];
+                float v2 = q[(size_t)2 * C];
+                float v3 = q[(size_t)3 * C];
+                a0 += v0; q0 += v0 * v0;
+                a1 += v1; q1 += v1 * v1;
+                a2 += v2; q2 += v2 * v2;
+                a3 += v3; q3 += v3 * v3;
+                q += (size_t)4 * C;
+            }
+            for (; si < s1; ++si) {
+                float v = *q;
+                a0 += v; q0 += v * v;
+                q += (size_t)C;
+            }
+        }
+        ssum[tid] = (a0 + a1) + (a2 + a3);
+        ssq [tid] = (q0 + q1) + (q2 + q3);
+        __syncthreads();
+
+        int ngrp = STAT_BS / D;
+        if (tid < ngrp) {
+            float sa = 0.f, sq = 0.f;
+            for (int d = 0; d < D; ++d) {
+                sa += ssum[tid * D + d];
+                sq += ssq [tid * D + d];
+            }
+            int g = cbase / D + tid;
+            if (g < G) {
+                size_t o = ((size_t)((size_t)n * nblk + b) * G + g) * 2;
+                partial[o + 0] = sa;
+                partial[o + 1] = sq;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------- K2
+__global__ void gn_finalize_kernel(const float* __restrict__ partial,
+                                   const float* __restrict__ gamma,
+                                   const float* __restrict__ beta,
+                                   float* __restrict__ A,
+                                   float* __restrict__ B,
+                                   int nblk, int G, int C, int D,
+                                   float eps, float cnt) {
+    __shared__ double smA[256];
+    __shared__ double smB[256];
+
+    const int idx = blockIdx.x;
+    const int n = idx / G;
+    const int g = idx - n * G;
+
+    const float* p = partial + ((size_t)n * nblk * G + g) * 2;
+    double s = 0.0, ss = 0.0;
+    for (int b = threadIdx.x; b < nblk; b += blockDim.x) {
+        s  += (double)p[(size_t)b * G * 2 + 0];
+        ss += (double)p[(size_t)b * G * 2 + 1];
+    }
+    smA[threadIdx.x] = s;
+    smB[threadIdx.x] = ss;
+    __syncthreads();
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+        if ((int)threadIdx.x < off) {
+            smA[threadIdx.x] += smA[threadIdx.x + off];
+            smB[threadIdx.x] += smB[threadIdx.x + off];
+        }
+        __syncthreads();
+    }
+    double mean = smA[0] / (double)cnt;
+    double var  = smB[0] / (double)cnt - mean * mean;
+    if (var < 0.0) var = 0.0;
+    float rstd = (float)(1.0 / sqrt(var + (double)eps));
+    float fm   = (float)mean;
+
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        int c = g * D + d;
+        float gg = gamma[c];
+        A[(size_t)n * C + c] = rstd * gg;
+        B[(size_t)n * C + c] = beta[c] - fm * rstd * gg;
+    }
+}
+
+// ---------------------------------------------------------------- K3
+__global__ void gn_apply_nhwc_kernel(const float* __restrict__ in,
+                                     const float* __restrict__ A,
+                                     const float* __restrict__ B,
+                                     float* __restrict__ out,
+                                     long total4, int C4, int C) {
+    extern __shared__ float sh[];
+    float* As = sh;
+    float* Bs = sh + C;
+
+    const int n = blockIdx.y;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        As[c] = A[(size_t)n * C + c];
+        Bs[c] = B[(size_t)n * C + c];
+    }
+    __syncthreads();
+
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total4) return;
+
+    int c4 = (int)(i - (i / (long)C4) * (long)C4);
+    int c  = c4 * 4;
+
+    const float4* pin  = (const float4*)(in  + (size_t)n * (size_t)total4 * 4);
+    float4*       pout = (float4*)      (out + (size_t)n * (size_t)total4 * 4);
+
+    float4 v = pin[i];
+    float4 o;
+    o.x = silu_f(v.x * As[c + 0] + Bs[c + 0]);
+    o.y = silu_f(v.y * As[c + 1] + Bs[c + 1]);
+    o.z = silu_f(v.z * As[c + 2] + Bs[c + 2]);
+    o.w = silu_f(v.w * As[c + 3] + Bs[c + 3]);
+    pout[i] = o;
+}
+
+// ---------------------------------------------------------------- K4
+__global__ void gn_apply_transpose_kernel(const float* __restrict__ in,   // NHWC
+                                          const float* __restrict__ A,
+                                          const float* __restrict__ B,
+                                          const float* __restrict__ res,  // NCHW
+                                          float* __restrict__ out,        // NCHW
+                                          int HW, int C) {
+    __shared__ float tile[TILE][TILE + 1];
+    const int n  = blockIdx.z;
+    const int s0 = blockIdx.x * TILE;
+    const int c0 = blockIdx.y * TILE;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+
+    const float* pin = in + (size_t)n * (size_t)HW * (size_t)C;
+    int c = c0 + tx;
+    float a = 0.f, b = 0.f;
+    if (c < C) {
+        a = A[(size_t)n * C + c];
+        b = B[(size_t)n * C + c];
+    }
+    #pragma unroll
+    for (int k = 0; k < TILE / TBY; ++k) {
+        int s = s0 + ty + k * TBY;
+        float y = 0.f;
+        if (s < HW && c < C) {
+            float v = pin[(size_t)s * (size_t)C + (size_t)c];
+            y = silu_f(v * a + b);
+        }
+        tile[ty + k * TBY][tx] = y;          // tile[s_local][c_local]
+    }
+    __syncthreads();
+
+    const size_t nbase = (size_t)n * (size_t)C * (size_t)HW;
+    int s = s0 + tx;
+    #pragma unroll
+    for (int k = 0; k < TILE / TBY; ++k) {
+        int cc = c0 + ty + k * TBY;
+        if (s < HW && cc < C) {
+            size_t off = nbase + (size_t)cc * (size_t)HW + (size_t)s;
+            out[off] = tile[tx][ty + k * TBY] + res[off];
+        }
+    }
+}
+
+// ---------------------------------------------------------------- event pool (plan item 3)
+struct EventPool {
+    cudaEvent_t e[MAX_CHUNKS * 5];
+    cudaEvent_t fork, joinMem, joinConv;
+    EventPool() {
+        for (int i = 0; i < MAX_CHUNKS * 5; ++i)
+            cudaEventCreateWithFlags(&e[i], cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&fork,     cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&joinMem,  cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&joinConv, cudaEventDisableTiming);
+    }
+};
+static EventPool& event_pool() { static EventPool p; return p; }
+
+static inline void ev_record(cudaEvent_t e, cudaStream_t s) {
+    if (e) C10_CUDA_CHECK(cudaEventRecord(e, s));
+}
+static inline void ev_wait(cudaStream_t s, cudaEvent_t e) {
+    if (e) C10_CUDA_CHECK(cudaStreamWaitEvent(s, e, 0));
+}
+
+// ---------------------------------------------------------------- host helpers
+static void run_gn_stats(const at::Tensor& src_nhwc,
+                         const at::Tensor& gamma, const at::Tensor& beta,
+                         at::Tensor& A, at::Tensor& B, at::Tensor& partial,
+                         int64_t N, int64_t C, int64_t HW,
+                         int G, int D, int nblk, int chunk,
+                         float eps, cudaStream_t stream) {
+    dim3 gs((unsigned)nblk, (unsigned)N, 1);
+    gn_stats_kernel<<<gs, STAT_BS, 0, stream>>>(
+        src_nhwc.data_ptr<float>(), partial.data_ptr<float>(),
+        (int)HW, (int)C, G, D, nblk, chunk);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    gn_finalize_kernel<<<(unsigned)(N * G), 256, 0, stream>>>(
+        partial.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(),
+        A.data_ptr<float>(), B.data_ptr<float>(),
+        nblk, G, (int)C, D, eps, (float)((double)HW * (double)D));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ------------------------------------------------------- plan items 1,4,5,6,8
+// One full residual-block chain for a batch slice, split across two streams.
+static void run_chain(const at::Tensor& xc_chunk,   // NCHW contiguous view
+                      at::Tensor& out_chunk,        // NCHW contiguous view
+                      const at::Tensor& w1c, const at::Tensor& g1c, const at::Tensor& b1c,
+                      const at::Tensor& w2c, const at::Tensor& g2c, const at::Tensor& b2c,
+                      float eps,
+                      int64_t nc, int64_t C, int64_t H, int64_t W,
+                      int G, int D,
+                      at::cuda::CUDAStream sMem, at::cuda::CUDAStream sConv,
+                      cudaEvent_t* ev, bool pipelined,
+                      std::vector<at::Tensor>& keep) {
+    const int64_t HW = H * W;
+    auto opts    = xc_chunk.options();
+    auto opts_cl = opts.memory_format(at::MemoryFormat::ChannelsLast);
+
+    cudaStream_t smem  = sMem.stream();
+    cudaStream_t sconv = sConv.stream();
+
+    // per-chunk partial-sum sizing (plan item 8)
+    int64_t per_img   = std::max<int64_t>(1, 680 / std::max<int64_t>(1, nc));
+    int     nblk_init = (int)std::max<int64_t>(1, std::min<int64_t>((HW + 63) / 64, per_img));
+    int     chunk     = (int)((HW + nblk_init - 1) / nblk_init);
+    if (chunk < 1) chunk = 1;
+    int     nblk      = (int)((HW + chunk - 1) / chunk);
+
+    // per-chunk private buffers
+    auto xn      = at::empty({nc, C, H, W}, opts_cl);
+    auto y1      = at::empty({nc, C, H, W}, opts_cl);
+    auto A       = at::empty({nc, C}, opts);
+    auto B       = at::empty({nc, C}, opts);
+    auto partial = at::empty({nc, (int64_t)nblk, (int64_t)G, 2}, opts);
+
+    if (pipelined) {  // allocator safety (plan item 6)
+        xc_chunk.record_stream(sMem);
+        out_chunk.record_stream(sMem);
+        xn.record_stream(sMem);   xn.record_stream(sConv);
+        y1.record_stream(sMem);   y1.record_stream(sConv);
+        A.record_stream(sMem);    B.record_stream(sMem);
+        partial.record_stream(sMem);
+        w1c.record_stream(sConv); w2c.record_stream(sConv);
+        g1c.record_stream(sMem);  b1c.record_stream(sMem);
+        g2c.record_stream(sMem);  b2c.record_stream(sMem);
+    }
+
+    // ---- K0 : x -> NHWC  (sMem) ----
+    {
+        dim3 grid((unsigned)((HW + TILE - 1) / TILE),
+                  (unsigned)((C + TILE - 1) / TILE), (unsigned)nc);
+        dim3 blk(TILE, TBY, 1);
+        nchw_to_nhwc_kernel<<<grid, blk, 0, smem>>>(
+            xc_chunk.data_ptr<float>(), xn.data_ptr<float>(), (int)HW, (int)C);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    ev_record(ev ? ev[0] : nullptr, smem);
+
+    // ---- conv1 (vendor, sConv) ----
+    ev_wait(sconv, ev ? ev[0] : nullptr);
+    at::Tensor c1;
+    {
+        std::optional<at::cuda::CUDAStreamGuard> g;
+        if (pipelined) g.emplace(sConv);
+        c1 = at::conv2d(xn, w1c, {}, {1, 1}, {1, 1}, {1, 1}, 1);
+        if (!c1.is_contiguous(at::MemoryFormat::ChannelsLast))
+            c1 = c1.contiguous(at::MemoryFormat::ChannelsLast);
+    }
+    if (pipelined) c1.record_stream(sMem);
+    ev_record(ev ? ev[1] : nullptr, sconv);
+
+    // ---- GN1 stats + K3 (sMem) ----
+    ev_wait(smem, ev ? ev[1] : nullptr);
+    run_gn_stats(c1, g1c, b1c, A, B, partial, nc, C, HW, G, D, nblk, chunk, eps, smem);
+    {
+        const int  C4     = (int)(C / 4);
+        const long total4 = (long)HW * (long)C4;
+        const int  bs     = 256;
+        dim3 grid((unsigned)((total4 + bs - 1) / bs), (unsigned)nc, 1);
+        size_t shm = (size_t)2 * C * sizeof(float);
+        gn_apply_nhwc_kernel<<<grid, bs, shm, smem>>>(
+            c1.data_ptr<float>(), A.data_ptr<float>(), B.data_ptr<float>(),
+            y1.data_ptr<float>(), total4, C4, (int)C);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    ev_record(ev ? ev[2] : nullptr, smem);
+
+    // ---- conv2 (vendor, sConv) ----
+    ev_wait(sconv, ev ? ev[2] : nullptr);
+    at::Tensor c2;
+    {
+        std::optional<at::cuda::CUDAStreamGuard> g;
+        if (pipelined) g.emplace(sConv);
+        c2 = at::conv2d(y1, w2c, {}, {1, 1}, {1, 1}, {1, 1}, 1);
+        if (!c2.is_contiguous(at::MemoryFormat::ChannelsLast))
+            c2 = c2.contiguous(at::MemoryFormat::ChannelsLast);
+    }
+    if (pipelined) c2.record_stream(sMem);
+    ev_record(ev ? ev[3] : nullptr, sconv);
+
+    // ---- GN2 stats + K4 (sMem) ----
+    ev_wait(smem, ev ? ev[3] : nullptr);
+    run_gn_stats(c2, g2c, b2c, A, B, partial, nc, C, HW, G, D, nblk, chunk, eps, smem);
+    {
+        dim3 grid((unsigned)((HW + TILE - 1) / TILE),
+                  (unsigned)((C + TILE - 1) / TILE), (unsigned)nc);
+        dim3 blk(TILE, TBY, 1);
+        gn_apply_transpose_kernel<<<grid, blk, 0, smem>>>(
+            c2.data_ptr<float>(), A.data_ptr<float>(), B.data_ptr<float>(),
+            xc_chunk.data_ptr<float>(), out_chunk.data_ptr<float>(), (int)HW, (int)C);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    ev_record(ev ? ev[4] : nullptr, smem);
+
+    // keep buffers alive until the final join (plan item 6)
+    keep.push_back(xn);
+    keep.push_back(y1);
+    keep.push_back(c1);
+    keep.push_back(c2);
+    keep.push_back(A);
+    keep.push_back(B);
+    keep.push_back(partial);
+}
+
+torch::Tensor fused_resblock(torch::Tensor x,
+                             torch::Tensor w1, torch::Tensor gamma1, torch::Tensor beta1,
+                             torch::Tensor w2, torch::Tensor gamma2, torch::Tensor beta2,
+                             double eps) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
+
+    const int64_t N = x.size(0), C = x.size(1), H = x.size(2), W = x.size(3);
+    const int G = 32;
+    TORCH_CHECK(C % G == 0 && C % 256 == 0, "unsupported channel count");
+    const int D = (int)(C / G);
+    TORCH_CHECK(256 % D == 0, "unsupported group width");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto xc   = x.is_contiguous() ? x : x.contiguous();
+    auto opts = xc.options();
+    auto out  = at::empty({N, C, H, W}, opts);
+
+    auto w1c = w1.contiguous(at::MemoryFormat::ChannelsLast);
+    auto w2c = w2.contiguous(at::MemoryFormat::ChannelsLast);
+    auto g1c = gamma1.is_contiguous() ? gamma1 : gamma1.contiguous();
+    auto b1c = beta1.is_contiguous()  ? beta1  : beta1.contiguous();
+    auto g2c = gamma2.is_contiguous() ? gamma2 : gamma2.contiguous();
+    auto b2c = beta2.is_contiguous()  ? beta2  : beta2.contiguous();
+
+    // plan item 2 (anti-regression fallback: use `(N >= 4) ? 4 : 1` here if the
+    // 2x256x64x64 shape ever regresses).
+    int nchunk = (N >= 4) ? MAX_CHUNKS : (int)N;
+
+    std::vector<at::Tensor> keep;
+    keep.reserve((size_t)nchunk * 7);
+
+    if (nchunk <= 1) {
+        // single-stream path, identical to the previous implementation
+        run_chain(xc, out, w1c, g1c, b1c, w2c, g2c, b2c, (float)eps,
+                  N, C, H, W, G, D, stream, stream, nullptr, false, keep);
+        return out;
+    }
+
+    // ---- fork (plan item 3) ----
+    static at::cuda::CUDAStream sMem  = at::cuda::getStreamFromPool();
+    static at::cuda::CUDAStream sConv = at::cuda::getStreamFromPool();
+    EventPool& p = event_pool();
+
+    C10_CUDA_CHECK(cudaEventRecord(p.fork, stream.stream()));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(sMem.stream(),  p.fork, 0));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(sConv.stream(), p.fork, 0));
+
+    // ---- enqueue all chunks without joining between them (plan item 4) ----
+    int64_t base = 0;
+    for (int i = 0; i < nchunk; ++i) {
+        int64_t nc = N / nchunk + ((int64_t)i < (N % nchunk) ? 1 : 0);
+        if (nc <= 0) continue;
+        auto xchunk = xc.narrow(0, base, nc);
+        auto ochunk = out.narrow(0, base, nc);
+        run_chain(xchunk, ochunk, w1c, g1c, b1c, w2c, g2c, b2c, (float)eps,
+                  nc, C, H, W, G, D, sMem, sConv, p.e + i * 5, true, keep);
+        base += nc;
+    }
+
+    // ---- join (plan item 7) ----
+    C10_CUDA_CHECK(cudaEventRecord(p.joinMem,  sMem.stream()));
+    C10_CUDA_CHECK(cudaEventRecord(p.joinConv, sConv.stream()));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(), p.joinMem,  0));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(), p.joinConv, 0));
+
+    return out;
+}
+"""
+
+_CPP_SRC = r"""
+torch::Tensor fused_resblock(torch::Tensor x,
+                             torch::Tensor w1, torch::Tensor gamma1, torch::Tensor beta1,
+                             torch::Tensor w2, torch::Tensor gamma2, torch::Tensor beta2,
+                             double eps);
+"""
+
+_ext = load_inline(
+    name="vae_resblock_fused_cl_pipe",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["fused_resblock"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+    ],
+)
+
+
+class ModelNew(nn.Module):
+    """Granularity (C): everything except the two vendor convolutions is fused into
+    5 custom CUDA kernels operating in NHWC, now batch-split and pipelined across
+    two CUDA streams so the DRAM-bound GN/layout kernels overlap the SM-bound convs."""
+
+    def __init__(self):
+        super().__init__()
+        self._ext = _ext
+
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        e = float(eps)
+        if (x.is_cuda and x.dtype == torch.float32 and x.dim() == 4
+                and x.size(1) % 256 == 0 and x.size(1) % 32 == 0):
+            return self._ext.fused_resblock(
+                x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, e)
+
+        # Generic fallback (never taken for the benchmarked shapes).
+        residual = x
+        out = F.conv2d(x, conv1_weight, None, 1, 1)
+        out = F.group_norm(out, 32, norm1_weight, norm1_bias, e)
+        out = F.silu(out)
+        out = F.conv2d(out, conv2_weight, None, 1, 1)
+        out = F.group_norm(out, 32, norm2_weight, norm2_bias, e)
+        out = F.silu(out)
+        return out + residual
