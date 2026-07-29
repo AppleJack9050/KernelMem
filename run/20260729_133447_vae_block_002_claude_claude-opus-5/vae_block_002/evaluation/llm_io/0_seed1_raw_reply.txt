@@ -1,3 +1,198 @@
+```python
+# ==========================================================================
+# ModelNew — SOL problem 002: Conv3x3 -> GN -> SiLU -> Conv3x3 -> GN -> SiLU -> +residual
+#
+# SEED GRANULARITY: (C) "fuse many ops into one/few kernels".
+#
+# 1) Chosen granularity: (C).
+#
+# 2) Ops replaced by custom CUDA:
+#    - both GroupNorm(32) statistics passes            -> gn_reduce_kernel + gn_finalize_kernel
+#    - GroupNorm affine + SiLU (after conv1)           -> gn_apply_nhwc_fast (in-place, float4)
+#    - GroupNorm affine + SiLU + residual add          -> gn_apply_out_kernel
+#    - all NCHW<->NHWC layout conversions              -> nchw2nhwc_kernel / fused into the
+#                                                         epilogue tile kernel
+#
+# 3) Fusion map:
+#    - kernel nchw2nhwc_kernel : one shared-memory-tiled transpose of x so that cuDNN gets a
+#      native NHWC tensor and performs ZERO internal nchwToNhwc copies (these were 156us +
+#      2 elementwise re-layout kernels in the reference profile).
+#    - GN #1  = [reduce (coalesced full-row loads, per-group partials)] + [tiny finalize] +
+#               [apply: (x-mean)*rstd*w+b followed by SiLU, done in-place on the conv output
+#                so no extra buffer traffic].
+#    - GN #2  = [reduce] + [finalize] + [apply_out: normalize + SiLU + residual add + the
+#               NHWC->NCHW transposition ALL fused in one tiled kernel, so the final layout
+#               conversion, the SiLU and the residual add cost a single read/write pass].
+#
+# 4) Left in PyTorch:
+#    - the two 3x3 convolutions (F.conv2d on channels_last tensors): the vendor TF32 NHWC
+#      implicit-GEMM already runs at ~89% of this GPU's TF32 roofline (77 GFLOP each in
+#      ~830us), so re-implementing it can only lose; we instead feed it the layout it wants.
+#    - the channels_last weight copies (2.4MB each, ~2us): trivial, no kernel needed.
+#
+# Precision: everything stays fp32; group statistics accumulate fp32 per-thread and are
+# combined in fp64. TF32 conv is used exactly as the reference does.
+# ==========================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r'''
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define TILE 32
+#define TROWS 8
+
+__device__ __forceinline__ float silu_f(float z){
+    return z / (1.0f + expf(-z));
+}
+
+// ---------------------------------------------------------------- transpose
+__global__ void nchw2nhwc_kernel(const float* __restrict__ x,
+                                 float* __restrict__ y,
+                                 int C, long HW)
+{
+    __shared__ float tile[TILE][TILE + 1];
+    long p0 = (long)blockIdx.x * TILE;
+    int  c0 = blockIdx.y * TILE;
+    int  n  = blockIdx.z;
+    const float* xn = x + (size_t)n * (size_t)C * (size_t)HW;
+    float*       yn = y + (size_t)n * (size_t)HW * (size_t)C;
+    int tx = threadIdx.x, ty = threadIdx.y;
+
+    #pragma unroll
+    for (int i = 0; i < TILE; i += TROWS) {
+        int  c = c0 + ty + i;
+        long p = p0 + tx;
+        float v = 0.f;
+        if (c < C && p < HW) v = xn[(size_t)c * (size_t)HW + (size_t)p];
+        tile[ty + i][tx] = v;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < TILE; i += TROWS) {
+        long p = p0 + ty + i;
+        int  c = c0 + tx;
+        if (c < C && p < HW) yn[(size_t)p * (size_t)C + (size_t)c] = tile[tx][ty + i];
+    }
+}
+
+// ------------------------------------------------------------ GN statistics
+// grid = (nch, B), block = G * ppb  (ppb pixel-lanes, each warp reads full rows)
+__global__ void gn_reduce_kernel(const float* __restrict__ y,
+                                 double* __restrict__ psum,
+                                 double* __restrict__ psq,
+                                 int C, long HW, int G, int CPG,
+                                 int ppb, long chunk, int nch)
+{
+    extern __shared__ float sh[];
+    float* s_s = sh;
+    float* s_q = sh + blockDim.x;
+
+    int tid = threadIdx.x;
+    int g   = tid % G;
+    int dp  = tid / G;
+    int n   = blockIdx.y;
+
+    long pstart = (long)blockIdx.x * chunk;
+    long pend   = pstart + chunk;
+    if (pend > HW) pend = HW;
+
+    const float* base = y + (size_t)n * (size_t)HW * (size_t)C + (size_t)g * (size_t)CPG;
+
+    float s = 0.f, q = 0.f;
+    if ((CPG & 3) == 0) {
+        int nv = CPG >> 2;
+        for (long p = pstart + dp; p < pend; p += ppb) {
+            const float4* v4 = reinterpret_cast<const float4*>(base + (size_t)p * (size_t)C);
+            for (int j = 0; j < nv; ++j) {
+                float4 v = v4[j];
+                s += v.x + v.y + v.z + v.w;
+                q += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            }
+        }
+    } else {
+        for (long p = pstart + dp; p < pend; p += ppb) {
+            const float* v = base + (size_t)p * (size_t)C;
+            for (int j = 0; j < CPG; ++j) { float t = v[j]; s += t; q += t * t; }
+        }
+    }
+
+    s_s[tid] = s; s_q[tid] = q;
+    __syncthreads();
+    for (int stride = ppb >> 1; stride > 0; stride >>= 1) {
+        if (dp < stride) {
+            s_s[tid] += s_s[tid + stride * G];
+            s_q[tid] += s_q[tid + stride * G];
+        }
+        __syncthreads();
+    }
+    if (dp == 0) {
+        size_t off = (size_t)(n * G + g) * (size_t)nch + (size_t)blockIdx.x;
+        psum[off] = (double)s_s[tid];
+        psq[off]  = (double)s_q[tid];
+    }
+}
+
+__global__ void gn_finalize_kernel(const double* __restrict__ psum,
+                                   const double* __restrict__ psq,
+                                   float* __restrict__ mean,
+                                   float* __restrict__ rstd,
+                                   int nch, double count, double eps)
+{
+    __shared__ double sh[256];
+    int bg  = blockIdx.x;
+    int tid = threadIdx.x;
+    double s = 0.0, q = 0.0;
+    for (int i = tid; i < nch; i += blockDim.x) {
+        s += psum[(size_t)bg * nch + i];
+        q += psq [(size_t)bg * nch + i];
+    }
+    sh[tid] = s; sh[128 + tid] = q;
+    __syncthreads();
+    for (int st = 64; st > 0; st >>= 1) {
+        if (tid < st) { sh[tid] += sh[tid + st]; sh[128 + tid] += sh[128 + tid + st]; }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        double m = sh[0] / count;
+        double v = sh[128] / count - m * m;
+        if (v < 0.0) v = 0.0;
+        mean[bg] = (float)m;
+        rstd[bg] = (float)(1.0 / sqrt(v + eps));
+    }
+}
+
+// ------------------------------------------------- GN affine + SiLU (NHWC, in-place)
+__global__ void gn_apply_nhwc_fast(float* __restrict__ y,
+                                   const float* __restrict__ mean,
+                                   const float* __restrict__ rstd,
+                                   const float* __restrict__ w,
+                                   const float* __restrict__ b,
+                                   int C4, long HW, int G, int CPG, int ppb)
+{
+    int n  = blockIdx.y;
+    int c4 = threadIdx.x % C4;
+    int dp = threadIdx.x / C4;
+    int c  = c4 << 2;
+    int g  = c / CPG;
+
+    float m = mean[n * G + g];
+    float r = rstd[n * G + g];
+    float a0 = r * w[c],     a1 = r * w[c + 1], a2 = r * w[c + 2], a3 = r * w[c + 3];
+    float d0 = b[c]     - m * a0;
+    float d1 = b[c + 1] - m * a1;
+    float d2 = b[c + 2] - m * a2;
+    float d3 = b[c + 3] - m * a3;
+
+    float4* base = reinterpret_cast<float4*>(y) + (size_t)n * (size_t)HW * (size_t)C4;
+    for (long p = (long)blockIdx
+```python
 # ==========================================================================
 # ModelNew — SOL problem 002: Conv3x3 -> GN -> SiLU -> Conv3x3 -> GN -> SiLU -> +residual
 #
@@ -477,3 +672,4 @@ class ModelNew(nn.Module):
 
         # GroupNorm + SiLU + residual add + NHWC->NCHW, one fused tiled kernel
         return _ext.gn_silu_add_nchw(o2, xc, norm2_weight, norm2_bias, e, _NUM_GROUPS)
+```

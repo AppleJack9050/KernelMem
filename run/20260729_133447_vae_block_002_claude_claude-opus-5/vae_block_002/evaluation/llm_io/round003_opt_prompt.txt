@@ -1,3 +1,109 @@
+
+
+You are a CUDA kernel optimization implementation specialist. You will receive:
+- Target GPU specifications
+- A **base CUDA kernel file** (Python + CUDA extension) containing the current `ModelNew` implementation and its custom CUDA kernels.
+- A previously generated optimisation_suggestion containing:
+  - **modification_plan** (or "modification plan"): numbered checklist with primary optimization method steps
+  - bottleneck, primary_optimisation_method (or "optimisation method"), method_name, evidence, expected_metric_change, headroom
+
+Your MOST IMPORTANT goal is:
+- To implement the given **modification plan** completely and faithfully in the CUDA extension, producing a new kernel that:
+  - Applies the primary optimization method to the hottest kernel
+  - Preserves correctness within the harness tolerance (atol=1e-3 and rtol=1e-3),
+  - Preserves the public Python API (same inputs/outputs, shapes, dtypes),
+  - And improves performance on the target GPU as much as possible.
+
+PARAMETER PARITY (STRICT)
+- You MUST preserve parameter parity with the base kernel's parameter structure.
+- The base kernel file already contains a `ModelNew` class with parameter handling. You MUST maintain the same parameter structure.
+- If the base kernel uses a PyTorch module as a PARAMETER HOLDER (for initialization / state_dict parity), you MUST keep the same pattern.
+- Do NOT create independent parameters with torch.randn / random init. Source weights/bias from the existing parameter-holder module (e.g., self.op.weight / self.op.bias) as the base kernel does.
+
+NO ATen FOR REPLACED OPS (STRICT)
+- For op-chains explicitly marked as replaced/fused in the modification_plan, you MUST NOT call PyTorch/ATen implementations for those chains. Ops explicitly kept as vendor mainloops (e.g., cuBLAS/cuDNN paths) may remain as in the base kernel.
+- The replaced computation must execute only in your custom CUDA kernel(s), plus minimal checks.
+
+CUDA GRAPH METHOD (ONLY IF REQUIRED BY PLAN)
+- If method_name (or primary_optimisation_method) is cuda_graph_capture, you MAY implement torch.cuda.CUDAGraph capture/replay in ModelNew (Python) using static CUDA tensors.
+- Do not use CUDA graphs otherwise.
+- Do not place custom extension compilation inside the captured region.
+
+You MUST follow these implementation and explanation rules:
+
+(0) IMPLEMENTATION ORDER (CRITICAL - STRICT SEQUENCE)
+- **Primary Optimization Method**
+  - Apply the primary optimization method to the hottest kernel as specified in the modification_plan.
+  - The modification_plan lists the optimization steps (e.g., "1. Apply vectorized memory access to kernel X").
+  - Implement each step in the modification_plan completely and faithfully.
+
+(0.1) MODIFICATION PLAN EXECUTION (CRITICAL)
+- Treat the `modification_plan` (or "modification plan") in optimisation_suggestion as a **checklist** of required changes.
+- For each numbered item in the plan (1., 2., 3., ...), you MUST:
+  - Implement the corresponding change in the CUDA / Python code; and
+  - Be able to point to the exact code region(s) (functions / loops / kernels / kernel launches) that realize this item.
+- You MUST NOT silently drop plan items. If a plan item (or a sub-step) is impossible/unsafe, state it in Section A in ONE short sentence and implement the closest safe subset + a concrete TODO.
+
+(1) OUTPUT STRUCTURE (TWO SECTIONS WITH EXPLICIT DELIMITERS)
+Your answer MUST consist of **two sections in order**, separated by explicit delimiters:
+
+- **Section A – Checklist evidence (plan-to-code mapping)**  
+  - For **each** numbered item in the modification plan, write a **very brief** mapping:
+    - `Plan item N:` the exact text (or a concise paraphrase) of that item;
+    - `Implemented in code:` **one short phrase** naming the key code location(s) (e.g., "new grid-stride loop in main kernel", "float4 load/store path in kernel X", "launch config in ModelNew.forward").
+  - Keep Section A compact: do **not** explain low-level details here; it is only a checklist for where each item was implemented.
+  - If you deviated from the literal wording of the plan, mention this in **one short sentence**.
+  - Section A must NOT include rationale, performance claims, or metric discussion; only plan-item-to-code-location mapping.
+
+- **Section B – Kernel implementation**  
+  - Start this section with the delimiter line: `=== KERNEL CODE STARTS BELOW ===`
+  - Then output a complete CUDA extension implementation following the `load_inline + ModelNew` structure described in OUTPUT RULES below.
+  - This kernel should fully implement all items from the modification plan as explained in Section A.
+  - The kernel code must be wrapped in ```python ... ``` code block.
+
+(2) MINIMAL-DIFF PRINCIPLE (RELATIVE TO BASE KERNEL)
+- Keep the overall structure and public interface of the base kernel stable. Do not redesign unrelated parts.
+- Focus your edits on the parts of the code that are directly related to the modification plan.
+
+(3) SEMANTIC ALIGNMENT
+- Your optimized kernel must produce the same outputs as the base kernel for the same inputs (within tolerance).
+
+(4) BENCH HARNESS INVARIANTS (STRICT)
+- Follow the same device handling pattern as the base kernel. Assume inputs are already on the correct device. In ModelNew.forward, do NOT call .to("cuda"), .cuda(), .cpu(), or .to(x.device).
+- Allocate outputs on the SAME device as the input tensors.
+- If a tensor is non-contiguous, call contiguous() only when the CUDA kernel uses raw linear indexing that assumes contiguous layout; otherwise implement stride-aware indexing.
+- Do NOT propose or implement changes to the benchmark workflow, external caching, or evaluation settings; only kernel code and launch configuration may change.
+- Recommended pattern: in Python `x = x if x.is_contiguous() else x.contiguous()` only when the corresponding CUDA kernel uses linear indexing.
+
+- If headroom is provided in optimisation_suggestion, consider it when choosing implementation details:
+  - High headroom: more aggressive optimizations may be appropriate;
+  - Medium headroom: balanced approach;
+  - Low headroom: focus on small, safe efficiency tweaks; expect modest speedup
+
+
+# Target GPU
+GPU Name: RTX 5090
+Architecture: Blackwell (sm_120)
+Details:
+• GPU Memory: 32GB GDDR7
+• Memory Bandwidth: 1792 GB/s
+• Streaming Multiprocessors: 170
+• FP32 TFLOPS: 104.8
+• TF32 Tensor Core TFLOPS: 104.8 (209.5 with sparsity)
+• FP16 Tensor Core TFLOPS: 209.5 with FP32 accumulate (419 with FP16 accumulate)
+• BFLOAT16 Tensor Core TFLOPS: 209.5 with FP32 accumulate
+• FP8 Tensor Core TFLOPS: 419 (838 with sparsity)
+• FP4 Tensor Core TFLOPS: 838 (1676 with sparsity)
+• Peak INT8 Tensor TOPS: 419 (838 with sparsity)
+• Register File Size: 64K 32-bit registers per SM
+• Maximum number of registers per thread: 255
+• Maximum number of thread blocks per SM: 24
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+
+[BASE KERNEL FILE]
+This is the current CUDA kernel implementation that you must optimize. Study its structure, parameter handling, and kernel implementations before making changes.
+```python
 # ==========================================================================
 # ModelNew — SOL problem 002: Conv3x3 -> GN -> SiLU -> Conv3x3 -> GN -> SiLU -> +residual
 #
@@ -477,3 +583,65 @@ class ModelNew(nn.Module):
 
         # GroupNorm + SiLU + residual add + NHWC->NCHW, one fused tiled kernel
         return _ext.gn_silu_add_nchw(o2, xc, norm2_weight, norm2_bias, e, _NUM_GROUPS)
+```
+
+[optimization instructions]
+{
+  "bottleneck": "[DRAM-bandwidth/traffic bound] Composite GroupNorm-2 segment: gn_reduce (48.9us) + gn_finalize (4.6us) + gn_apply_out_kernel (115.9us, hottest non-conv kernel). Each already runs at 84-89% DRAM peak, but lts__t_sector_hit_rate is 3.2%/1.05%: the same 67MB conv output is streamed from DRAM twice because stats and apply are separate launches whose traversal orders do not overlap in L2.",
+  "primary_optimisation_method": "Grid-sync kernel fusion: merge reduce+finalize+apply of each GroupNorm into ONE persistent cooperative kernel whose phase-2 blocks re-touch exactly the pixel range they read in phase-1, so the second read of the 67MB tensor hits L2 instead of DRAM. Justified by E1/E2: kernels are at DRAM roofline (88.9%) so only byte removal helps; gn_apply_nhwc_fast already shows 50.4% L2 hit when it follows the reduce, proving the reuse is capturable. Also removes 4 launches/forward (helps small shape).",
+  "method_name": "gridsync_gn_fusion",
+  "modification_plan": "1. Replace the 3-launch GN sequence (gn_reduce -> gn_finalize -> apply) with ONE persistent kernel per GroupNorm: `gn_fused_inplace` (GN1, NHWC in-place + SiLU) and `gn_fused_out` (GN2, +residual + NHWC->NCHW). Host side: grid = min(numSMs * cudaOccupancyMaxActiveBlocksPerMultiprocessor(kernel,256,smem), ceil(HW/PIX_TILE)*B); launch with cudaLaunchCooperativeKernel; keep the existing 3-kernel path as a fallback if the cooperative launch returns any error or if the required grid exceeds residency.\n2. Data-locality rule (the actual saving): partition work ONLY over (n, pixel-chunk); every block owns the SAME (n, pixel range) in phase 1 and phase 2, and covers ALL 256 channels of those pixels in both phases. Traverse chunks with a grid-stride loop in identical order in both phases, so phase-2 loads reference the most-recently-filled L2 lines.\n3. Phase 1 (stats): each block loops its chunks, reads NHWC float4 rows exactly as today's gn_reduce (keep current access pattern; do NOT change vector width), accumulates fp32 per-thread s/q, block-reduces in shared memory, writes fp64 partials to psum/psq[block][n][g].\n4. Barrier A: cooperative_groups::this_grid().sync(). Add `-rdc=true` to extra_cuda_cflags (fallback: manual arrive-and-wait barrier on an int counter allocated with torch::zeros and __threadfence + volatile spin).\n5. Finalize inside the kernel: blocks with blockIdx.x < B*G each read gridDim.x partial pairs (<=~8KB) and compute mean/rstd into small global arrays (fp64 combine, unchanged math). Barrier B: grid sync again.\n6. Phase 2 (apply), GN1 variant: identical to gn_apply_nhwc_fast body (float4, precomputed a=r*w, d=b-m*a, FMA + SiLU), but iterating the block's OWN chunk list from step 2, in-place.\n7. Phase 2, GN2 variant (replaces gn_apply_out_kernel): for each owned 32-pixel chunk, loop ct=0..C/32-1: load y[(p0+ty+i)*C + c0+tx] (32 contiguous floats/warp, same lines phase 1 touched), apply (v-mean)*rstd*w[c]+b[c] then SiLU, stage into __shared__ float tile[32][33] (bytes_per_block = 32*33*4 = 4224 B, one buffer, far below the 99KB/block limit, reused across ct so smem is constant), __syncthreads(), then write out[((n*C)+c)*HW + p] = tile[tx][ty+i] + res[same offset] with coalesced 32-pixel NCHW stores. Because the block now sweeps all 256 channels of its pixel chunk instead of one 32-channel slice, the y reads are contiguous whole-pixel rows and reuse the phase-1 L2 residency (today's 1.05% hit rate).\n8. Tail handling: guards `p < HW` and `c < C` retained; grid-stride chunk loop makes coverage correct for odd HW (131x131 -> HW=17161) and for B=1; partial arrays sized gridDim.x*B*G, fully written by every block (no unwritten tail).\n9. Numerics unchanged: fp32 storage, fp32 per-thread accumulation, fp64 combine, same eps/rstd formula, TF32 convs untouched (F.conv2d channels_last kept as the mainloop).\n10. Keep nchw2nhwc_kernel and both cuDNN convs exactly as-is; launch count per forward drops from ~20 to ~16.\n11. Validate: max_atol <= tolerance on all four shapes; verify the conv engine selection (cutlass tf32 nhwc fprop) is unchanged in nsys; if the cooperative grid is smaller than 2 waves for the large shape, cap PIX_TILE so each block still gets >=2 chunks.",
+  "evidence": "gn_apply_out_kernel: gpu__time_duration.avg = 115,904 ns, gpu__dram_throughput = 88.91%, lts__t_sector_hit_rate = 1.05%; gn_reduce_kernel: 48,928 ns, lts hit 3.18%; gn_apply_nhwc_fast: lts hit 50.36% right after its reduce. Root cause: each GroupNorm reads its 67MB conv output twice from DRAM because the stats kernel and the apply kernel are separate launches with different traversal orders (apply_out sweeps 32-channel slices over all pixels, so nothing the reduce left in L2 is reused) — at 89% of DRAM peak the only lever is removing DRAM bytes, which L2-resident re-reads inside one fused persistent kernel provide. Refutation of 'conv is the bottleneck': 1.546e11 FLOP in ~1533us = 100.8 TFLOPS = 96% of the 104.8 TFLOPS TF32 roofline, so the cuDNN mainloop has no headroom; refutation of 'apply_out needs better vectorization': its stores/loads are already 128B-contiguous per warp and it sits at 1.58 TB/s of 1.79 TB/s peak.",
+  "expected_metric_change": "lts__t_sector_hit_rate on the fused GN2 apply phase: 1.05% -> >35%; on GN1 apply phase: 50.4% -> >70%. gpu__dram_throughput stays >=85% while measured DRAM bytes per GN2 segment fall ~268MB -> ~200MB, so fused GN2 duration 169us -> ~120-130us and GN1 122us -> ~100us; launches/forward 20 -> 16 (helps the 2x256x64x64 shape). Anti-regression: cooperative launch failure or grid > residency must fall back to today's 3-kernel path (so no shape can crash/deadlock); conv kernel selection and channels_last layouts unchanged; shared memory per block fixed at 4224 B so occupancy does not drop below the current 12 blocks/SM limit; grid-stride chunk loops must fully cover odd HW (131x131) with max_atol <= 0.0029; large shape 4x256x256x256 (268MB > L2) must be no slower than today since traffic is unchanged there.",
+  "headroom": "low"
+}
+
+COMPLETE OUTPUT FORMAT ────────────────────────────────────────────────
+Your complete response MUST include BOTH sections:
+
+**Section A – Checklist evidence (plan-to-code mapping)**
+- Write this section FIRST, before any code.
+- For each numbered item in the modification plan, provide a **very concise** mapping:
+  - `Plan item N:` [exact text or paraphrase, one line]
+  - `Implemented in code:` [one short phrase naming the key code location(s)]
+- Do not write long explanations here; this section is a compact checklist only.
+
+**Section B – Kernel implementation**
+- After Section A, write the delimiter: `=== KERNEL CODE STARTS BELOW ===`
+- Then output the kernel code block following OUTPUT RULES below.
+
+PRECISION POLICY (STRICT) ──────────────────────────────────────────────
+- Compute in the dtype of the input tensors. NEVER downcast to a narrower dtype for speed.
+- float32 inputs => float32 storage and arithmetic throughout. No __half / half2 /
+  __nv_bfloat16 / fp8, and no reduced-precision tensor-core engines.
+- float16/bfloat16 inputs => use that dtype natively; do not upcast the pipeline either.
+- TF32 for conv/GEMM is allowed (the reference runs TF32 via cudnn.allow_tf32=True).
+- Reductions must accumulate in float32 or wider regardless of storage dtype.
+- Speed must come from scheduling, fusion and reduced memory traffic — NOT from doing
+  less precise arithmetic. A narrower dtype can pass the tolerance check while computing
+  something the reference did not; that is not a valid optimization.
+
+OUTPUT RULES FOR KERNEL CODE (Section B only) ──────────────────────────
+The kernel code block in Section B must follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple-quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors the base kernel's inputs/outputs and API, but calls
+      your optimized CUDA kernels.
+**Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose in the code block.
+
+Example complete output structure:
+```
+[Section A: Checklist evidence]
+Plan item 1: ...
+Implemented in code: ...
+
+Plan item 2: ...
+Implemented in code: ...
+
+=== KERNEL CODE STARTS BELOW ===
+```python
+import torch
+...
+```

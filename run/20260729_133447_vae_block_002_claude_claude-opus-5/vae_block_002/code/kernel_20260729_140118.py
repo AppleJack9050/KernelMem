@@ -1,38 +1,15 @@
 # ==========================================================================
 # ModelNew — SOL problem 002: Conv3x3 -> GN -> SiLU -> Conv3x3 -> GN -> SiLU -> +residual
 #
-# SEED GRANULARITY: (C) "fuse many ops into one/few kernels".
-#
-# 1) Chosen granularity: (C).
-#
-# 2) Ops replaced by custom CUDA kernels:
-#    - both GroupNorm(32) statistics passes            -> gn_reduce_kernel + gn_finalize_kernel
-#    - GroupNorm affine + SiLU (after conv1)           -> gn_apply_nhwc_fast (in-place, float4)
-#    - GroupNorm affine + SiLU + residual add          -> gn_apply_out_kernel
-#    - all NCHW<->NHWC layout conversions              -> nchw2nhwc_kernel / fused into the
-#                                                         epilogue tile kernel
-#
-# 3) Fusion map:
-#    - nchw2nhwc_kernel: one shared-memory-tiled transpose of x so cuDNN receives a native
-#      NHWC tensor and performs ZERO internal nchwToNhwc copies (156us + 2 re-layout
-#      elementwise kernels in the reference profile).
-#    - GN #1 = [reduce: coalesced full-row loads producing per-(n,group) partials] +
-#              [finalize: tiny fp64 combine -> mean/rstd] +
-#              [apply: (v-mean)*rstd*w+b then SiLU, done IN-PLACE on the conv output so no
-#               extra buffer traffic].
-#    - GN #2 = [reduce] + [finalize] +
-#              [apply_out: normalize + SiLU + residual add + NHWC->NCHW transposition ALL in
-#               one tiled kernel, so the final layout conversion, SiLU and residual add cost
-#               a single read/write pass].
-#
-# 4) Left in PyTorch:
-#    - the two 3x3 convolutions (F.conv2d on channels_last): the vendor TF32 NHWC implicit
-#      GEMM already runs at ~89% of this GPU's TF32 roofline, so re-implementing it can only
-#      lose; we instead hand it the layout it wants.
-#    - the channels_last weight copies (2.4MB each, ~2us): trivial, no custom kernel needed.
-#
-# Precision: everything stays fp32; group statistics accumulate fp32 per thread and combine
-# in fp64. TF32 conv is used exactly as the reference does.
+# Optimisation applied: L2 CACHE BLOCKING (l2_cache_blocking).
+#   The five DRAM-bound kernels (transpose, gn_reduce x2, gn_apply_nhwc_fast,
+#   gn_apply_out) stream the same multi-tens-of-MB tensors with ~1-3% L2 hit
+#   rate.  We now run the whole block on batch sub-chunks sized so each live
+#   intermediate (~<=24MB) stays resident in L2 across the 4-5 kernels that
+#   touch it, converting inter-kernel re-reads into L2 hits.
+#   GroupNorm statistics are per-(n,group), so batch chunking is EXACT.
+#   Device kernels are untouched; only scheduling + one non-allocating
+#   epilogue binding were added.
 # ==========================================================================
 import torch
 import torch.nn as nn
@@ -377,14 +354,18 @@ void gn_silu_nhwc_(torch::Tensor y, torch::Tensor w, torch::Tensor b, double eps
     }
 }
 
-torch::Tensor gn_silu_add_nchw(torch::Tensor y, torch::Tensor res,
-                               torch::Tensor w, torch::Tensor b,
-                               double eps, int64_t G_)
+// ---- L2-blocking variant: writes into a caller-provided contiguous NCHW buffer ----
+void gn_silu_add_nchw_out(torch::Tensor y, torch::Tensor res, torch::Tensor out,
+                          torch::Tensor w, torch::Tensor b,
+                          double eps, int64_t G_)
 {
     TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kFloat32, "fp32 cuda expected");
     TORCH_CHECK(y.is_contiguous(at::MemoryFormat::ChannelsLast), "channels_last expected");
     TORCH_CHECK(res.is_contiguous(), "contiguous residual expected");
     TORCH_CHECK(res.sizes() == y.sizes(), "shape mismatch");
+    TORCH_CHECK(out.is_contiguous(), "contiguous destination expected");
+    TORCH_CHECK(out.sizes() == y.sizes(), "dest shape mismatch");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat32, "fp32 dest expected");
     int B = (int)y.size(0), C = (int)y.size(1), G = (int)G_;
     long H = y.size(2), W = y.size(3), HW = H * W;
     TORCH_CHECK(C % G == 0, "C%G");
@@ -395,7 +376,6 @@ torch::Tensor gn_silu_add_nchw(torch::Tensor y, torch::Tensor res,
     torch::Tensor mean, rstd;
     compute_stats(y.data_ptr<float>(), B, C, HW, G, eps, y.options(), mean, rstd);
 
-    auto out = torch::empty({B, C, H, W}, res.options());
     dim3 block(TILE, TROWS);
     dim3 grid((unsigned)((HW + TILE - 1) / TILE), (unsigned)((C + TILE - 1) / TILE), (unsigned)B);
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -404,6 +384,14 @@ torch::Tensor gn_silu_add_nchw(torch::Tensor y, torch::Tensor res,
         mean.data_ptr<float>(), rstd.data_ptr<float>(),
         wc.data_ptr<float>(), bc.data_ptr<float>(), C, HW, G, CPG);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor gn_silu_add_nchw(torch::Tensor y, torch::Tensor res,
+                               torch::Tensor w, torch::Tensor b,
+                               double eps, int64_t G_)
+{
+    auto out = torch::empty({y.size(0), y.size(1), y.size(2), y.size(3)}, res.options());
+    gn_silu_add_nchw_out(y, res, out, w, b, eps, G_);
     return out;
 }
 '''
@@ -411,15 +399,17 @@ torch::Tensor gn_silu_add_nchw(torch::Tensor y, torch::Tensor res,
 _CPP_SRC = r'''
 torch::Tensor nchw_to_nhwc(torch::Tensor x);
 void gn_silu_nhwc_(torch::Tensor y, torch::Tensor w, torch::Tensor b, double eps, int64_t G_);
+void gn_silu_add_nchw_out(torch::Tensor y, torch::Tensor res, torch::Tensor out,
+                          torch::Tensor w, torch::Tensor b, double eps, int64_t G_);
 torch::Tensor gn_silu_add_nchw(torch::Tensor y, torch::Tensor res, torch::Tensor w,
                                torch::Tensor b, double eps, int64_t G_);
 '''
 
 _ext = load_inline(
-    name="sol002_gn_silu_res_fused",
+    name="sol002_gn_silu_res_fused_l2",
     cpp_sources=_CPP_SRC,
     cuda_sources=_CUDA_SRC,
-    functions=["nchw_to_nhwc", "gn_silu_nhwc_", "gn_silu_add_nchw"],
+    functions=["nchw_to_nhwc", "gn_silu_nhwc_", "gn_silu_add_nchw_out", "gn_silu_add_nchw"],
     verbose=False,
     extra_cflags=["-O3", "-std=c++20"],
     extra_cuda_cflags=[
@@ -436,13 +426,37 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
 
 _NUM_GROUPS = 32
+# Target live-working-set per intermediate tensor so it stays resident in L2.
+_L2_TARGET_BYTES = 24 * 1024 * 1024
+# Minimum pixels per conv launch to keep >= ~170 CTAs busy.
+_MIN_CONV_PIXELS = 8192
+
+
+def _pick_chunk(B, HW, img_bytes):
+    """Largest divisor d of B with d*img_bytes <= _L2_TARGET_BYTES, grown until
+    d*HW >= _MIN_CONV_PIXELS (conv parallelism guard)."""
+    cap = _L2_TARGET_BYTES // max(img_bytes, 1)
+    if cap >= B or cap < 1:
+        return B
+    divs = [d for d in range(1, B + 1) if B % d == 0]
+    cands = [d for d in divs if d <= cap]
+    chunk = max(cands) if cands else B
+    if chunk * HW < _MIN_CONV_PIXELS:
+        for d in divs:
+            if d >= chunk and d * HW >= _MIN_CONV_PIXELS:
+                chunk = d
+                break
+        else:
+            chunk = B
+    return chunk
 
 
 class ModelNew(nn.Module):
-    """See header comment: granularity (C) — GN stats / affine+SiLU / residual / layout
-    conversions are custom CUDA; the two 3x3 convolutions stay on the vendor TF32 NHWC
-    implicit-GEMM (already ~roofline), fed directly in channels_last so cuDNN performs no
-    internal layout copies."""
+    """Granularity (C) fusion + L2 cache blocking: GN stats / affine+SiLU / residual /
+    layout conversions are custom CUDA; the two 3x3 convolutions stay on the vendor TF32
+    NHWC implicit-GEMM, fed directly in channels_last.  The whole chain is executed on
+    batch sub-chunks so each intermediate tensor stays L2-resident across the kernels that
+    consume it."""
 
     def __init__(self):
         super().__init__()
@@ -453,27 +467,43 @@ class ModelNew(nn.Module):
         e = float(eps.item()) if torch.is_tensor(eps) else float(eps)
 
         xc = x if x.is_contiguous() else x.contiguous()
+        B, C, H, W = xc.shape
+        HW = H * W
+        img_bytes = C * HW * xc.element_size()
 
-        # NCHW -> NHWC (custom tiled transpose); view it back as a channels_last (B,C,H,W)
-        xh = _ext.nchw_to_nhwc(xc)               # (B, H, W, C) contiguous
-        xl = xh.permute(0, 3, 1, 2)              # (B, C, H, W), channels_last strides
-
+        # --- weight layout conversions hoisted OUT of the chunk loop ---
         w1 = conv1_weight
         if not w1.is_contiguous(memory_format=torch.channels_last):
             w1 = w1.contiguous(memory_format=torch.channels_last)
-        o = F.conv2d(xl, w1, None, 1, 1)
-        if not o.is_contiguous(memory_format=torch.channels_last):
-            o = o.contiguous(memory_format=torch.channels_last)
-
-        # GroupNorm + SiLU fused, in-place on our own conv output buffer
-        _ext.gn_silu_nhwc_(o, norm1_weight, norm1_bias, e, _NUM_GROUPS)
-
         w2 = conv2_weight
         if not w2.is_contiguous(memory_format=torch.channels_last):
             w2 = w2.contiguous(memory_format=torch.channels_last)
-        o2 = F.conv2d(o, w2, None, 1, 1)
-        if not o2.is_contiguous(memory_format=torch.channels_last):
-            o2 = o2.contiguous(memory_format=torch.channels_last)
 
-        # GroupNorm + SiLU + residual add + NHWC->NCHW, one fused tiled kernel
-        return _ext.gn_silu_add_nchw(o2, xc, norm2_weight, norm2_bias, e, _NUM_GROUPS)
+        chunk = _pick_chunk(B, HW, img_bytes)
+
+        out = torch.empty_like(xc)
+
+        for n0 in range(0, B, chunk):
+            cs = min(chunk, B - n0)
+            xs = xc.narrow(0, n0, cs)                 # contiguous NCHW slice
+
+            # NCHW -> NHWC (custom tiled transpose); view back as channels_last (B,C,H,W)
+            xh = _ext.nchw_to_nhwc(xs)                # (cs, H, W, C) contiguous
+            xl = xh.permute(0, 3, 1, 2)               # channels_last strides
+
+            o = F.conv2d(xl, w1, None, 1, 1)
+            if not o.is_contiguous(memory_format=torch.channels_last):
+                o = o.contiguous(memory_format=torch.channels_last)
+
+            # GroupNorm + SiLU fused, in-place on our own conv output buffer
+            _ext.gn_silu_nhwc_(o, norm1_weight, norm1_bias, e, _NUM_GROUPS)
+
+            o2 = F.conv2d(o, w2, None, 1, 1)
+            if not o2.is_contiguous(memory_format=torch.channels_last):
+                o2 = o2.contiguous(memory_format=torch.channels_last)
+
+            # GroupNorm + SiLU + residual + NHWC->NCHW into the preallocated destination
+            _ext.gn_silu_add_nchw_out(o2, xs, out.narrow(0, n0, cs),
+                                      norm2_weight, norm2_bias, e, _NUM_GROUPS)
+
+        return out
