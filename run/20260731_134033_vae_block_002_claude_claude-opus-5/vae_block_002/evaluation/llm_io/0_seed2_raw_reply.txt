@@ -1,0 +1,392 @@
+```python
+# ==========================================================================
+# ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# HEADER (required):
+# 1) Chosen granularity: (C) — fuse many ops into one/few custom kernels,
+#    keeping the vendor convolution (cuDNN) as the GEMM engine.
+# 2) Ops replaced by custom CUDA:
+#      - the implicit NCHW->NHWC / NHWC->NCHW layout conversions that cuDNN
+#        was doing internally (164.9us + 143.5us in the reference profile),
+#      - both GroupNorm statistic passes (RowwiseMoments + ComputeFusedParams),
+#      - both GroupNorm affine applications,
+#      - both SiLU elementwise kernels,
+#      - the final residual add.
+# 3) Fusion map:
+#      k_nchw2nhwc      : x (NCHW) -> NHWC, shared-mem tiled transpose (both
+#                         sides coalesced) so cuDNN can run its native NHWC
+#                         TF32 kernel with zero internal layout conversions.
+#      k_gn_partial     : per-(batch,group) segmented sum / sumsq over NHWC.
+#      k_gn_finalize    : partials -> mean/rstd (double accumulate).
+#      k_gn_silu_nhwc   : (norm * gamma + beta) -> SiLU, float4 vectorised,
+#                         stays in NHWC = fuses GN-affine + SiLU for stage 1.
+#      k_gn_silu_res_t  : stage-2 GN-affine + SiLU + residual add + NHWC->NCHW
+#                         transpose, ALL in one shared-mem tiled kernel, so the
+#                         output layout conversion costs nothing extra.
+#      at::conv2d       : both 3x3 convolutions (cuDNN NHWC TF32) called from
+#                         inside the load_inline extension.
+# 4) What stays in PyTorch and why:
+#      - conv2d itself: vendor tensor-core implicit-GEMM is at/near roofline;
+#        we only own its prologue/epilogue (layout + norm + act + residual).
+#      - weight channels_last packing: 2.4MB one-shot copy, negligible.
+#      - a pure-PyTorch fallback path for shapes with channels != 256 or
+#        non-CUDA/non-fp32 inputs (kernels are specialised for C=256, G=32).
+#
+# Precision policy: everything is float32 storage + float32/double reductions.
+# TF32 for the convs only, which is exactly what the reference does.
+# ==========================================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+
+#define CH 256
+#define NGROUPS 32
+#define CPG 8
+#define PIXCHUNK 128
+
+// ---------------------------------------------------------------- transpose in
+// NCHW -> NHWC, 32(channel) x 32(pixel) shared tile, both sides coalesced.
+__global__ void k_nchw2nhwc(const float* __restrict__ src,
+                            float* __restrict__ dst,
+                            int HW, int C) {
+    __shared__ float tile[32][33];
+    const int cbase = blockIdx.x * 32;
+    const int pbase = blockIdx.y * 32;
+    const int n     = blockIdx.z;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    // load: coalesced along pixels (NCHW contiguous dim)
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int cl = ty + r * 8;
+        int c  = cbase + cl;
+        int p  = pbase + tx;
+        float v = 0.f;
+        if (p < HW) v = src[((size_t)n * C + c) * HW + p];
+        tile[cl][tx] = v;
+    }
+    __syncthreads();
+    // store: coalesced along channels (NHWC contiguous dim)
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int pl = ty + r * 8;
+        int p  = pbase + pl;
+        if (p < HW) {
+            dst[((size_t)n * HW + p) * C + cbase + tx] = tile[tx][pl];
+        }
+    }
+}
+
+// ---------------------------------------------------------------- GN partials
+// One thread per channel (256 threads). Each block owns PIXCHUNK pixels.
+__global__ void k_gn_partial(const float* __restrict__ y,
+                             float* __restrict__ psum,
+                             float* __restrict__ psq,
+                             int HW, int nseg) {
+    const int seg = blockIdx.x;
+    const int n   = blockIdx.y;
+    const int c   = threadIdx.x;              // 0..255
+
+    int p0 = seg * PIXCHUNK;
+    int p1 = p0 + PIXCHUNK; if (p1 > HW) p1 = HW;
+
+    float s = 0.f, sq = 0.f;
+    if (p0 < HW) {
+        const float* base = y + (size_t)n * HW * CH + (size_t)p0 * CH + c;
+        for (int p = p0; p < p1; ++p) {
+            float v = base[(size_t)(p - p0) * CH];
+            s  += v;
+            sq += v * v;
+        }
+    }
+    // reduce over the 8 lanes forming one group
+    #pragma unroll
+    for (int off = 1; off < CPG; off <<= 1) {
+        s  += __shfl_xor_sync(0xffffffffu, s,  off);
+        sq += __shfl_xor_sync(0xffffffffu, sq, off);
+    }
+    if ((c & (CPG - 1)) == 0) {
+        int g = c >> 3;
+        size_t o = ((size_t)n * NGROUPS + g) * nseg + seg;
+        psum[o] = s;
+        psq[o]  = sq;
+    }
+}
+
+__global__ void k_gn_finalize(const float* __restrict__ psum,
+                              const float* __restrict__ psq,
+                              float* __restrict__ mean,
+                              float* __restrict__ rstd,
+                              int nseg, double count, double eps) {
+    const int bg = blockIdx.x;            // n * NGROUPS + g
+    const int tid = threadIdx.x;
+    __shared__ double sh_s[256];
+    __shared__ double sh_q[256];
+
+    double s = 0.0, q = 0.0;
+    const float* ps = psum + (size_t)bg * nseg;
+    const float* pq = psq  + (size_t)bg * nseg;
+    for (int i = tid; i < nseg; i += blockDim.x) {
+        s += (double)ps[i];
+        q += (double)pq[i];
+    }
+    sh_s[tid] = s; sh_q[tid] = q;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) { sh_s[tid] += sh_s[tid + stride]; sh_q[tid] += sh_q[tid + stride]; }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        double m = sh_s[0] / count;
+        double v = sh_q[0] / count - m * m;
+        if (v < 0.0) v = 0.0;
+        mean[bg] = (float)m;
+        rstd[bg] = (float)(1.0 / sqrt(v + eps));
+    }
+}
+
+// ------------------------------------------------- GN affine + SiLU (NHWC out)
+__global__ void k_gn_silu_nhwc(const float* __restrict__ y,
+                               float* __restrict__ out,
+                               const float* __restrict__ mean,
+                               const float* __restrict__ rstd,
+                               const float* __restrict__ gamma,
+                               const float* __restrict__ beta,
+                               long elems4_per_img) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= elems4_per_img) return;
+    const int n = blockIdx.y;
+    const int c = (int)((i & 63L) * 4L);
+    const int g = c >> 3;
+    const float m  = mean[n * NGROUPS + g];
+    const float rs = rstd[n * NGROUPS + g];
+
+    size_t off = (size_t)n * (size_t)elems4_per_img;
+    float4 v  = reinterpret_cast<const float4*>(y)[off + i];
+    float4 gm = *reinterpret_cast<const float4*>(gamma + c);
+    float4 bt = *reinterpret_cast<const float4*>(beta  + c);
+
+    float a0 = (v.x - m) * rs * gm.x + bt.x;
+    float a1 = (v.y - m) * rs * gm.y + bt.y;
+    float a2 = (v.z - m) * rs * gm.z + bt.z;
+    float a3 = (v.w - m) * rs * gm.w + bt.w;
+
+    float4 o;
+    o.x = a0 / (1.f + expf(-a0));
+    o.y = a1 / (1.f + expf(-a1));
+    o.z = a2 / (1.f + expf(-a2));
+    o.w = a3 / (1.f + expf(-a3));
+    reinterpret_cast<float4*>(out)[off + i] = o;
+}
+
+// ------------- GN affine + SiLU + residual add + NHWC->NCHW, single kernel ----
+__global__ void k_gn_silu_res_t(const float* __restrict__ y,
+                                const float* __restrict__ res,
+                                float* __restrict__ out,
+                                const float* __restrict__ mean,
+                                const float* __restrict__ rstd,
+                                const float* __restrict__ gamma,
+                                const float* __restrict__ beta,
+                                int HW, int C) {
+    __shared__ float tile[32][33];
+    const int cbase = blockIdx.x * 32;
+    const int pbase = blockIdx.y * 32;
+    const int n     = blockIdx.z;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int c  = cbase + tx;
+    const int g  = c >> 3;
+    const float m  = mean[n * NGROUPS + g];
+    const float rs = rstd[n * NGROUPS + g];
+    const float gm = gamma[c];
+    const float bt = beta[c];
+
+    const float* yb = y + (size_t)n * HW * C;
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int pl = ty + r * 8;
+        int p  = pbase + pl;
+        float v = 0.f;
+        if (p < HW) {
+            float t = yb[(size_t)p * C + c];
+            t = (t - m) * rs * gm + bt;
+            v = t / (1.f + expf(-t));
+        }
+        tile[pl][tx] = v;
+    }
+    __syncthreads();
+    const int p = pbase + tx;
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int cl = ty + r * 8;
+        int cc = cbase + cl;
+        if (p < HW) {
+            size_t off = ((size_t)n * C + cc) * HW + p;
+            out[off] = tile[tx][cl] + res[off];
+        }
+    }
+}
+
+// ---------------------------------------------------------------- host driver
+static void gn_stats(const at::Tensor& y, int B, int HW,
+                     at::Tensor& mean, at::Tensor& rstd, double eps,
+                     cudaStream_t stream) {
+    int nseg = (HW + PIXCHUNK - 1) / PIXCHUNK;
+    auto opts = y.options();
+    at::Tensor psum = at::empty({(long)B * NGROUPS * nseg}, opts);
+    at::Tensor psq  = at::empty({(long)B * NGROUPS * nseg}, opts);
+
+    dim3 gA(nseg, B);
+    k_gn_partial<<<gA, CH, 0, stream>>>(y.data_ptr<float>(),
+                                        psum.data_ptr<float>(),
+                                        psq.data_ptr<float>(),
+                                        HW, nseg);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    k_gn_finalize<<<B * NGROUPS, 256, 0, stream>>>(psum.data_ptr<float>(),
+                                                   psq.data_ptr<float>(),
+                                                   mean.data_ptr<float>(),
+                                                   rstd.data_ptr<float>(),
+                                                   nseg, (double)HW * CPG, eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor conv1_w,
+                          torch::Tensor n1_w, torch::Tensor n1_b,
+                          torch::Tensor conv2_w,
+                          torch::Tensor n2_w, torch::Tensor n2_b,
+                          double eps) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat, "fp32 cuda only");
+    TORCH_CHECK(x.dim() == 4 && x.size(1) == CH, "expects (B,256,H,W)");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    at::Tensor xc = x.is_contiguous() ? x : x.contiguous();
+    const int B = (int)xc.size(0);
+    const int C = (int)xc.size(1);
+    const int H = (int)xc.size(2);
+    const int W = (int)xc.size(3);
+    const int HW = H * W;
+
+    auto cl = at::MemoryFormat::ChannelsLast;
+    at::Tensor xn = at::empty({B, C, H, W}, xc.options().memory_format(cl));
+
+    dim3 blk(32, 8);
+    dim3 gT(C / 32, (HW + 31) / 32, B);
+    k_nchw2nhwc<<<gT, blk, 0, stream>>>(xc.data_ptr<float>(), xn.data_ptr<float>(), HW, C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    at::Tensor w1 = conv1_w.contiguous(cl);
+    at::Tensor w2 = conv2_w.contiguous(cl);
+
+    at::Tensor y1 = at::conv2d(xn, w1, {}, {1, 1}, {1, 1}, {1, 1}, 1);
+    if (!y1.is_contiguous(cl)) y1 = y1.contiguous(cl);
+
+    auto fopt = xc.options();
+    at::Tensor mean = at::empty({(long)B * NGROUPS}, fopt);
+    at::Tensor rstd = at::empty({(long)B * NGROUPS}, fopt);
+    gn_stats(y1, B, HW, mean, rstd, eps, stream);
+
+    at::Tensor z1 = at::empty({B, C, H, W}, fopt.memory_format(cl));
+    long elems4 = (long)HW * (CH / 4);
+    {
+        int threads = 256;
+        dim3 g((unsigned)((elems4 + threads - 1) / threads), (unsigned)B);
+        k_gn_silu_nhwc<<<g, threads, 0, stream>>>(y1.data_ptr<float>(),
+                                                  z1.data_ptr<float>(),
+                                                  mean.data_ptr<float>(),
+                                                  rstd.data_ptr<float>(),
+                                                  n1_w.contiguous().data_ptr<float>(),
+                                                  n1_b.contiguous().data_ptr<float>(),
+                                                  elems4);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    at::Tensor y2 = at::conv2d(z1, w2, {}, {1, 1}, {1, 1}, {1, 1}, 1);
+    if (!y2.is_contiguous(cl)) y2 = y2.contiguous(cl);
+
+    at::Tensor mean2 = at::empty({(long)B * NGROUPS}, fopt);
+    at::Tensor rstd2 = at::empty({(long)B * NGROUPS}, fopt);
+    gn_stats(y2, B, HW, mean2, rstd2, eps, stream);
+
+    at::Tensor out = at::empty({B, C, H, W}, fopt);   // NCHW contiguous
+    k_gn_silu_res_t<<<gT, blk, 0, stream>>>(y2.data_ptr<float>(),
+                                            xc.data_ptr<float>(),
+                                            out.data_ptr<float>(),
+                                            mean2.data_ptr<float>(),
+                                            rstd2.data_ptr<float>(),
+                                            n2_w.contiguous().data_ptr<float>(),
+                                            n2_b.contiguous().data_ptr<float>(),
+                                            HW, C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+"""
+
+_CPP_SRC = r"""
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor conv1_w,
+                          torch::Tensor n1_w, torch::Tensor n1_b,
+                          torch::Tensor conv2_w,
+                          torch::Tensor n2_w, torch::Tensor n2_b,
+                          double eps);
+"""
+
+_ext = load_inline(
+    name="vae_resblock_fused_v1",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["fused_block"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_90,code=sm_90",
+    ],
+)
+
+# cuDNN autotune helps pick the best NHWC TF32 implicit-GEMM per shape.
+torch.backends.cudnn.benchmark = True
+
+
+class ModelNew(nn.Module):
+    """See header comment at top of file for the granularity/fusion plan."""
+
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+
+    @torch.no_grad()
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        if (x.is_cuda and x.dtype == torch.float32 and x.dim() == 4
+                and x.size(1) == 256):
+            return self.ext.fused_block(x, conv1_weight, norm1_weight, norm1_bias,
+                                        conv2_weight, norm2_weight, norm2_bias,
+                                        float(eps))
+        # Fallback: shapes/dtypes the specialised kernels do not cover.
+        num_groups = 32
+        residual = x
+        out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, num_groups, weight=norm1_weight, bias=norm1_bias, eps=eps)
+        out = F.silu(out)
+        out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, num_groups, weight=norm2_weight, bias=norm2_bias, eps=eps)
+        out = F.silu(out)
+        return out + residual
+```

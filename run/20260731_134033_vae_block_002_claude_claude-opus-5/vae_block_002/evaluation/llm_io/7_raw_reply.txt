@@ -1,0 +1,936 @@
+**Section A – Checklist evidence (plan-to-code mapping)**
+
+Plan item 1: Keep cuDNN autotune (NHWC TF32, benchmark) + L2-resident chunk loop; capture once per (shape,dtype,device,eps) key with 8-entry cache.
+Implemented in code: `detail::ensure_bm()` + `cudnn_conv_dispatch(..., benchmark=true, allow_tf32=true)` inside `chunk_pipeline`; chunk loop now baked into the captured graph; `ModelNew.forward` key `(shape,dtype,dev,eps)` and `self._state` cap-8 logic.
+
+Plan item 2: `plan_chunk` target_live 40MB→20MB, guard `chunk*HW<16384`→`<8192`, keep divisor snap, also return NC.
+Implemented in code: `plan_chunk` (constant `target_live`, guard loop, `NC = N/chunk`, now returns a 4-tuple).
+
+Plan item 3: Two parity buffer sets + static_x / static_out + static weight clones.
+Implemented in code: `ModelNew._build_pipeline` (`bufs[p] = {x_cl,z,part,scale,shift}`, `static_x`, `static_out`, `w1c/w2c/n1w/n1b/n2w/n2b` clones).
+
+Plan item 4: C++ `chunk_pipeline(...)` enqueuing K1→conv1→gn_partial→gn_finalize→gn_silu→conv2→gn_partial→gn_finalize→K5 on the current stream only, no sync/memcpy.
+Implemented in code: new `chunk_pipeline` host function in `_CUDA_SRC` (parity chosen by which buffer set is passed).
+
+Plan item 5: Warmup on side streams s0,s1, 3× each, then synchronize.
+Implemented in code: `_build_pipeline` warmup loop `for p,s in ((0,s0),(1,s1))` + `torch.cuda.synchronize(dev)`.
+
+Plan item 6: Capture with fresh pool, fork `s0/s1.wait_stream(cap_s)`, per-chunk `with torch.cuda.stream(s[c%2])`, join back.
+Implemented in code: `_build_pipeline` capture block (`torch.cuda.graph(g, pool=pool, stream=cap_s)` + fork/join wait_stream calls).
+
+Plan item 7: Hazard comments (parity-private buffers, per-stream allocator blocks) and `set_l2_window(z[0])` on cap_s, s0, s1.
+Implemented in code: comment block above the capture + three `self._ext.set_l2_window(bufs[0]["z"])` calls under `with torch.cuda.stream(...)`.
+
+Plan item 8: forward copies 6 params + `static_x.copy_`, `g.replay()`, `out = empty_like; out.copy_(static_out)`; no Python chunk loop / no recapture.
+Implemented in code: `ModelNew.forward` `mode == "pipe"` branch.
+
+Plan item 9: K1/K5 kernel bodies, block (32,8), grid ((HW+31)/32, C/32, chunk), `p < HW` guard unchanged.
+Implemented in code: `nchw2nhwc_kernel` / `gn_silu_res_t_kernel` untouched; identical `t_blk`/`t_grd` inside `chunk_pipeline`.
+
+Plan item 10: try/except in `_build`, fall back to single-stream interior graph, then to `fused_block`.
+Implemented in code: `_build_pipeline` try/except → `_build_interior` try/except → `fused_block` branch in `forward`.
+
+=== KERNEL CODE STARTS BELOW ===
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r'''
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/Context.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <vector>
+#include <tuple>
+#include <algorithm>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
+#include <cstring>
+
+namespace {
+
+constexpr int CC  = 256;          // channels (const in the SOL definition)
+constexpr int GG  = 32;           // groups   (const in the SOL definition)
+constexpr int CPG = CC / GG;      // 8 channels per group
+
+// ---------------------------------------------------------------- K1: NCHW -> NHWC
+// plan item 9: body / block shape / grid / bounds guard are UNCHANGED.
+__global__ void nchw2nhwc_kernel(const float* __restrict__ src,
+                                 float* __restrict__ dst,
+                                 int HW) {
+    __shared__ float tile[32][33];
+    const int p0 = blockIdx.x * 32;
+    const int c0 = blockIdx.y * 32;
+    const int n  = blockIdx.z;
+    const float* s = src + (size_t)n * (size_t)CC * (size_t)HW;
+    float*       d = dst + (size_t)n * (size_t)HW * (size_t)CC;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int c = c0 + ty + 8 * k;
+        const int p = p0 + tx;
+        float v = 0.f;
+        if (p < HW) v = s[(size_t)c * (size_t)HW + p];
+        tile[ty + 8 * k][tx] = v;            // tile[c_local][p_local]
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int p = p0 + ty + 8 * k;
+        const int c = c0 + tx;
+        if (p < HW) d[(size_t)p * (size_t)CC + c] = tile[tx][ty + 8 * k];
+    }
+}
+
+// ------------------------------------------------- K2: per-(n,group) partial moments
+__global__ void gn_partial_kernel(const float* __restrict__ y,
+                                  double2* __restrict__ part,
+                                  int HW, int nchunks, int ppc) {
+    const int n  = blockIdx.y;
+    const int ch = blockIdx.x;
+    const int c  = threadIdx.x;
+
+    const int pstart = ch * ppc;
+    int pend = pstart + ppc;
+    if (pend > HW) pend = HW;
+
+    const float* base = y + (size_t)n * (size_t)HW * (size_t)CC + c;
+
+    double s = 0.0, ss = 0.0;
+    int p = pstart;
+    for (; p + 3 < pend; p += 4) {
+        float v0 = base[(size_t)(p    ) * CC];
+        float v1 = base[(size_t)(p + 1) * CC];
+        float v2 = base[(size_t)(p + 2) * CC];
+        float v3 = base[(size_t)(p + 3) * CC];
+        s  += (double)v0 + (double)v1 + (double)v2 + (double)v3;
+        ss += (double)v0 * (double)v0 + (double)v1 * (double)v1
+            + (double)v2 * (double)v2 + (double)v3 * (double)v3;
+    }
+    for (; p < pend; ++p) {
+        float v = base[(size_t)p * CC];
+        s  += (double)v;
+        ss += (double)v * (double)v;
+    }
+
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+        s  += __shfl_down_sync(0xffffffffu, s,  off);
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    }
+    if ((c & (CPG - 1)) == 0) {
+        const int g = c >> 3;
+        part[(size_t)(n * GG + g) * (size_t)nchunks + ch] = make_double2(s, ss);
+    }
+}
+
+// ------------------------------------------- K3: partials -> per-(n,c) scale / shift
+__global__ void gn_finalize_kernel(const double2* __restrict__ part,
+                                   const float* __restrict__ gamma,
+                                   const float* __restrict__ beta,
+                                   float* __restrict__ scale,
+                                   float* __restrict__ shift,
+                                   int nchunks, double M, double eps) {
+    __shared__ double sm_s[128];
+    __shared__ double sm_ss[128];
+    const int ng  = blockIdx.x;          // n * GG + g
+    const int tid = threadIdx.x;
+
+    double s = 0.0, ss = 0.0;
+    for (int i = tid; i < nchunks; i += 128) {
+        double2 v = part[(size_t)ng * (size_t)nchunks + i];
+        s  += v.x;
+        ss += v.y;
+    }
+    sm_s[tid] = s; sm_ss[tid] = ss;
+    __syncthreads();
+    for (int st = 64; st > 0; st >>= 1) {
+        if (tid < st) { sm_s[tid] += sm_s[tid + st]; sm_ss[tid] += sm_ss[tid + st]; }
+        __syncthreads();
+    }
+    if (tid < CPG) {
+        const double mean = sm_s[0] / M;
+        double var = sm_ss[0] / M - mean * mean;
+        if (!(var > 0.0)) var = 0.0;
+        const double rstd = 1.0 / sqrt(var + eps);
+        const int g = ng % GG;
+        const int n = ng / GG;
+        const int c = g * CPG + tid;
+        const double gm = (double)gamma[c];
+        const double bt = (double)beta[c];
+        scale[n * CC + c] = (float)(rstd * gm);
+        shift[n * CC + c] = (float)(bt - mean * rstd * gm);
+    }
+}
+
+// ------------------------------------------------ K4: GN-affine + SiLU (NHWC -> NHWC)
+__global__ void gn_silu_kernel(const float* __restrict__ y,
+                               const float* __restrict__ scale,
+                               const float* __restrict__ shift,
+                               float* __restrict__ out,
+                               long HW) {
+    __shared__ float ssc[CC];
+    __shared__ float ssh[CC];
+    const int n = blockIdx.y;
+    const int tid = threadIdx.x;
+    ssc[tid] = scale[n * CC + tid];
+    ssh[tid] = shift[n * CC + tid];
+    __syncthreads();
+
+    const float4* yp = reinterpret_cast<const float4*>(y   + (size_t)n * (size_t)HW * CC);
+    float4*       op = reinterpret_cast<float4*>      (out + (size_t)n * (size_t)HW * CC);
+    const long nq = HW * (long)(CC / 4);
+
+    for (long q = (long)blockIdx.x * blockDim.x + tid; q < nq;
+         q += (long)gridDim.x * blockDim.x) {
+        const int cq = (int)(q & (long)(CC / 4 - 1));
+        const float4 v  = yp[q];
+        const float sc0 = ssc[cq * 4 + 0], sh0 = ssh[cq * 4 + 0];
+        const float sc1 = ssc[cq * 4 + 1], sh1 = ssh[cq * 4 + 1];
+        const float sc2 = ssc[cq * 4 + 2], sh2 = ssh[cq * 4 + 2];
+        const float sc3 = ssc[cq * 4 + 3], sh3 = ssh[cq * 4 + 3];
+        float t0 = fmaf(v.x, sc0, sh0);
+        float t1 = fmaf(v.y, sc1, sh1);
+        float t2 = fmaf(v.z, sc2, sh2);
+        float t3 = fmaf(v.w, sc3, sh3);
+        float4 r;
+        r.x = t0 / (1.0f + expf(-t0));
+        r.y = t1 / (1.0f + expf(-t1));
+        r.z = t2 / (1.0f + expf(-t2));
+        r.w = t3 / (1.0f + expf(-t3));
+        op[q] = r;
+    }
+}
+
+// ------------ K5: GN-affine + SiLU + residual add + NHWC -> NCHW transpose (one pass)
+// plan item 9: body / block shape / grid / bounds guard are UNCHANGED.
+__global__ void gn_silu_res_t_kernel(const float* __restrict__ y,
+                                     const float* __restrict__ xres,   // NCHW contiguous
+                                     const float* __restrict__ scale,
+                                     const float* __restrict__ shift,
+                                     float* __restrict__ out,          // NCHW contiguous
+                                     int HW) {
+    __shared__ float tile[32][33];
+    const int p0 = blockIdx.x * 32;
+    const int c0 = blockIdx.y * 32;
+    const int n  = blockIdx.z;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const float* yb = y + (size_t)n * (size_t)HW * (size_t)CC;
+    const float* sc_b = scale + n * CC;
+    const float* sh_b = shift + n * CC;
+
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int p = p0 + ty + 8 * k;
+        const int c = c0 + tx;
+        float t = 0.f;
+        if (p < HW) {
+            const float v = yb[(size_t)p * (size_t)CC + c];
+            t = fmaf(v, sc_b[c], sh_b[c]);
+            t = t / (1.0f + expf(-t));
+        }
+        tile[tx][ty + 8 * k] = t;          // tile[c_local][p_local]
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int c = c0 + ty + 8 * k;
+        const int p = p0 + tx;
+        if (p < HW) {
+            const size_t off = ((size_t)n * CC + c) * (size_t)HW + p;
+            out[off] = tile[ty + 8 * k][tx] + xres[off];
+        }
+    }
+}
+
+} // namespace
+
+// ------------------------------------------------------------- cudnn_algo_autotune
+namespace detail {
+
+template <class... Args>
+auto cudnn_conv_dispatch(int, Args&&... args)
+    -> decltype(at::cudnn_convolution(std::forward<Args>(args)...)) {
+    return at::cudnn_convolution(std::forward<Args>(args)...);
+}
+
+template <class... Args>
+at::Tensor cudnn_conv_dispatch(long, Args&&...) {
+    throw std::runtime_error("at::cudnn_convolution unavailable with this signature");
+}
+
+template <class Ctx>
+auto set_bm_limit(Ctx& c, int v, int) -> decltype(c.setBenchmarkLimitCuDNN(v), void()) {
+    c.setBenchmarkLimitCuDNN(v);
+}
+template <class Ctx>
+void set_bm_limit(Ctx&, int, long) {}
+
+inline void ensure_bm() {
+    static const bool _bm_init = [](){
+        at::globalContext().setBenchmarkCuDNN(true);
+        set_bm_limit(at::globalContext(), 16, 0);
+        return true;
+    }();
+    (void)_bm_init;
+}
+
+} // namespace detail
+
+// ================= plan item 2: chunk / reduction-schedule planning ================
+// target_live halved (40MB -> 20MB) because TWO chunk working sets are now live
+// concurrently (parity double buffering), so the total L2 footprint is unchanged.
+// The conv-efficiency guard is relaxed from chunk*HW < 16384 to < 8192.
+// Returns (chunk, nchunks, ppc, NC) with NC = N / chunk.
+std::tuple<int64_t, int64_t, int64_t, int64_t> plan_chunk(int64_t N, int64_t C,
+                                                          int64_t H, int64_t W) {
+    detail::ensure_bm();
+    const int64_t HW = H * W;
+    const int64_t per_sample_bytes = C * HW * 4;
+    const int64_t target_live      = (int64_t)20 << 20;   // half of the old 40 MB
+
+    int64_t chunk = target_live / (2 * per_sample_bytes); // two intermediates live
+    if (chunk < 1) chunk = 1;
+    if (chunk > N) chunk = N;
+    while (N % chunk) --chunk;                            // snap DOWN to a divisor of N
+    while (chunk * HW < 8192 && chunk < N) {              // relaxed conv-efficiency guard
+        ++chunk;
+        while (N % chunk) ++chunk;                        // next divisor of N
+    }
+    if (N * per_sample_bytes <= target_live) chunk = N;
+    TORCH_CHECK(N % chunk == 0, "chunk must divide N");
+
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int min_ppc = 32;
+    long nc = ((long)8 * sms + chunk - 1) / chunk;
+    const long max_nc = (HW + min_ppc - 1) / min_ppc;
+    if (nc > max_nc) nc = max_nc;
+    if (nc < 1) nc = 1;
+    const int ppc     = (int)((HW + nc - 1) / nc);
+    const int nchunks = (int)((HW + ppc - 1) / ppc);
+
+    return std::make_tuple(chunk, (int64_t)nchunks, (int64_t)ppc, (int64_t)(N / chunk));
+}
+
+// ================= plan item 7: persisting-L2 window on the CURRENT stream ==========
+bool set_l2_window(torch::Tensor z) {
+    static const size_t max_win = [](){
+        const auto* p = at::cuda::getCurrentDeviceProperties();
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                           (size_t)p->persistingL2CacheMaxSize);
+        cudaGetLastError();
+        return (size_t)p->accessPolicyMaxWindowSize;
+    }();
+    const size_t win_bytes = (size_t)z.numel() * (size_t)z.element_size();
+    if (win_bytes > max_win || win_bytes > ((size_t)30 << 20)) return false;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamAttrValue av;
+    memset(&av, 0, sizeof(av));
+    av.accessPolicyWindow.base_ptr  = z.data_ptr();
+    av.accessPolicyWindow.num_bytes = win_bytes;
+    av.accessPolicyWindow.hitRatio  = 1.0f;
+    av.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    av.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+    const bool ok = (cudaStreamSetAttribute(stream,
+                        cudaStreamAttributeAccessPolicyWindow, &av) == cudaSuccess);
+    cudaGetLastError();
+    return ok;
+}
+
+// ================= K1 for one chunk (legacy single-stream fallback path) ===========
+void k1_chunk(torch::Tensor x, int64_t off, torch::Tensor x_cl) {
+    at::NoGradGuard no_grad;
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat && x.dim() == 4,
+                "k1_chunk: float32 CUDA NCHW expected");
+    TORCH_CHECK(x.is_contiguous(), "k1_chunk: x must be contiguous NCHW");
+    const int64_t C = x.size(1), H = x.size(2), W = x.size(3), HW = H * W;
+    const int64_t chunk = x_cl.size(0);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const float* xs = x.data_ptr<float>() + (size_t)off * (size_t)C * (size_t)HW;
+    const dim3 t_blk(32, 8);
+    const dim3 t_grd((unsigned)((HW + 31) / 32), (unsigned)(C / 32), (unsigned)chunk);
+    nchw2nhwc_kernel<<<t_grd, t_blk, 0, stream>>>(xs, x_cl.data_ptr<float>(), (int)HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ============ legacy captured interior (conv1 .. gn_finalize2) — fallback path =====
+torch::Tensor interior(torch::Tensor x_cl,
+                       torch::Tensor w1c, torch::Tensor w2c,
+                       torch::Tensor n1w, torch::Tensor n1b,
+                       torch::Tensor n2w, torch::Tensor n2b,
+                       double eps,
+                       torch::Tensor part, torch::Tensor scale, torch::Tensor shift,
+                       torch::Tensor z,
+                       int64_t nchunks, int64_t ppc, double M) {
+    at::NoGradGuard no_grad;
+    detail::ensure_bm();
+
+    const int64_t chunk = x_cl.size(0);
+    const int64_t H = x_cl.size(2), W = x_cl.size(3), HW = H * W;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+    std::vector<int64_t> stride{1, 1}, pad{1, 1}, dil{1, 1};
+
+    const long nq = HW * (long)(CC / 4);
+    int silu_blocks = (int)std::min<long>((nq + 255) / 256, (long)(6 * sms));
+    if (silu_blocks < 1) silu_blocks = 1;
+
+    at::Tensor y1;
+    try {
+        y1 = detail::cudnn_conv_dispatch(0, x_cl, w1c, pad, stride, dil,
+                                         (int64_t)1, true, false, true);
+    } catch (const std::exception&) {
+        y1 = at::conv2d(x_cl, w1c, {}, stride, pad, dil, 1);
+    }
+    if (!y1.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y1 = y1.contiguous(at::MemoryFormat::ChannelsLast);
+
+    gn_partial_kernel<<<dim3((unsigned)nchunks, (unsigned)chunk), 256, 0, stream>>>(
+        y1.data_ptr<float>(), reinterpret_cast<double2*>(part.data_ptr<double>()),
+        (int)HW, (int)nchunks, (int)ppc);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    gn_finalize_kernel<<<(unsigned)(chunk * GG), 128, 0, stream>>>(
+        reinterpret_cast<const double2*>(part.data_ptr<double>()),
+        n1w.data_ptr<float>(), n1b.data_ptr<float>(),
+        scale.data_ptr<float>(), shift.data_ptr<float>(), (int)nchunks, M, eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    gn_silu_kernel<<<dim3((unsigned)silu_blocks, (unsigned)chunk), 256, 0, stream>>>(
+        y1.data_ptr<float>(), scale.data_ptr<float>(), shift.data_ptr<float>(),
+        z.data_ptr<float>(), (long)HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    at::Tensor y2;
+    try {
+        y2 = detail::cudnn_conv_dispatch(0, z, w2c, pad, stride, dil,
+                                         (int64_t)1, true, false, true);
+    } catch (const std::exception&) {
+        y2 = at::conv2d(z, w2c, {}, stride, pad, dil, 1);
+    }
+    if (!y2.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y2 = y2.contiguous(at::MemoryFormat::ChannelsLast);
+
+    gn_partial_kernel<<<dim3((unsigned)nchunks, (unsigned)chunk), 256, 0, stream>>>(
+        y2.data_ptr<float>(), reinterpret_cast<double2*>(part.data_ptr<double>()),
+        (int)HW, (int)nchunks, (int)ppc);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    gn_finalize_kernel<<<(unsigned)(chunk * GG), 128, 0, stream>>>(
+        reinterpret_cast<const double2*>(part.data_ptr<double>()),
+        n2w.data_ptr<float>(), n2b.data_ptr<float>(),
+        scale.data_ptr<float>(), shift.data_ptr<float>(), (int)nchunks, M, eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return y2;
+}
+
+// ================= K5 for one chunk (legacy single-stream fallback path) ===========
+void k5_chunk(torch::Tensor y2, torch::Tensor x, int64_t off,
+              torch::Tensor scale, torch::Tensor shift, torch::Tensor out) {
+    at::NoGradGuard no_grad;
+    TORCH_CHECK(x.is_contiguous() && out.is_contiguous(), "k5_chunk: NCHW contiguous");
+    const int64_t C = x.size(1), H = x.size(2), W = x.size(3), HW = H * W;
+    const int64_t chunk = y2.size(0);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const float* xs = x.data_ptr<float>()   + (size_t)off * (size_t)C * (size_t)HW;
+    float*       os = out.data_ptr<float>() + (size_t)off * (size_t)C * (size_t)HW;
+
+    const dim3 t_blk(32, 8);
+    const dim3 t_grd((unsigned)((HW + 31) / 32), (unsigned)(C / 32), (unsigned)chunk);
+    gn_silu_res_t_kernel<<<t_grd, t_blk, 0, stream>>>(
+        y2.data_ptr<float>(), xs,
+        scale.data_ptr<float>(), shift.data_ptr<float>(), os, (int)HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ============== plan item 4: WHOLE per-chunk pipeline on the CURRENT stream ========
+// K1 -> conv1 -> gn_partial -> gn_finalize -> gn_silu -> conv2 -> gn_partial ->
+// gn_finalize -> K5.  Everything is enqueued on the caller's stream; there is no
+// cudaStreamSynchronize and no cudaMemcpy inside, so it is fully graph-capturable.
+// All per-chunk scratch (x_cl, z, part, scale, shift) is parity-private, supplied by
+// the caller, so two invocations with different parity on two capture streams never
+// alias (plan item 7).
+void chunk_pipeline(torch::Tensor sx, int64_t off,
+                    torch::Tensor x_cl, torch::Tensor z,
+                    torch::Tensor part, torch::Tensor scale, torch::Tensor shift,
+                    torch::Tensor w1c, torch::Tensor w2c,
+                    torch::Tensor n1w, torch::Tensor n1b,
+                    torch::Tensor n2w, torch::Tensor n2b,
+                    torch::Tensor sout,
+                    double eps, int64_t nchunks, int64_t ppc, double M) {
+    at::NoGradGuard no_grad;
+    detail::ensure_bm();
+
+    TORCH_CHECK(sx.is_cuda() && sx.scalar_type() == at::kFloat && sx.dim() == 4,
+                "chunk_pipeline: float32 CUDA NCHW expected");
+    TORCH_CHECK(sx.is_contiguous() && sout.is_contiguous(),
+                "chunk_pipeline: static_x / static_out must be contiguous NCHW");
+
+    const int64_t C = sx.size(1), H = sx.size(2), W = sx.size(3), HW = H * W;
+    const int64_t chunk = x_cl.size(0);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+    std::vector<int64_t> stride{1, 1}, pad{1, 1}, dil{1, 1};
+
+    const long nq = HW * (long)(CC / 4);
+    int silu_blocks = (int)std::min<long>((nq + 255) / 256, (long)(6 * sms));
+    if (silu_blocks < 1) silu_blocks = 1;
+
+    // ---- K1 : NCHW(static_x + off) -> NHWC(x_cl[p]) (plan item 9: unchanged) ----
+    const float* xs = sx.data_ptr<float>() + (size_t)off * (size_t)C * (size_t)HW;
+    const dim3 t_blk(32, 8);
+    const dim3 t_grd((unsigned)((HW + 31) / 32), (unsigned)(C / 32), (unsigned)chunk);
+    nchw2nhwc_kernel<<<t_grd, t_blk, 0, stream>>>(xs, x_cl.data_ptr<float>(), (int)HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // ---- conv1 (cuDNN v8, NHWC TF32, autotuned) -------------------------------
+    at::Tensor y1;
+    try {
+        y1 = detail::cudnn_conv_dispatch(0, x_cl, w1c, pad, stride, dil,
+                                         (int64_t)1,
+                                         /*benchmark=*/true,
+                                         /*deterministic=*/false,
+                                         /*allow_tf32=*/true);
+    } catch (const std::exception&) {
+        y1 = at::conv2d(x_cl, w1c, {}, stride, pad, dil, 1);
+    }
+    if (!y1.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y1 = y1.contiguous(at::MemoryFormat::ChannelsLast);
+
+    // ---- GroupNorm statistics for norm1 ---------------------------------------
+    gn_partial_kernel<<<dim3((unsigned)nchunks, (unsigned)chunk), 256, 0, stream>>>(
+        y1.data_ptr<float>(), reinterpret_cast<double2*>(part.data_ptr<double>()),
+        (int)HW, (int)nchunks, (int)ppc);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    gn_finalize_kernel<<<(unsigned)(chunk * GG), 128, 0, stream>>>(
+        reinterpret_cast<const double2*>(part.data_ptr<double>()),
+        n1w.data_ptr<float>(), n1b.data_ptr<float>(),
+        scale.data_ptr<float>(), shift.data_ptr<float>(), (int)nchunks, M, eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // ---- GN + SiLU fused into z[p] --------------------------------------------
+    gn_silu_kernel<<<dim3((unsigned)silu_blocks, (unsigned)chunk), 256, 0, stream>>>(
+        y1.data_ptr<float>(), scale.data_ptr<float>(), shift.data_ptr<float>(),
+        z.data_ptr<float>(), (long)HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // ---- conv2 (cuDNN v8, NHWC TF32, autotuned) -------------------------------
+    at::Tensor y2;
+    try {
+        y2 = detail::cudnn_conv_dispatch(0, z, w2c, pad, stride, dil,
+                                         (int64_t)1,
+                                         /*benchmark=*/true,
+                                         /*deterministic=*/false,
+                                         /*allow_tf32=*/true);
+    } catch (const std::exception&) {
+        y2 = at::conv2d(z, w2c, {}, stride, pad, dil, 1);
+    }
+    if (!y2.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y2 = y2.contiguous(at::MemoryFormat::ChannelsLast);
+
+    // ---- GroupNorm statistics for norm2 ---------------------------------------
+    gn_partial_kernel<<<dim3((unsigned)nchunks, (unsigned)chunk), 256, 0, stream>>>(
+        y2.data_ptr<float>(), reinterpret_cast<double2*>(part.data_ptr<double>()),
+        (int)HW, (int)nchunks, (int)ppc);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    gn_finalize_kernel<<<(unsigned)(chunk * GG), 128, 0, stream>>>(
+        reinterpret_cast<const double2*>(part.data_ptr<double>()),
+        n2w.data_ptr<float>(), n2b.data_ptr<float>(),
+        scale.data_ptr<float>(), shift.data_ptr<float>(), (int)nchunks, M, eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // ---- K5 : GN+SiLU+residual+transpose into static_out at off (unchanged) ----
+    float* os = sout.data_ptr<float>() + (size_t)off * (size_t)C * (size_t)HW;
+    gn_silu_res_t_kernel<<<t_grd, t_blk, 0, stream>>>(
+        y2.data_ptr<float>(), xs,
+        scale.data_ptr<float>(), shift.data_ptr<float>(), os, (int)HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ------------------------------- monolithic path (plan item 10 fallback) -----------
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor conv1_weight,
+                          torch::Tensor norm1_weight,
+                          torch::Tensor norm1_bias,
+                          torch::Tensor conv2_weight,
+                          torch::Tensor norm2_weight,
+                          torch::Tensor norm2_bias,
+                          double eps) {
+    at::NoGradGuard no_grad;
+    detail::ensure_bm();
+
+    TORCH_CHECK(x.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "float32 only");
+    TORCH_CHECK(x.dim() == 4, "expected NCHW");
+    TORCH_CHECK(x.size(1) == CC, "specialised for C=256");
+
+    const int64_t N = x.size(0), C = x.size(1), H = x.size(2), W = x.size(3);
+    const int64_t HW = H * W;
+
+    auto xc = x.is_contiguous() ? x : x.contiguous();
+    auto opts = xc.options();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int64_t chunk, nchunks64, ppc64, nc64;
+    std::tie(chunk, nchunks64, ppc64, nc64) = plan_chunk(N, C, H, W);
+    const int nchunks = (int)nchunks64;
+    const int ppc     = (int)ppc64;
+    const double M    = (double)CPG * (double)HW;
+
+    auto w1c = conv1_weight.contiguous(at::MemoryFormat::ChannelsLast);
+    auto w2c = conv2_weight.contiguous(at::MemoryFormat::ChannelsLast);
+
+    auto x_cl  = at::empty({chunk, C, H, W},
+                           opts.memory_format(at::MemoryFormat::ChannelsLast));
+    auto z     = at::empty({chunk, C, H, W},
+                           opts.memory_format(at::MemoryFormat::ChannelsLast));
+    auto part  = at::empty({(int64_t)chunk * GG * nchunks, 2}, opts.dtype(at::kDouble));
+    auto scale = at::empty({chunk, C}, opts);
+    auto shift = at::empty({chunk, C}, opts);
+    auto out   = at::empty({N, C, H, W}, opts);
+
+    auto n1w = norm1_weight.contiguous();
+    auto n1b = norm1_bias.contiguous();
+    auto n2w = norm2_weight.contiguous();
+    auto n2b = norm2_bias.contiguous();
+
+    bool win_set = false;
+    if (chunk < N) win_set = set_l2_window(z);
+
+    for (int64_t off = 0; off < N; off += chunk) {
+        k1_chunk(xc, off, x_cl);
+        auto y2 = interior(x_cl, w1c, w2c, n1w, n1b, n2w, n2b, eps,
+                           part, scale, shift, z, nchunks, ppc, M);
+        k5_chunk(y2, xc, off, scale, shift, out);
+    }
+
+    if (win_set) {
+        cudaStreamAttrValue av;
+        memset(&av, 0, sizeof(av));
+        av.accessPolicyWindow.num_bytes = 0;
+        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &av);
+        cudaGetLastError();
+    }
+    return out;
+}
+'''
+
+_CPP_SRC = r'''
+#include <tuple>
+
+std::tuple<int64_t, int64_t, int64_t, int64_t> plan_chunk(int64_t N, int64_t C,
+                                                          int64_t H, int64_t W);
+bool set_l2_window(torch::Tensor z);
+void k1_chunk(torch::Tensor x, int64_t off, torch::Tensor x_cl);
+torch::Tensor interior(torch::Tensor x_cl,
+                       torch::Tensor w1c, torch::Tensor w2c,
+                       torch::Tensor n1w, torch::Tensor n1b,
+                       torch::Tensor n2w, torch::Tensor n2b,
+                       double eps,
+                       torch::Tensor part, torch::Tensor scale, torch::Tensor shift,
+                       torch::Tensor z,
+                       int64_t nchunks, int64_t ppc, double M);
+void k5_chunk(torch::Tensor y2, torch::Tensor x, int64_t off,
+              torch::Tensor scale, torch::Tensor shift, torch::Tensor out);
+void chunk_pipeline(torch::Tensor sx, int64_t off,
+                    torch::Tensor x_cl, torch::Tensor z,
+                    torch::Tensor part, torch::Tensor scale, torch::Tensor shift,
+                    torch::Tensor w1c, torch::Tensor w2c,
+                    torch::Tensor n1w, torch::Tensor n1b,
+                    torch::Tensor n2w, torch::Tensor n2b,
+                    torch::Tensor sout,
+                    double eps, int64_t nchunks, int64_t ppc, double M);
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor conv1_weight,
+                          torch::Tensor norm1_weight,
+                          torch::Tensor norm1_bias,
+                          torch::Tensor conv2_weight,
+                          torch::Tensor norm2_weight,
+                          torch::Tensor norm2_bias,
+                          double eps);
+'''
+
+_ext = load_inline(
+    name="vae_resblock_fused_v5_pipegraph",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["plan_chunk", "set_l2_window", "k1_chunk", "interior",
+               "k5_chunk", "chunk_pipeline", "fused_block"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_90,code=sm_90",
+    ],
+)
+
+
+class ModelNew(nn.Module):
+    """Whole-forward CUDA-graph capture of a two-stream, double-buffered chunk pipeline."""
+
+    def __init__(self):
+        super().__init__()
+        self._ext = _ext
+        self._state = {}          # cap 8 entries, keyed by (shape,dtype,device,eps)
+
+    # ---------------- plan items 3-7: static buffers + multi-stream whole-forward graph
+    def _build_pipeline(self, x, w1, n1w, n1b, w2, n2w, n2b, eps):
+        try:
+            N, C, H, W = (int(x.size(0)), int(x.size(1)),
+                          int(x.size(2)), int(x.size(3)))
+            dev = x.device
+            chunk, nchunks, ppc, NC = self._ext.plan_chunk(N, C, H, W)
+            chunk, nchunks, ppc, NC = int(chunk), int(nchunks), int(ppc), int(NC)
+            M = 8.0 * float(H * W)
+            f32 = torch.float32
+
+            # ---- plan item 3: static whole-tensor in/out + TWO parity buffer sets ----
+            static_x = torch.empty((N, C, H, W), dtype=f32, device=dev)
+            static_out = torch.empty((N, C, H, W), dtype=f32, device=dev)
+            static_x.zero_()
+            static_out.zero_()
+
+            bufs = []
+            for _ in range(2):
+                bufs.append({
+                    "x_cl": torch.empty((chunk, C, H, W), dtype=f32, device=dev,
+                                        memory_format=torch.channels_last).zero_(),
+                    "z": torch.empty((chunk, C, H, W), dtype=f32, device=dev,
+                                     memory_format=torch.channels_last).zero_(),
+                    "part": torch.empty((chunk * 32 * nchunks, 2),
+                                        dtype=torch.float64, device=dev),
+                    "scale": torch.empty((chunk, C), dtype=f32, device=dev),
+                    "shift": torch.empty((chunk, C), dtype=f32, device=dev),
+                })
+
+            w1c = w1.contiguous(memory_format=torch.channels_last).clone()
+            w2c = w2.contiguous(memory_format=torch.channels_last).clone()
+            s_n1w = n1w.contiguous().clone()
+            s_n1b = n1b.contiguous().clone()
+            s_n2w = n2w.contiguous().clone()
+            s_n2b = n2b.contiguous().clone()
+
+            def args_for(p, off):
+                b = bufs[p]
+                return (static_x, int(off), b["x_cl"], b["z"], b["part"],
+                        b["scale"], b["shift"], w1c, w2c,
+                        s_n1w, s_n1b, s_n2w, s_n2b, static_out,
+                        float(eps), nchunks, ppc, M)
+
+            cur = torch.cuda.current_stream(dev)
+            s0 = torch.cuda.Stream(device=dev)
+            s1 = torch.cuda.Stream(device=dev)
+            cap_s = torch.cuda.Stream(device=dev)
+
+            # ---- plan item 5: warmup 3x on EACH side stream (locks the cuDNN plan
+            #      and pre-populates per-stream caching-allocator blocks) ------------
+            s0.wait_stream(cur)
+            s1.wait_stream(cur)
+            for p, st in ((0, s0), (1, s1)):
+                with torch.cuda.stream(st):
+                    for _ in range(3):
+                        self._ext.chunk_pipeline(*args_for(p, 0))
+            cur.wait_stream(s0)
+            cur.wait_stream(s1)
+            torch.cuda.synchronize(dev)
+
+            # ---- plan item 7: keep the L2-blocking mechanism on every stream that
+            #      will carry captured work.  Hazard note: every per-chunk buffer is
+            #      parity-private, and y1/y2/workspace come from the graph pool with a
+            #      per-stream block association in the caching allocator, so chunks on
+            #      s0 and s1 can never alias; chunks c and c+2 share a stream and are
+            #      therefore serialized correctly.
+            if chunk < N:
+                with torch.cuda.stream(cap_s):
+                    self._ext.set_l2_window(bufs[0]["z"])
+                with torch.cuda.stream(s0):
+                    self._ext.set_l2_window(bufs[0]["z"])
+                with torch.cuda.stream(s1):
+                    self._ext.set_l2_window(bufs[0]["z"])
+
+            # ---- plan item 6: capture the fork/join two-stream chunk pipeline -------
+            pool = torch.cuda.graph_pool_handle()
+            g = torch.cuda.CUDAGraph()
+            try:
+                ctx = torch.cuda.graph(g, pool=pool, stream=cap_s)
+            except TypeError:
+                ctx = torch.cuda.graph(g, pool=pool)
+            with ctx:
+                s0.wait_stream(cap_s)
+                s1.wait_stream(cap_s)
+                for c in range(NC):
+                    p = c & 1
+                    st = s0 if p == 0 else s1
+                    with torch.cuda.stream(st):
+                        self._ext.chunk_pipeline(*args_for(p, c * chunk))
+                cap_s.wait_stream(s0)
+                cap_s.wait_stream(s1)
+            torch.cuda.synchronize(dev)
+
+            return {
+                "mode": "pipe", "g": g, "pool": pool, "chunk": chunk, "NC": NC,
+                "static_x": static_x, "static_out": static_out, "bufs": bufs,
+                "w1c": w1c, "w2c": w2c,
+                "n1w": s_n1w, "n1b": s_n1b, "n2w": s_n2w, "n2b": s_n2b,
+                "streams": (s0, s1, cap_s),
+            }
+        except Exception:
+            return None                                        # plan item 10
+
+    # ---------------- plan item 10: previous single-stream interior-graph path -------
+    def _build_interior(self, x, w1, n1w, n1b, w2, n2w, n2b, eps):
+        try:
+            N, C, H, W = (int(x.size(0)), int(x.size(1)),
+                          int(x.size(2)), int(x.size(3)))
+            dev = x.device
+            chunk, nchunks, ppc, NC = self._ext.plan_chunk(N, C, H, W)
+            chunk, nchunks, ppc = int(chunk), int(nchunks), int(ppc)
+            M = 8.0 * float(H * W)
+
+            f32 = torch.float32
+            x_cl = torch.empty((chunk, C, H, W), dtype=f32, device=dev,
+                               memory_format=torch.channels_last)
+            z = torch.empty((chunk, C, H, W), dtype=f32, device=dev,
+                            memory_format=torch.channels_last)
+            part = torch.empty((chunk * 32 * nchunks, 2), dtype=torch.float64, device=dev)
+            scale = torch.empty((chunk, C), dtype=f32, device=dev)
+            shift = torch.empty((chunk, C), dtype=f32, device=dev)
+
+            w1c = w1.contiguous(memory_format=torch.channels_last).clone()
+            w2c = w2.contiguous(memory_format=torch.channels_last).clone()
+            s_n1w = n1w.contiguous().clone()
+            s_n1b = n1b.contiguous().clone()
+            s_n2w = n2w.contiguous().clone()
+            s_n2b = n2b.contiguous().clone()
+            x_cl.zero_()
+
+            args = (x_cl, w1c, w2c, s_n1w, s_n1b, s_n2w, s_n2b, float(eps),
+                    part, scale, shift, z, nchunks, ppc, M)
+
+            cap_s = torch.cuda.Stream(device=dev)
+            if chunk < N:
+                self._ext.set_l2_window(z)
+                with torch.cuda.stream(cap_s):
+                    self._ext.set_l2_window(z)
+
+            cur = torch.cuda.current_stream(dev)
+            s = torch.cuda.Stream(device=dev)
+            s.wait_stream(cur)
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    _ = self._ext.interior(*args)
+            cur.wait_stream(s)
+            torch.cuda.synchronize(dev)
+
+            pool = torch.cuda.graph_pool_handle()
+            g = torch.cuda.CUDAGraph()
+            try:
+                ctx = torch.cuda.graph(g, pool=pool, stream=cap_s)
+            except TypeError:
+                ctx = torch.cuda.graph(g, pool=pool)
+            with ctx:
+                y2_s = self._ext.interior(*args)
+            torch.cuda.synchronize(dev)
+
+            return {
+                "mode": "interior", "g": g, "pool": pool, "chunk": chunk,
+                "x_cl": x_cl, "z": z, "part": part,
+                "scale": scale, "shift": shift,
+                "w1c": w1c, "w2c": w2c,
+                "n1w": s_n1w, "n1b": s_n1b, "n2w": s_n2w, "n2b": s_n2b,
+                "y2": y2_s,
+            }
+        except Exception:
+            return None
+
+    def _build(self, x, w1, n1w, n1b, w2, n2w, n2b, eps):
+        st = self._build_pipeline(x, w1, n1w, n1b, w2, n2w, n2b, eps)
+        if st is not None:
+            return st
+        return self._build_interior(x, w1, n1w, n1b, w2, n2w, n2b, eps)
+
+    @torch.no_grad()
+    def forward(self,
+                x,
+                conv1_weight,
+                norm1_weight,
+                norm1_bias,
+                conv2_weight,
+                norm2_weight,
+                norm2_bias,
+                eps):
+        e = float(eps)
+        if (x.is_cuda and x.dtype == torch.float32 and x.dim() == 4
+                and x.size(1) == 256 and conv1_weight.dtype == torch.float32
+                and conv2_weight.dtype == torch.float32):
+            xc = x if x.is_contiguous() else x.contiguous()
+
+            dev_idx = xc.device.index if xc.device.index is not None else 0
+            key = (tuple(xc.shape), xc.dtype, dev_idx, e)
+            if key in self._state:
+                st = self._state[key]
+            else:
+                st = self._build(xc, conv1_weight, norm1_weight, norm1_bias,
+                                 conv2_weight, norm2_weight, norm2_bias, e)
+                if len(self._state) >= 8:
+                    self._state.clear()
+                self._state[key] = st
+
+            if st is None:
+                return self._ext.fused_block(xc, conv1_weight, norm1_weight,
+                                             norm1_bias, conv2_weight,
+                                             norm2_weight, norm2_bias, e)
+
+            # ---- steady state: copy only the ~4.7 MB of parameters ---------------
+            st["w1c"].copy_(conv1_weight)
+            st["w2c"].copy_(conv2_weight)
+            st["n1w"].copy_(norm1_weight)
+            st["n1b"].copy_(norm1_bias)
+            st["n2w"].copy_(norm2_weight)
+            st["n2b"].copy_(norm2_bias)
+
+            if st["mode"] == "pipe":
+                # ---- plan item 8: single replay of the whole forward -------------
+                st["static_x"].copy_(xc)
+                st["g"].replay()
+                out = torch.empty_like(st["static_out"])
+                out.copy_(st["static_out"])
+                return out
+
+            # ---- fallback: interior-only graph with a Python chunk loop ----------
+            out = torch.empty(xc.shape, dtype=xc.dtype, device=xc.device)
+            chunk = st["chunk"]
+            N = int(xc.size(0))
+            g = st["g"]
+            for off in range(0, N, chunk):
+                self._ext.k1_chunk(xc, off, st["x_cl"])
+                g.replay()
+                self._ext.k5_chunk(st["y2"], xc, off, st["scale"], st["shift"], out)
+            return out
+
+        # ---- fallback: exact reference semantics for unsupported configurations ----
+        residual = x
+        out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, 32, weight=norm1_weight, bias=norm1_bias, eps=e)
+        out = F.silu(out)
+        out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, 32, weight=norm2_weight, bias=norm2_bias, eps=e)
+        out = F.silu(out)
+        return out + residual
+```

@@ -31,6 +31,8 @@ from typing import List, Tuple
 
 import torch
 
+from utils import device_state
+
 # ---------------------------------------------------------------------------
 
 TORCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -682,6 +684,7 @@ def compare_and_bench(
     tol: float = 1e-4,
     log_dir: str | Path | None = "run/debug",
     seed: int = 100,  # Fixed default seed; set it to None to read the seed from the env instead
+    reject_on_state_leak: bool = True,
 ) -> Dict[str, Any]:
     """
     Benchmark *test_py* against *ref_py*.
@@ -818,6 +821,8 @@ def compare_and_bench(
             raise TypeError("get_init_inputs() must return a list/tuple (used as *args) or a dict (used as **kwargs).")
 
     # ------------ Run & benchmark ------------
+    _leaks: List[str] = []
+    _clean_state: Dict[str, Any] = {}
     try:
         ctx = torch.cuda.device(dev) if TORCH_DEVICE == "cuda" else contextlib.nullcontext()
         with ctx:
@@ -834,6 +839,17 @@ def compare_and_bench(
             # ref_model = torch.compile(ref_model)
             
             _seed_everything(seed, device_idx)
+
+            # Baseline the device-global state HERE: the harness has finished
+            # configuring itself (_seed_everything sets the cudnn/determinism
+            # flags just above) but the candidate has not been constructed or run
+            # yet. Snapshotting any earlier attributes the harness's own settings
+            # to the candidate, which false-positives on every kernel.
+            # Every reference timing below is forced back to this, so T_ref stays
+            # a constant of (task, shape, hardware) rather than something the
+            # candidate can move. See utils/device_state.py for the incident.
+            _clean_state = device_state.snapshot()
+
             test_model = ModelNew(*init_args, **init_kwargs)
             # # torch.compile speedup
             # test_model = torch.compile(test_model)   
@@ -952,7 +968,13 @@ def compare_and_bench(
                     if alloc_note:
                         raise ValueError(alloc_note)
 
-            # Timing
+            # Timing. The candidate has already executed once (correctness check
+            # above), so any state it leaked is in effect right now -- restore
+            # before measuring the reference, never after.
+            # Record the leak BEFORE restoring -- restoring erases the evidence,
+            # so an end-of-round diff would always come back clean.
+            _leaks = device_state.diff(_clean_state, device_state.snapshot())
+            device_state.restore(_clean_state)
             ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)
             test_t = _bench(test_model, inp, dev, warmup, repeat)
 
@@ -1014,6 +1036,7 @@ def compare_and_bench(
                         raise ValueError(msg)
                     if e_note:
                         raise ValueError(e_note)
+                    device_state.restore(_clean_state)   # same rule per shape
                     e_rt = _bench(ref_model,  extra, dev, warmup, repeat)
                     e_tt = _bench(test_model, extra, dev, warmup, repeat)
                     per_shape.append({
@@ -1040,10 +1063,28 @@ def compare_and_bench(
             _sp = [s["speedup"] for s in per_shape]
             score = math.exp(sum(math.log(v) for v in _sp) / len(_sp))
 
+            # The scores above are already honest -- every reference was timed
+            # from _clean_state. But a candidate that leaks device state is still
+            # not a valid solution: it degrades every other tenant of the process.
+            # _leaks was captured above, at the moment the leak was still visible.
+            _leaks += [c for c in device_state.diff(_clean_state, device_state.snapshot())
+                       if c not in _leaks]
+            if _leaks:
+                device_state.restore(_clean_state)
+                print(f"[device_state] candidate leaked: {'; '.join(_leaks)}", flush=True)
+                if reject_on_state_leak and device_state.is_fatal(_leaks):
+                    raise ValueError(device_state.leak_message(_leaks))
+
     except Exception:
         # Raise the full traceback (caught by the caller)
         import traceback as _tb
         raise RuntimeError(_tb.format_exc()) from None
+    finally:
+        # Leave the process exactly as it was found, on EVERY exit path. Without
+        # this an accuracy failure (which throws before the leak check) would let
+        # one candidate's device state reach the next kernel measured in this
+        # process -- which is precisely how paired_bench, below, could be fooled.
+        device_state.restore(_clean_state)
 
     # ------------ Result summary ------------
     result: Dict[str, Any] = {
@@ -1066,6 +1107,7 @@ def compare_and_bench(
             "all": test_t,
         },
         "num_runs": repeat,
+        "state_leak": _leaks,
         # Geometric-mean speedup across every benchmarked shape. Equals the
         # single-shape ref/test ratio when the task has no get_inputs_extra().
         "score": score,

@@ -18,6 +18,21 @@ the drift hit both equally so it cancels in the difference. Running all of one
 kernel's repeats before the other does NOT work: a clock ramp part-way through
 the sequence reads as a difference between the kernels.
 
+Rank on ABSOLUTE time, never on ``score``
+-----------------------------------------
+``score`` is ``T_ref / T_k``, and each kernel's ``T_ref`` is measured separately.
+A kernel that slows the reference down therefore outranks a kernel that is
+genuinely faster. This is not theoretical: on 2026-07-31 this tool reported
+vae_block_002 round 6 as "+9.35%, t=+7.33, REAL" over round 3, when round 6 was
+in fact 1.28x SLOWER in absolute time. Round 6 raised the persisting-L2
+reservation to 31.25 MB of the H100's 50 MB L2 and never released it, so its
+reference lost two thirds of the cache -- while round 3, measured afterwards in
+the same process, lost the cache with no access-policy window to win it back.
+The polluter was flattered twice and its rival penalised.
+
+So: ``test_ms`` is the metric. It has no denominator to corrupt. ``score`` is
+still recorded, for reading only, never for ranking.
+
 Usage
 -----
     python -m utils.paired_bench ref_0.py seed.py candidate.py --reps 3
@@ -34,6 +49,11 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from utils.compile_and_run import compare_and_bench
+
+
+def _geo(xs: List[float]) -> float:
+    """Geometric mean, so no single shape dominates by being large."""
+    return math.exp(sum(math.log(x) for x in xs) / len(xs))
 
 
 def _welch(a: List[float], b: List[float]) -> Dict[str, float]:
@@ -63,11 +83,17 @@ def run(reference: Path, kernels: List[Path], reps: int, device: int,
     samples: Dict[str, List[Dict[str, Any]]] = {k.stem: [] for k in kernels}
     for r in range(reps):
         for k in kernels:
+            # Diagnostic tool: measure and REPORT a leaking kernel rather than
+            # refuse it. compare_and_bench still restores state after each call,
+            # so one kernel's leak cannot reach the next one measured here.
             res = compare_and_bench(reference, k, device_idx=device,
-                                    warmup=warmup, repeat=repeat, tol=tol)
+                                    warmup=warmup, repeat=repeat, tol=tol,
+                                    reject_on_state_leak=False)
             samples[k.stem].append(res)
-            sc = res.get("score")
-            print(f"  rep {r + 1}/{reps}  {k.stem:<28} score={sc:.4f}", flush=True)
+            ms = _geo([p["test_ms"] for p in res["per_shape"]])
+            leak = res.get("state_leak")
+            print(f"  rep {r + 1}/{reps}  {k.stem:<28} {ms:8.4f} ms"
+                  + (f"   [leaked: {'; '.join(leak)}]" if leak else ""), flush=True)
 
     shapes = [s["shape"] for s in samples[kernels[0].stem][0]["per_shape"]]
     out: Dict[str, Any] = {"reference": str(reference), "reps": reps,
@@ -75,19 +101,28 @@ def run(reference: Path, kernels: List[Path], reps: int, device: int,
 
     for k in kernels:
         name = k.stem
-        scores = [r["score"] for r in samples[name]]
-        per_shape = {sh: [next(p["speedup"] for p in r["per_shape"] if p["shape"] == sh)
+        # ABSOLUTE candidate time per shape -- never `speedup`, which carries a
+        # separately-measured T_ref in its denominator. See the module docstring.
+        per_shape = {sh: [next(p["test_ms"] for p in r["per_shape"] if p["shape"] == sh)
                           for r in samples[name]] for sh in shapes}
-        mean = st.mean(scores)
-        sd = st.stdev(scores) if len(scores) > 1 else 0.0
+        # One number per rep, so reps are the sampling unit for the t-test.
+        times = [_geo([p["test_ms"] for p in r["per_shape"]]) for r in samples[name]]
+        # Welch runs on speed (1/time) so that "positive" keeps meaning "better".
+        speeds = [1.0 / t for t in times]
+        mean_ms, mean_sp = st.mean(times), st.mean(speeds)
+        sd = st.stdev(times) if len(times) > 1 else 0.0
+        leaks = sorted({c for r in samples[name] for c in (r.get("state_leak") or [])})
         out["kernels"][name] = {
             "path": str(k),
-            "scores": scores,
-            "mean": mean,
-            "stdev": sd,
-            "stdev_pct": sd / mean * 100.0 if mean else float("nan"),
-            "sem_pct": (sd / math.sqrt(len(scores))) / mean * 100.0 if mean else float("nan"),
-            "per_shape_mean": {sh: st.mean(v) for sh, v in per_shape.items()},
+            "times_ms": times,
+            "speeds": speeds,
+            "mean_ms": mean_ms,
+            "mean_speed": mean_sp,
+            "stdev_pct": sd / mean_ms * 100.0 if mean_ms else float("nan"),
+            "sem_pct": (sd / math.sqrt(len(times))) / mean_ms * 100.0 if mean_ms else float("nan"),
+            "state_leak": leaks,
+            "scores": [r["score"] for r in samples[name]],   # recorded, NOT ranked on
+            "per_shape_ms": {sh: st.mean(v) for sh, v in per_shape.items()},
             "per_shape_stdev_pct": {
                 sh: (st.stdev(v) / st.mean(v) * 100.0 if len(v) > 1 else 0.0)
                 for sh, v in per_shape.items()
@@ -96,16 +131,17 @@ def run(reference: Path, kernels: List[Path], reps: int, device: int,
 
     # Every kernel after the first is compared against the first.
     base = kernels[0].stem
-    base_scores = out["kernels"][base]["scores"]
+    base_speeds = out["kernels"][base]["speeds"]
     for k in kernels[1:]:
         name = k.stem
-        cmp = _welch(out["kernels"][name]["scores"], base_scores)
+        cmp = _welch(out["kernels"][name]["speeds"], base_speeds)
         # Sign test across shapes. Per-shape noise is independent while drift
         # moves all shapes together, so "won on N of M shapes" survives drift
         # that any magnitude comparison on the geomean would fail.
+        # A win is now a SHORTER time, hence '<'.
         wins = [sh for sh in shapes
-                if out["kernels"][name]["per_shape_mean"][sh]
-                > out["kernels"][base]["per_shape_mean"][sh]]
+                if out["kernels"][name]["per_shape_ms"][sh]
+                < out["kernels"][base]["per_shape_ms"][sh]]
         cmp["shape_wins"] = len(wins)
         cmp["shape_total"] = len(shapes)
         cmp["shapes_won"] = wins
@@ -121,19 +157,26 @@ def _report(out: Dict[str, Any]) -> None:
     print("\n" + "=" * 78)
     print(f"PAIRED INTERLEAVED BENCHMARK   reps={out['reps']}   baseline={base}")
     print("=" * 78)
-    print(f"{'kernel':<30}{'mean':>9}{'stdev':>8}{'sem':>8}")
+    print("Ranked on ABSOLUTE kernel time (geomean over shapes) -- LOWER is better.")
+    print(f"{'kernel':<30}{'geomean ms':>12}{'stdev':>8}{'sem':>8}")
     for name, d in out["kernels"].items():
-        print(f"{name:<30}{d['mean']:>9.4f}{d['stdev_pct']:>7.2f}%{d['sem_pct']:>7.2f}%")
+        print(f"{name:<30}{d['mean_ms']:>12.4f}{d['stdev_pct']:>7.2f}%{d['sem_pct']:>7.2f}%")
 
-    print(f"\nPer-shape means (noise in parentheses, as stdev %):")
+    print(f"\nPer-shape mean time in ms (noise in parentheses, as stdev %):")
     print(f"{'shape':<20}" + "".join(f"{n[-13:]:>16}" for n in out["kernels"]))
     for sh in shapes:
         row = f"{sh:<20}"
         for d in out["kernels"].values():
-            row += f"{d['per_shape_mean'][sh]:>10.4f}({d['per_shape_stdev_pct'][sh]:>4.1f})"
+            row += f"{d['per_shape_ms'][sh]:>10.4f}({d['per_shape_stdev_pct'][sh]:>4.1f})"
         print(row)
 
-    print(f"\nComparisons vs {base}:")
+    leaky = {n: d["state_leak"] for n, d in out["kernels"].items() if d.get("state_leak")}
+    if leaky:
+        print("\nDevice-state leaks (a leaking kernel can distort its RIVAL's timing):")
+        for n, cs in leaky.items():
+            print(f"  {n:<28} {'; '.join(cs)}")
+
+    print(f"\nComparisons vs {base}   (positive = FASTER than baseline):")
     for name, d in out["kernels"].items():
         c = d.get("vs_base")
         if not c:
@@ -141,7 +184,7 @@ def _report(out: Dict[str, Any]) -> None:
         verdict = ("REAL" if abs(c["t"]) >= 3 else
                    "likely" if abs(c["t"]) >= 2 else "NOT RESOLVED")
         print(f"  {name:<28} {c['rel_diff_pct']:>+7.2f}%  "
-              f"se={c['se'] / d['mean'] * 100:>5.2f}%  t={c['t']:>+6.2f}  "
+              f"se={c['se'] / d['mean_speed'] * 100:>5.2f}%  t={c['t']:>+6.2f}  "
               f"shapes {c['shape_wins']}/{c['shape_total']}  -> {verdict}")
     print()
 
