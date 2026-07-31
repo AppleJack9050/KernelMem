@@ -507,6 +507,10 @@ def build_judger_optimization_prompts(
     nsys_csv_path: Optional[Path] = None,  # Optional path to nsys CSV file with kernel_launch_count
     io_dir: Optional[Path] = None,  # Optional directory to save machine_check_result JSON
     round_idx: Optional[int] = None,  # Optional round index for filename
+    base_optimizations: Optional[list] = None,  # Accepted optimizations the base kernel carries
+    rejected_metrics_block: Optional[str] = None,  # NCU profile of the previous round's rejected kernel
+    rejected_kernel_name: Optional[str] = None,
+    rejected_kernel_score: Optional[float] = None,
 ) -> Tuple[str, str]:
     """Return (system_prompt_str, instruction_str) for single-issue optimisation.
 
@@ -811,7 +815,35 @@ def build_judger_optimization_prompts(
                 opt_history_lines.append(f"- **Strategy**: {str(strategy)[:200]}...")
             
             if speedup is not None:
-                opt_history_lines.append(f"- **Result**: Speedup = {speedup:.4f} {'(PASSED)' if test_passed else '(FAILED)'}")
+                # "PASSED" only ever meant "compiled and was numerically correct", so an
+                # attempt that regressed 6% against the base still read as PASSED. State the
+                # verdict against the base the attempt actually had to beat.
+                _base_at = hist.get("base_score_at_attempt")
+                if _base_at:
+                    _d = (speedup / _base_at - 1.0) * 100.0
+                    _verdict = "IMPROVED" if _d > 0 else "REGRESSED"
+                    opt_history_lines.append(
+                        f"- **Result**: {speedup:.4f} vs base {_base_at:.4f} -> {_verdict} "
+                        f"{_d:+.2f}% ({'ran correctly' if test_passed else 'FAILED correctness'})")
+                else:
+                    opt_history_lines.append(
+                        f"- **Result**: Speedup = {speedup:.4f} "
+                        f"({'ran correctly' if test_passed else 'FAILED correctness'})")
+                # Where it won and where it lost. This is the cheapest signal that separates
+                # "the mechanism is wrong" from "the mechanism works but needs a shape gate":
+                # a method that gains on some shapes and collapses on one should be GATED,
+                # not abandoned.
+                _psb = hist.get("per_shape_vs_base_pct") or []
+                if _psb:
+                    _cells = "  ".join(f"{r['shape']}={r['delta_pct']:+.1f}%" for r in _psb)
+                    opt_history_lines.append(f"- **Per-shape vs base**: {_cells}")
+                    _won = [r["shape"] for r in _psb if r["delta_pct"] > 0]
+                    if _won and len(_won) < len(_psb):
+                        opt_history_lines.append(
+                            f"- **Read this**: gained on {len(_won)}/{len(_psb)} shapes "
+                            f"({', '.join(_won)}). A mechanism that helps some shapes and hurts "
+                            f"others is usually applied unconditionally -- consider GATING it on "
+                            f"size/shape rather than discarding the mechanism.")
             else:
                 opt_history_lines.append(f"- **Result**: Test {'PASSED but no speedup recorded' if test_passed else 'FAILED'}")
             
@@ -825,6 +857,115 @@ def build_judger_optimization_prompts(
         opt_history_text = "\n".join(opt_history_lines)
     else:
         opt_history_text = "# Optimization History\n(No previous optimization attempts recorded for this kernel.)\n"
+
+    # The CUDA code above is the BASE kernel, which accumulates the mechanism of every
+    # round that beat it. Nothing in the source marks which parts are load-bearing, so
+    # the judge cannot distinguish tuned code from ordinary code and readily proposes
+    # replacing a measured win with an untuned guess. Listing them makes the tuned
+    # mechanisms explicit.
+    #
+    # Deliberately about MECHANISMS, not code regions: an already-optimised region can
+    # still have headroom (a stream-overlapped GroupNorm chain may still run at 85% DRAM
+    # with a 1.6% L2 hit rate), so forbidding work there would fence off real gains.
+    # What must not happen is a mechanism being dropped WITHOUT the trade being stated.
+    if base_optimizations:
+        _lines = []
+        for o in base_optimizations:
+            g = o.get("gain_pct")
+            _lines.append(
+                f"  - {o.get('method_name')}"
+                + (f"  (round {o.get('round')}" if o.get("round") is not None else "  (")
+                + (f", +{g:.2f}% over its parent)" if g is not None else ")")
+                + (f"\n      {o['summary']}" if o.get("summary") else "")
+            )
+        opt_history_text += f"""
+
+================================================================================
+OPTIMIZATIONS THE BASE KERNEL ALREADY CARRIES
+================================================================================
+Each of these was accepted in an earlier round because it MEASURABLY improved
+this kernel, and each is implemented in the CUDA code above:
+
+{chr(10).join(_lines)}
+
+HOW THIS CONSTRAINS YOUR CHOICE (this is about MECHANISMS, not code regions):
+
+  * You MAY optimise a code region one of these already touches. "Already
+    optimised" does NOT mean "out of headroom" -- a region can be tuned and
+    still show a dominant stall, low cache hit rate, or high DRAM traffic in the
+    metrics above. If the evidence shows room, go after it. Making that region
+    faster WHILE KEEPING the listed mechanism working is composition, and is the
+    single most valuable thing you can do.
+
+  * You MAY NOT drop one of these mechanisms without accounting for it. If your
+    plan disables, bypasses, replaces, or makes unreachable any listed
+    optimisation, you MUST:
+      1. name which one your plan removes,
+      2. explain why your mechanism subsumes it or makes it unnecessary,
+      3. put in `expected_metric_change` the specific metric that would reveal
+         the loss if you are wrong -- e.g. kernel launch count rising back,
+         conv/normalisation overlap disappearing from the timeline, an autotuned
+         vendor engine reverting to a default plan, a fused kernel splitting.
+    Replacement is permitted. UNACCOUNTED replacement is what is forbidden.
+
+  * Watch for silent incompatibility, which is the most common way this fails:
+    a mechanism can disable another without your plan ever mentioning it (a
+    capture/replay scheme that requires static buffers defeats per-call dynamic
+    chunking; a cached fixed plan defeats per-shape re-selection; a grid-wide
+    barrier defeats multi-stream execution). Before finalising, check each
+    listed mechanism and confirm your plan leaves it operational.
+================================================================================
+"""
+
+    # The NCU block earlier in this prompt profiles the BASE. This one profiles the
+    # kernel the PREVIOUS round produced and that lost -- what it actually did on the
+    # GPU, as opposed to what its strategy predicted. Without it the judge is asked to
+    # classify implementation-failure vs method-mismatch (see CRITICAL ANALYSIS above)
+    # from a single scalar, which it cannot do, so it defaults to inventing a new
+    # mechanism every round.
+    if rejected_metrics_block:
+        _score_txt = (f" (scored {rejected_kernel_score:.4f})"
+                      if rejected_kernel_score is not None else "")
+        opt_history_text += f"""
+
+================================================================================
+MEASURED PROFILE OF THE PREVIOUS ATTEMPT -- {rejected_kernel_name or 'previous round'}{_score_txt} -- REJECTED
+================================================================================
+This kernel RAN CORRECTLY but scored below the base, so the base was NOT replaced.
+Everything below is what it ACTUALLY did on the GPU, not what its strategy predicted.
+
+{rejected_metrics_block.strip()}
+
+DO THIS BEFORE CHOOSING YOUR METHOD:
+1. Find that attempt's `expected_metric_change` in the history above.
+2. Compare it against the measured numbers here, and classify the failure:
+
+   (a) The predicted metric DID move as intended, but the kernel was still slower
+       -> The bottleneck model was WRONG. That direction is a dead end. Do NOT
+          re-attempt this mechanism "with a better implementation" -- pick a
+          different target with independent evidence.
+
+   (b) The predicted metric did NOT move as intended
+       -> The mechanism never really engaged: a fallback path was taken, a guard
+          never fired, a cooperative/graph launch was refused, a gate excluded the
+          shape. The method may still be sound. ONE retry is justified, and you
+          must name the specific defect you are fixing.
+
+   (c) It improved some shapes and collapsed others (see the per-shape line)
+       -> The mechanism works but is applied unconditionally. Do NOT discard it.
+          Add the missing size/shape gate so it engages only where it pays.
+
+3. Say which of (a)/(b)/(c) you concluded and cite the deciding metric in `evidence`.
+
+ALSO CHECK WHAT IT BROKE. Compare this profile against the base's profile above.
+If a mechanism the base carries has disappeared here -- launch count climbed back,
+kernels that were fused are separate again, an autotuned engine reverted to a
+default plan, conv/normalisation overlap vanished -- then that attempt failed
+because it was structurally incompatible with the base, NOT because its target was
+wrong. In that case the useful move is a mechanism that COMPOSES with what the base
+already does, and you should say so explicitly in `evidence`.
+================================================================================
+"""
 
     # Choose template based on machine_check result
     if machine_check_case == "NO_MATCH":

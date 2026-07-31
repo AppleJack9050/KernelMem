@@ -61,6 +61,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup", type=int, default=25, help="Warm-up iterations")
     p.add_argument("--repeat", type=int, default=100, help="Timed iterations per benchmark")
     p.add_argument("--tol", type=float, default=1e-2, help="Max |err| tolerated")
+    p.add_argument("--base_margin", type=float, default=0.005,
+                   help="Relative margin a kernel must beat the current base by to become the new "
+                        "base for later optimization rounds (0.005 = 0.5%%). Too low and the base "
+                        "churns on measurement jitter; too high and optimization keeps restarting "
+                        "from the seed instead of compounding. Default measured on RTX 5090 / "
+                        "vae_block_002: within-session noise is 0.15-0.80%% stdev (kernel-dependent -- "
+                        "multi-stream kernels are ~5x noisier), but scores are compared ACROSS "
+                        "rounds, where GPU-state drift of +0.9..+1.7%% attenuates real gains. A "
+                        "verified +1.26%% same-session improvement showed up as only +0.57%% "
+                        "cross-round, so the margin must sit below the attenuated value. Re-derive "
+                        "this for a different GPU or task. Use 0 to accept any improvement, or a "
+                        "large value to pin the base to the seed (the pre-fix behaviour).")
     p.add_argument("--max_tokens", type=int, default=16384, help="LLM max new tokens")
     p.add_argument("--temperature", type=float, default=1, help="LLM temperature")
     p.add_argument("--top_p", type=float, default=1.0, help="LLM top_p")
@@ -871,6 +883,47 @@ def _load_checkpoint(task_root: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _base_optimization_inventory(optimization_tree: Dict[str, Any],
+                                 base_name: Optional[str]) -> List[Dict[str, Any]]:
+    """List the accepted optimizations the base kernel carries, oldest first.
+
+    Once the base advances (see the ratchet in the round loop), it accumulates
+    the mechanisms of every ancestor. The judge is given the base's SOURCE but
+    nothing marks which parts are load-bearing, so it cannot tell that e.g. a
+    `benchmark=true` conv call is the thing that bought +6.3%. Walking the tree
+    recovers that, and it is all data the tree already stores.
+
+    Each entry: method_name, round, and the gain over the immediate parent --
+    the gain is what makes "this is worth preserving" concrete.
+    """
+    if not optimization_tree or not base_name:
+        return []
+    chain, cur, seen = [], base_name, set()
+    while cur and cur in optimization_tree and cur not in seen:
+        seen.add(cur)
+        chain.append(cur)
+        cur = optimization_tree[cur].get("parent")
+
+    inventory: List[Dict[str, Any]] = []
+    for name in reversed(chain):  # oldest ancestor first
+        node = optimization_tree.get(name) or {}
+        strategy = node.get("strategy")
+        method = strategy.get("method_name") if isinstance(strategy, dict) else None
+        if not method:
+            continue  # the seed has no method
+        parent = optimization_tree.get(node.get("parent") or "") or {}
+        sp, psp = node.get("speedup"), parent.get("speedup")
+        gain = ((sp / psp - 1.0) * 100.0) if (sp and psp) else None
+        inventory.append({
+            "method_name": method,
+            "round": node.get("round"),
+            "speedup": sp,
+            "gain_pct": gain,
+            "summary": (strategy.get("primary_optimisation_method") or "")[:200],
+        })
+    return inventory
+
+
 def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # --- per-task directories under the SAME batch_dir
     task_root = (batch_dir / task_path.stem).resolve()
@@ -1561,6 +1614,62 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 "improvement — the score is the geometric mean across all of them.\n"
                             )
 
+                        # ========== Profile the previous round's REJECTED kernel ==========
+                        # The profile above is of the BASE -- the kernel we optimise FROM. When the
+                        # last round produced something that ran but lost, only its scalar speedup
+                        # was fed back, so the judge could not tell WHY it lost. Two failures that
+                        # look identical as numbers need opposite responses:
+                        #   - the predicted metric moved and it was STILL slower  -> the bottleneck
+                        #     model is wrong; that direction is a dead end, change target.
+                        #   - the predicted metric did NOT move                   -> the mechanism
+                        #     never really engaged (fallback taken, guard never fired, cooperative
+                        #     launch refused); the method may be fine, retry it fixed.
+                        # Only the MOST RECENT rejection is profiled: it is the attempt the judge is
+                        # reacting to, and attaching every past failure's profile would bloat an
+                        # already ~125KB prompt. Older failures carry the cheap per-shape summary.
+                        rejected_metrics_block = None
+                        rejected_kernel_name = None
+                        rejected_kernel_score = None
+                        try:
+                            _rej = current_kernel
+                            _rej_ok = bool((getattr(_rej, "metrics", {}) or {}).get("runnable", False))
+                            if (_rej is not None and _rej is not base_kernel and _rej_ok
+                                    and getattr(_rej, "code", None) and _rej.score is not None):
+                                rejected_kernel_name = (_rej.code_path.stem
+                                                        if getattr(_rej, "code_path", None)
+                                                        else "previous_attempt")
+                                rejected_kernel_score = float(_rej.score)
+                                print(f"[ncu] Profiling last round's REJECTED kernel "
+                                      f"{rejected_kernel_name} ({rejected_kernel_score:.4f} vs base "
+                                      f"{base_score:.4f}) to explain why it lost", flush=True)
+                                _rf = Path(f"rejected_kernel_{args.subproc_id}.py")
+                                _rf.write_text(_rej.code, encoding="utf-8")
+                                _rn = extract_cuda_kernel_names(_rf)
+                                _rcsv = profile_bench(
+                                    bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
+                                    kernel_names=_rn, kernel_file=_rf,
+                                    out_csv=f"ncu_rejected_{args.subproc_id}.csv",
+                                    device_idx=args.device, repeat=ncu_repeat,
+                                    timeout_override=ncu_timeout_seconds,
+                                )
+                                _rdf, _rsec = load_ncu_metrics(
+                                    Path(_rcsv), extra_keep=("Kernel Name", "Block Size", "Grid Size"),
+                                    name_list=_rn, select="last")
+                                rejected_metrics_block = metrics_to_prompt(_rdf, sections_dict=_rsec)
+                                try:
+                                    import shutil as _sh
+                                    profile_dir.mkdir(parents=True, exist_ok=True)
+                                    _sh.copy(Path(_rcsv),
+                                             profile_dir / f"{rejected_kernel_name}_rejected_ncu.csv")
+                                except Exception:
+                                    pass
+                                print(f"[ncu] Rejected-kernel profile captured", flush=True)
+                        except Exception as _re:
+                            # Optional diagnostic: must never break a round.
+                            rejected_metrics_block = None
+                            print(f"[ncu] Skipping rejected-kernel profile: "
+                                  f"{_re.__class__.__name__}: {_re}", flush=True)
+
                         # ========== Run nsys profiling to get kernel launch counts ==========
                         nsys_rep_path = None
                         nsys_csv_path = None
@@ -1762,6 +1871,22 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         # Use parent_kernel.code (base_kernel) for judge LLM, not current_kernel
                         # This is the kernel we want to analyze and optimize
                         parent_kernel_code = parent_kernel.code if parent_kernel and hasattr(parent_kernel, 'code') else (current_kernel.code if current_kernel else "")  # type: ignore[union-attr]
+
+                        # What the base already carries. Every round branches from the base, so
+                        # once the ratchet advances it the base accumulates earlier mechanisms --
+                        # and the profile's hottest remaining targets tend to BE that tuned code.
+                        # Without this list the judge cannot tell tuned code from ordinary code and
+                        # proposes replacing it, which trades a measured win for an untuned guess.
+                        _parent_name = (parent_kernel.code_path.stem
+                                        if (parent_kernel and getattr(parent_kernel, "code_path", None))
+                                        else None)
+                        base_optimizations = _base_optimization_inventory(optimization_tree, _parent_name)
+                        if base_optimizations:
+                            print("[opt] Base carries " + ", ".join(
+                                f"{o['method_name']}"
+                                + (f" (+{o['gain_pct']:.2f}%)" if o.get("gain_pct") else "")
+                                for o in base_optimizations), flush=True)
+
                         sys_judge__prompt, judge_prompt = build_judger_optimization_prompts(
                             arch_path=task_path,
                             gpu_name=args.gpu,
@@ -1774,6 +1899,10 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             nsys_csv_path=nsys_csv_path,  # Pass nsys CSV path for kernel_launch_count
                             io_dir=io_dir,  # Pass io_dir for saving machine_check_result JSON
                             round_idx=round_idx,  # Pass round_idx for filename
+                            base_optimizations=base_optimizations,
+                            rejected_metrics_block=rejected_metrics_block,
+                            rejected_kernel_name=rejected_kernel_name,
+                            rejected_kernel_score=rejected_kernel_score,
                         )
                         prompt_file = io_dir / f"round{round_idx:03d}_judge_optimization_prompt.txt"
                         prompt_file.write_text(judge_prompt, encoding="utf-8")
@@ -1916,6 +2045,27 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 opt_history["test_passed"] = runnable and speedup is not None
                                 opt_history["test_kernel"] = str(getattr(ind, "code_path", None)) if hasattr(ind, "code_path") else None
                                 opt_history["test_timestamp"] = datetime.now().isoformat()
+                                # Record WHAT WAS MEASURED, not just the scalar. A bare speedup
+                                # cannot distinguish "the mechanism is wrong" from "the mechanism
+                                # works but is applied unconditionally and one shape collapsed" --
+                                # opposite conclusions with opposite next moves. The per-shape
+                                # split makes the second case visible without any extra profiling.
+                                _ps = (getattr(ind, "metrics", {}) or {}).get("per_shape") or []
+                                if _ps:
+                                    opt_history["per_shape"] = [
+                                        {"shape": s.get("shape"), "speedup": s.get("speedup")} for s in _ps
+                                    ]
+                                if base_score != float("-inf"):
+                                    opt_history["base_score_at_attempt"] = float(base_score)
+                                    _bps = ((base_kernel.metrics or {}).get("per_shape")
+                                            if base_kernel is not None else None) or []
+                                    _bmap = {s.get("shape"): s.get("speedup") for s in _bps}
+                                    if _ps and _bmap:
+                                        opt_history["per_shape_vs_base_pct"] = [
+                                            {"shape": s.get("shape"),
+                                             "delta_pct": (s["speedup"] / _bmap[s["shape"]] - 1.0) * 100.0}
+                                            for s in _ps if _bmap.get(s.get("shape")) and s.get("speedup")
+                                        ]
                                 opt_history_file.write_text(json.dumps(opt_history, indent=2, ensure_ascii=False), encoding="utf-8")
                                 if runnable and speedup is not None:
                                     print(f"[opt] Optimization history updated: speedup={speedup:.4f}")
@@ -1947,29 +2097,45 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             scores.append(this_score)
             err_flags.append(False)
             
-            # Update base_kernel only if this kernel's score shows significant improvement
-            # Criteria: (1) score >= base_score * 1.3 (30% improvement), OR (2) score - base_score >= 0.3 (absolute improvement)
-            # Note: Special case for repaired base_kernel is handled in the ncu timeout handler above
+            # Advance base_kernel whenever this kernel beats the current base by more than
+            # benchmark noise. base_kernel is what every later optimization round branches from
+            # (see `parent_kernel = base_kernel` in the opt phase), so this is the ratchet: without
+            # it, each round re-derives from the same starting kernel and improvements never
+            # compound, no matter how good an intermediate result was.
+            #
+            # This previously required score >= base_score * 1.3 OR score - base_score >= 0.3.
+            # Kernel speedups move in 1-5% steps, so at a base of ~1.12 those gates demanded ~1.46x
+            # to fire -- they never did, and the base stayed pinned to the seed for entire runs
+            # while best_kernel (statistics only) silently tracked the real winner.
+            #
+            # Note: special cases where an unprofilable base is replaced by its repair are handled
+            # in the pre-compile / ncu handlers above, and intentionally bypass this margin.
             should_update_base = False
             if base_score == float("-inf"):
                 # First valid score, always update
                 should_update_base = True
             elif base_score <= 0:
-                # If base_score is negative or zero, use absolute improvement threshold
-                should_update_base = (this_score - base_score >= 0.1)
+                # Base is unusable (negative/zero); any real speedup is an improvement
+                should_update_base = (this_score > 0)
             else:
-                # base_score is positive, check both relative (30%) and absolute (0.3) improvement
-                relative_improvement = this_score >= base_score * 1.3
-                absolute_improvement = (this_score - base_score) >= 0.3
-                should_update_base = relative_improvement or absolute_improvement
-            
+                should_update_base = this_score >= base_score * (1.0 + args.base_margin)
+
             if should_update_base:
-                improvement_type = "relative (30%)" if (base_score > 0 and this_score >= base_score * 1.3) else "absolute (0.3)"
-                print(f"[base] Updating base_kernel: {this_score:.4f} vs {base_score:.4f} ({improvement_type} improvement)", flush=True)
+                if base_score == float("-inf"):
+                    print(f"[base] Setting initial base_kernel: {this_score:.4f}", flush=True)
+                else:
+                    gain = (this_score / base_score - 1.0) * 100.0 if base_score > 0 else float("nan")
+                    print(f"[base] Ratchet: base_kernel {base_score:.4f} -> {this_score:.4f} "
+                          f"(+{gain:.2f}%, margin {args.base_margin * 100:.1f}%); "
+                          f"later rounds now optimize from this kernel", flush=True)
                 base_score = this_score
                 base_kernel = ind
                 with open(test_kernel, "w") as f:
                     f.write(base_kernel.code)
+            elif base_score not in (float("-inf"), 0):
+                delta = (this_score / base_score - 1.0) * 100.0 if base_score > 0 else float("nan")
+                print(f"[base] Keeping base_kernel {base_score:.4f} ({this_score:.4f} is "
+                      f"{delta:+.2f}%, below the {args.base_margin * 100:.1f}% margin)", flush=True)
             
             # Update best_kernel unconditionally if score is higher (for statistics)
             if this_score > best_score:
