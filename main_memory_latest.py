@@ -1630,6 +1630,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         rejected_metrics_block = None
                         rejected_kernel_name = None
                         rejected_kernel_score = None
+                        rejected_base_score = None
                         try:
                             _rej = current_kernel
                             _rej_ok = bool((getattr(_rej, "metrics", {}) or {}).get("runnable", False))
@@ -1639,9 +1640,22 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                                         if getattr(_rej, "code_path", None)
                                                         else "previous_attempt")
                                 rejected_kernel_score = float(_rej.score)
-                                print(f"[ncu] Profiling last round's REJECTED kernel "
+                                rejected_base_score = (float(base_score)
+                                                       if base_score != float("-inf") else None)
+                                # "Not adopted" covers two DIFFERENT outcomes and they must not be
+                                # described the same way: a kernel that scored BELOW the base
+                                # genuinely lost, while one that scored ABOVE it but under the
+                                # margin was simply not resolvable from noise. Telling the judge
+                                # the second one "lost" is confidently wrong feedback -- it will
+                                # invent a failure explanation for something that mildly worked.
+                                if rejected_base_score and rejected_kernel_score < rejected_base_score:
+                                    _why = "to explain why it lost"
+                                else:
+                                    _why = ("-- note it scored ABOVE the base but inside the margin "
+                                            "(not resolvable from noise), so this is 'unproven', not 'failed'")
+                                print(f"[ncu] Profiling last round's NOT-ADOPTED kernel "
                                       f"{rejected_kernel_name} ({rejected_kernel_score:.4f} vs base "
-                                      f"{base_score:.4f}) to explain why it lost", flush=True)
+                                      f"{base_score:.4f}) {_why}", flush=True)
                                 _rf = Path(f"rejected_kernel_{args.subproc_id}.py")
                                 _rf.write_text(_rej.code, encoding="utf-8")
                                 _rn = extract_cuda_kernel_names(_rf)
@@ -1903,6 +1917,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             rejected_metrics_block=rejected_metrics_block,
                             rejected_kernel_name=rejected_kernel_name,
                             rejected_kernel_score=rejected_kernel_score,
+                            rejected_base_score=rejected_base_score,
                         )
                         prompt_file = io_dir / f"round{round_idx:03d}_judge_optimization_prompt.txt"
                         prompt_file.write_text(judge_prompt, encoding="utf-8")

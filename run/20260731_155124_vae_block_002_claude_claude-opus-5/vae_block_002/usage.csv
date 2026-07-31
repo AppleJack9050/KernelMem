@@ -10,3 +10,5 @@ timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens
 2026-07-31 16:32:56,3,optimization,15594,25670,41264
 2026-07-31 16:41:42,4,judge_optimization,58655,13871,72526
 2026-07-31 16:44:45,4,optimization,19967,20278,40245
+2026-07-31 16:52:57,5,judge_optimization,60540,10508,71048
+2026-07-31 17:00:54,5,optimization,75863,56662,132525

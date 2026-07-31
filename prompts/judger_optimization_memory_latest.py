@@ -511,6 +511,7 @@ def build_judger_optimization_prompts(
     rejected_metrics_block: Optional[str] = None,  # NCU profile of the previous round's rejected kernel
     rejected_kernel_name: Optional[str] = None,
     rejected_kernel_score: Optional[float] = None,
+    rejected_base_score: Optional[float] = None,  # base score it was compared against
 ) -> Tuple[str, str]:
     """Return (system_prompt_str, instruction_str) for single-issue optimisation.
 
@@ -926,17 +927,48 @@ HOW THIS CONSTRAINS YOUR CHOICE (this is about MECHANISMS, not code regions):
     if rejected_metrics_block:
         _score_txt = (f" (scored {rejected_kernel_score:.4f})"
                       if rejected_kernel_score is not None else "")
-        opt_history_text += f"""
+        # A kernel can fail to be adopted for two very different reasons, and describing
+        # them identically produces confidently WRONG feedback: telling the judge that a
+        # kernel which actually scored HIGHER "lost" makes it invent a failure explanation
+        # for something that mildly worked, and abandon a direction worth refining.
+        _improved_but_unproven = (
+            rejected_kernel_score is not None and rejected_base_score
+            and rejected_kernel_score >= rejected_base_score)
+        if _improved_but_unproven:
+            _delta = (rejected_kernel_score / rejected_base_score - 1.0) * 100.0
+            _headline = "NOT ADOPTED (improvement too small to be resolvable)"
+            _framing = f"""This kernel RAN CORRECTLY and actually scored *HIGHER* than the base
+({rejected_kernel_score:.4f} vs {rejected_base_score:.4f}, {_delta:+.2f}%), but by less than the
+margin required to treat the difference as real, so the base was not replaced.
 
-================================================================================
-MEASURED PROFILE OF THE PREVIOUS ATTEMPT -- {rejected_kernel_name or 'previous round'}{_score_txt} -- REJECTED
-================================================================================
-This kernel RAN CORRECTLY but scored below the base, so the base was NOT replaced.
-Everything below is what it ACTUALLY did on the GPU, not what its strategy predicted.
+IMPORTANT: this attempt did NOT fail. Its direction was mildly positive but is
+indistinguishable from measurement noise. Do NOT diagnose it as a failure and do
+NOT abandon its mechanism on this evidence. The two useful moves are: strengthen
+the SAME mechanism so the effect becomes large enough to measure, or pick an
+independent target -- but do not conclude the direction was wrong."""
+        else:
+            _headline = "REJECTED"
+            _framing = """This kernel RAN CORRECTLY but scored below the base, so the base was NOT replaced."""
 
-{rejected_metrics_block.strip()}
+        if _improved_but_unproven:
+            _diagnosis = """DO THIS BEFORE CHOOSING YOUR METHOD:
+1. Find that attempt's `expected_metric_change` in the history above.
+2. Compare it against the measured numbers here and decide which is true:
 
-DO THIS BEFORE CHOOSING YOUR METHOD:
+   (i)  The predicted metric moved as intended
+        -> The mechanism WORKS, it is just too small to measure. Making it bigger
+           is the highest-value move available: widen where it applies, remove a
+           gate that is excluding shapes, or attack the same bottleneck harder.
+
+   (ii) The predicted metric did NOT move
+        -> The gain came from somewhere other than your mechanism, i.e. it is
+           probably noise. Treat the direction as unproven and pick a target with
+           independent evidence.
+
+3. State which of (i)/(ii) you concluded and cite the deciding metric in `evidence`.
+   Do NOT describe this attempt as a failure -- it was not one."""
+        else:
+            _diagnosis = """DO THIS BEFORE CHOOSING YOUR METHOD:
 1. Find that attempt's `expected_metric_change` in the history above.
 2. Compare it against the measured numbers here, and classify the failure:
 
@@ -955,7 +987,18 @@ DO THIS BEFORE CHOOSING YOUR METHOD:
        -> The mechanism works but is applied unconditionally. Do NOT discard it.
           Add the missing size/shape gate so it engages only where it pays.
 
-3. Say which of (a)/(b)/(c) you concluded and cite the deciding metric in `evidence`.
+3. Say which of (a)/(b)/(c) you concluded and cite the deciding metric in `evidence`."""
+        opt_history_text += f"""
+
+================================================================================
+MEASURED PROFILE OF THE PREVIOUS ATTEMPT -- {rejected_kernel_name or 'previous round'}{_score_txt} -- {_headline}
+================================================================================
+{_framing}
+Everything below is what it ACTUALLY did on the GPU, not what its strategy predicted.
+
+{rejected_metrics_block.strip()}
+
+{_diagnosis}
 
 ALSO CHECK WHAT IT BROKE. Compare this profile against the base's profile above.
 If a mechanism the base carries has disappeared here -- launch count climbed back,
