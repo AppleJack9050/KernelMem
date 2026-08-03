@@ -1,0 +1,19 @@
+```json
+{
+  "critical_issue": "Persisting-L2 carve-out set once at init and never restored, leaking device-global state",
+  "evidence": [
+    "Candidate leaked device-global state.",
+    "persisting_l2_bytes: 18874368 -> 62914560"
+  ],
+  "root_cause": "l2_init_impl() calls cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, prop.persistingL2CacheMaxSize) under std::call_once, invoked from ModelNew.__init__ via ext.l2_persist_init(). This raises the device-wide persisting-L2 reservation (18MB -> 60MB) permanently; nothing ever restores the previous limit or calls cudaCtxResetPersistingL2Cache, so the state outlives forward and slows unrelated/reference work.",
+  "trigger_condition": "Any run: the extension's l2_persist_init() executes at module/ModelNew construction and sets the device limit once, outside forward, with no unwind path.",
+  "must_hold_invariants": [
+    "cudaLimitPersistingL2CacheSize must equal its pre-forward value when forward returns",
+    "Any persisting window set inside forward must be released via cudaCtxResetPersistingL2Cache before return",
+    "No device-global limit may be configured from a static initializer or __init__"
+  ],
+  "minimal_fix": "Delete the cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,...) in l2_init_impl and the l2_persist_init() call in __init__; set g_persist_cap=0 so use_window stays false (base plain-launch path).",
+  "patch_anchor": "cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize",
+  "confidence": "high"
+}
+```

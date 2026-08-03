@@ -1,0 +1,950 @@
+# =============================================================================
+# ModelNew — fused VAE residual block (Conv3x3 -> GN -> SiLU -> Conv3x3 -> GN -> SiLU -> +x)
+#
+# This round adds: stream_stage_skew
+#   The 2-way batch split is kept, but chunk1's pipeline is made to start only
+#   after a chosen stage of chunk0 (AFTER_CONV1 / AFTER_APPLY1) so that the
+#   DRAM-bound transpose/GN kernels of one chunk overlap the SM-bound TF32 conv
+#   of the other.  The skew point is chosen by a capture-time A/B gate and is
+#   then frozen into ONE CUDA graph (events become graph edges).
+#
+# PRECISION: float32 storage/arithmetic throughout, float32 reductions.
+# TF32 for conv only (cudnn.allow_tf32 default), exactly as the reference.
+# =============================================================================
+
+import os
+import functools
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import OrderedDict
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# Group 1 : the five custom kernels (UNCHANGED - plan item 8)
+# ---------------------------------------------------------------------------
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <algorithm>
+
+#define CCH 256          // channels (const per problem definition)
+#define NGRP 32          // num_groups (const)
+#define CPG  8           // channels per group
+
+__device__ __forceinline__ float silu_f(float t) {
+    return t / (1.0f + __expf(-t));
+}
+
+// ---------------------------------------------------------------------------
+// K0: NCHW -> NHWC tiled transpose (32 pixels x 32 channels per block)
+// ---------------------------------------------------------------------------
+__global__ void to_nhwc_kernel(const float* __restrict__ x,
+                               float* __restrict__ out,
+                               int HW, int C) {
+    __shared__ float sh[32][33];
+    const int n  = blockIdx.z;
+    const int cb = blockIdx.y * 32;
+    const int pb = blockIdx.x * 32;
+    const int tx = threadIdx.x;   // 0..31
+    const int ty = threadIdx.y;   // 0..7
+
+    const float* xb = x + (long)n * C * HW;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int c = cb + ty + i * 8;
+        int p = pb + tx;
+        float v = 0.0f;
+        if (p < HW) v = xb[(long)c * HW + p];
+        sh[ty + i * 8][tx] = v;
+    }
+    __syncthreads();
+
+    float* ob = out + (long)n * (long)HW * C;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int p = pb + ty + i * 8;
+        int c = cb + tx;
+        if (p < HW) ob[(long)p * C + c] = sh[tx][ty + i * 8];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K1: per-(n, group) partial sums over a tile of pixels. NHWC, float4 loads.
+// ---------------------------------------------------------------------------
+__global__ void gn_stats_kernel(const float* __restrict__ y,
+                                float* __restrict__ psum,
+                                float* __restrict__ psq,
+                                int HW, int tile, int ntiles) {
+    const int n = blockIdx.y;
+    const int t = blockIdx.x;
+    const int c4 = threadIdx.x & 63;     // float4 index within the 256 channels
+    const int sp = threadIdx.x >> 6;     // 0..3 pixel phase
+
+    const float4* y4 = (const float4*)(y + (long)n * (long)HW * CCH);
+
+    int p0 = t * tile;
+    int p1 = p0 + tile;
+    if (p1 > HW) p1 = HW;
+
+    float s = 0.0f, q = 0.0f;
+    for (int p = p0 + sp; p < p1; p += 4) {
+        float4 v = y4[(long)p * 64 + c4];
+        s += v.x + v.y + v.z + v.w;
+        q += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+
+    // channels 4*c4 .. 4*c4+3 all live in group (c4>>1); pair adjacent lanes.
+    s += __shfl_xor_sync(0xffffffffu, s, 1);
+    q += __shfl_xor_sync(0xffffffffu, q, 1);
+
+    __shared__ float ss[4][32];
+    __shared__ float sq[4][32];
+    if ((threadIdx.x & 1) == 0) {
+        int g = c4 >> 1;                 // 0..31
+        ss[sp][g] = s;
+        sq[sp][g] = q;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < NGRP) {
+        int g = threadIdx.x;
+        float ts = ss[0][g] + ss[1][g] + ss[2][g] + ss[3][g];
+        float tq = sq[0][g] + sq[1][g] + sq[2][g] + sq[3][g];
+        long idx = ((long)n * NGRP + g) * ntiles + t;
+        psum[idx] = ts;
+        psq[idx]  = tq;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K2: reduce partials -> mean/rstd -> per-(n,channel) scale/shift
+// ---------------------------------------------------------------------------
+__global__ void gn_reduce_kernel(const float* __restrict__ psum,
+                                 const float* __restrict__ psq,
+                                 const float* __restrict__ gamma,
+                                 const float* __restrict__ beta,
+                                 float* __restrict__ scale,
+                                 float* __restrict__ shift,
+                                 int ntiles, int HW, float eps) {
+    const int ng = blockIdx.x;
+    const int n  = ng / NGRP;
+    const int g  = ng % NGRP;
+
+    const float* pb_s = psum + (long)ng * ntiles;
+    const float* pb_q = psq  + (long)ng * ntiles;
+
+    float s = 0.0f, q = 0.0f;
+    for (int i = threadIdx.x; i < ntiles; i += blockDim.x) {
+        s += pb_s[i];
+        q += pb_q[i];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s += __shfl_down_sync(0xffffffffu, s, off);
+        q += __shfl_down_sync(0xffffffffu, q, off);
+    }
+    __shared__ float ws[8], wq[8];
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    if (lane == 0) { ws[warp] = s; wq[warp] = q; }
+    __syncthreads();
+
+    if (threadIdx.x < CPG) {
+        int nwarps = blockDim.x >> 5;
+        float ts = 0.0f, tq = 0.0f;
+        for (int i = 0; i < nwarps; ++i) { ts += ws[i]; tq += wq[i]; }
+        float cnt  = (float)HW * (float)CPG;
+        float mean = ts / cnt;
+        float var  = tq / cnt - mean * mean;
+        if (var < 0.0f) var = 0.0f;
+        float rstd = rsqrtf(var + eps);
+        int c = g * CPG + (int)threadIdx.x;
+        float gm = gamma[c];
+        float bt = beta[c];
+        scale[n * CCH + c] = rstd * gm;
+        shift[n * CCH + c] = bt - mean * rstd * gm;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K3: GN affine + SiLU, NHWC in / NHWC out, float4
+// ---------------------------------------------------------------------------
+__global__ void gn_apply_silu_nhwc_kernel(const float* __restrict__ y,
+                                          const float* __restrict__ scale,
+                                          const float* __restrict__ shift,
+                                          float* __restrict__ out,
+                                          int HW) {
+    const int n = blockIdx.y;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)HW * 64;
+    if (i >= total) return;
+
+    const float4* y4 = (const float4*)(y   + (long)n * (long)HW * CCH);
+    float4*       o4 = (float4*)      (out + (long)n * (long)HW * CCH);
+    const float4* s4 = (const float4*)(scale + (long)n * CCH);
+    const float4* b4 = (const float4*)(shift + (long)n * CCH);
+
+    int c4 = (int)(i & 63);
+    float4 v = y4[i];
+    float4 s = s4[c4];
+    float4 b = b4[c4];
+    float4 r;
+    r.x = silu_f(v.x * s.x + b.x);
+    r.y = silu_f(v.y * s.y + b.y);
+    r.z = silu_f(v.z * s.z + b.z);
+    r.w = silu_f(v.w * s.w + b.w);
+    o4[i] = r;
+}
+
+// ---------------------------------------------------------------------------
+// K4: GN affine + SiLU + residual add + NHWC->NCHW transpose (one pass)
+// ---------------------------------------------------------------------------
+__global__ void gn_apply_silu_add_t_kernel(const float* __restrict__ y,     // NHWC
+                                           const float* __restrict__ res,   // NCHW
+                                           const float* __restrict__ scale,
+                                           const float* __restrict__ shift,
+                                           float* __restrict__ out,         // NCHW
+                                           int HW) {
+    __shared__ float sh[32][33];
+    const int n  = blockIdx.z;
+    const int cb = blockIdx.y * 32;
+    const int pb = blockIdx.x * 32;
+    const int tx = threadIdx.x;   // 0..31
+    const int ty = threadIdx.y;   // 0..7
+
+    const float* yb = y + (long)n * (long)HW * CCH;
+    const int c_in = cb + tx;
+    const float sc = scale[n * CCH + c_in];
+    const float sf = shift[n * CCH + c_in];
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int p = pb + ty + i * 8;
+        float o = 0.0f;
+        if (p < HW) {
+            float v = yb[(long)p * CCH + c_in];
+            o = silu_f(v * sc + sf);
+        }
+        sh[ty + i * 8][tx] = o;
+    }
+    __syncthreads();
+
+    const float* rb = res + (long)n * CCH * (long)HW;
+    float*       ob = out + (long)n * CCH * (long)HW;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int c = cb + ty + i * 8;
+        int p = pb + tx;
+        if (p < HW) {
+            ob[(long)c * HW + p] = sh[tx][ty + i * 8] + rb[(long)c * HW + p];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// host helpers
+// ---------------------------------------------------------------------------
+static void compute_affine(const at::Tensor& y, const at::Tensor& gamma,
+                           const at::Tensor& beta, int N, int HW, float eps,
+                           at::Tensor& scale, at::Tensor& shift) {
+    int bpi = (HW + 15) / 16;
+    int cap = std::max(1, 8192 / std::max(1, N));
+    if (bpi > cap) bpi = cap;
+    int tile = (HW + bpi - 1) / bpi;
+    tile = ((tile + 3) / 4) * 4;              // multiple of 4 pixels
+    if (tile < 4) tile = 4;
+    bpi = (HW + tile - 1) / tile;             // no empty tile
+
+    auto opts = y.options();
+    auto psum = at::empty({(long)N * NGRP * bpi}, opts);
+    auto psq  = at::empty({(long)N * NGRP * bpi}, opts);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    gn_stats_kernel<<<dim3(bpi, N), 256, 0, stream>>>(
+        y.data_ptr<float>(), psum.data_ptr<float>(), psq.data_ptr<float>(),
+        HW, tile, bpi);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    gn_reduce_kernel<<<N * NGRP, 256, 0, stream>>>(
+        psum.data_ptr<float>(), psq.data_ptr<float>(),
+        gamma.data_ptr<float>(), beta.data_ptr<float>(),
+        scale.data_ptr<float>(), shift.data_ptr<float>(),
+        bpi, HW, eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+at::Tensor to_nhwc_cuda(at::Tensor x) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat, "float32 cuda tensor expected");
+    TORCH_CHECK(x.dim() == 4, "4d tensor expected");
+    int N = (int)x.size(0), C = (int)x.size(1);
+    int H = (int)x.size(2), W = (int)x.size(3);
+    TORCH_CHECK(C % 32 == 0, "channels must be a multiple of 32");
+    int HW = H * W;
+    auto xc = x.is_contiguous() ? x : x.contiguous();
+    auto out = at::empty_like(xc, xc.options(), at::MemoryFormat::ChannelsLast);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dim3 grid((HW + 31) / 32, C / 32, N);
+    dim3 blk(32, 8);
+    to_nhwc_kernel<<<grid, blk, 0, stream>>>(xc.data_ptr<float>(), out.data_ptr<float>(), HW, C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+at::Tensor gn_silu_nhwc_cuda(at::Tensor y, at::Tensor gamma, at::Tensor beta, double eps) {
+    TORCH_CHECK(y.is_cuda() && y.scalar_type() == at::kFloat, "float32 cuda tensor expected");
+    TORCH_CHECK(y.dim() == 4 && y.size(1) == CCH, "expected (N,256,H,W)");
+    TORCH_CHECK(y.is_contiguous(at::MemoryFormat::ChannelsLast), "expected channels_last");
+    int N = (int)y.size(0);
+    int HW = (int)(y.size(2) * y.size(3));
+
+    auto scale = at::empty({(long)N * CCH}, y.options());
+    auto shift = at::empty({(long)N * CCH}, y.options());
+    compute_affine(y, gamma, beta, N, HW, (float)eps, scale, shift);
+
+    auto out = at::empty_like(y);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    long per_img = (long)HW * 64;
+    int blocks = (int)((per_img + 255) / 256);
+    dim3 grid(blocks, N);
+    gn_apply_silu_nhwc_kernel<<<grid, 256, 0, stream>>>(
+        y.data_ptr<float>(), scale.data_ptr<float>(), shift.data_ptr<float>(),
+        out.data_ptr<float>(), HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// core of the GN+SiLU+add+relayout epilogue, writing into a caller-owned buffer
+static void gn_silu_add_nchw_core(at::Tensor& y, at::Tensor& res, at::Tensor& gamma,
+                                  at::Tensor& beta, double eps, at::Tensor& out) {
+    TORCH_CHECK(y.is_cuda() && y.scalar_type() == at::kFloat, "float32 cuda tensor expected");
+    TORCH_CHECK(y.dim() == 4 && y.size(1) == CCH, "expected (N,256,H,W)");
+    TORCH_CHECK(y.is_contiguous(at::MemoryFormat::ChannelsLast), "expected channels_last");
+    TORCH_CHECK(res.is_contiguous(), "residual must be contiguous NCHW");
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kFloat, "float32 cuda out expected");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous NCHW");
+    int N = (int)y.size(0);
+    int H = (int)y.size(2), W = (int)y.size(3);
+    int HW = H * W;
+    TORCH_CHECK(out.dim() == 4 && out.size(0) == N && out.size(1) == CCH &&
+                out.size(2) == H && out.size(3) == W, "out shape mismatch");
+    TORCH_CHECK(res.size(0) == N && res.size(1) == CCH &&
+                res.size(2) == H && res.size(3) == W, "residual shape mismatch");
+
+    auto scale = at::empty({(long)N * CCH}, y.options());
+    auto shift = at::empty({(long)N * CCH}, y.options());
+    compute_affine(y, gamma, beta, N, HW, (float)eps, scale, shift);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dim3 grid((HW + 31) / 32, CCH / 32, N);
+    dim3 blk(32, 8);
+    gn_apply_silu_add_t_kernel<<<grid, blk, 0, stream>>>(
+        y.data_ptr<float>(), res.data_ptr<float>(),
+        scale.data_ptr<float>(), shift.data_ptr<float>(),
+        out.data_ptr<float>(), HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+at::Tensor gn_silu_add_nchw_cuda(at::Tensor y, at::Tensor res, at::Tensor gamma,
+                                 at::Tensor beta, double eps) {
+    int N = (int)y.size(0);
+    int H = (int)y.size(2), W = (int)y.size(3);
+    auto out = at::empty({(long)N, (long)CCH, (long)H, (long)W}, res.options());
+    gn_silu_add_nchw_core(y, res, gamma, beta, eps, out);
+    return out;
+}
+
+// out-parameter variant: both batch chunks write disjoint slices of one buffer
+void gn_silu_add_nchw_out_cuda(at::Tensor y, at::Tensor res, at::Tensor gamma,
+                               at::Tensor beta, double eps, at::Tensor out) {
+    gn_silu_add_nchw_core(y, res, gamma, beta, eps, out);
+}
+"""
+
+_CPP_SRC = r"""
+at::Tensor to_nhwc_cuda(at::Tensor x);
+at::Tensor gn_silu_nhwc_cuda(at::Tensor y, at::Tensor gamma, at::Tensor beta, double eps);
+at::Tensor gn_silu_add_nchw_cuda(at::Tensor y, at::Tensor res, at::Tensor gamma, at::Tensor beta, double eps);
+void gn_silu_add_nchw_out_cuda(at::Tensor y, at::Tensor res, at::Tensor gamma, at::Tensor beta, double eps, at::Tensor out);
+"""
+
+_ext = load_inline(
+    name="vae_resblock_fused_v3",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["to_nhwc_cuda", "gn_silu_nhwc_cuda", "gn_silu_add_nchw_cuda",
+               "gn_silu_add_nchw_out_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Group 2 : legacy cuDNN-v7 NHWC 3x3 convolution (UNCHANGED - plan items 4/8)
+# ---------------------------------------------------------------------------
+_CONV_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cudnn/Handle.h>
+#include <cudnn.h>
+#include <map>
+#include <tuple>
+#include <vector>
+
+#define CK(expr) TORCH_CHECK((expr) == CUDNN_STATUS_SUCCESS, "cudnn call failed: ", #expr)
+
+struct ConvPlan {
+    cudnnTensorDescriptor_t      xd = nullptr;
+    cudnnTensorDescriptor_t      od = nullptr;
+    cudnnFilterDescriptor_t      fd = nullptr;
+    cudnnConvolutionDescriptor_t cd = nullptr;
+    cudnnConvolutionFwdAlgo_t    algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+    size_t                       ws = 0;
+};
+
+using ck_t = std::tuple<int,int,int,int,int>;
+static std::map<ck_t, ConvPlan> g_plans;
+
+static ConvPlan& get_plan(int N, int C, int H, int W, int K) {
+    ck_t key(N, C, H, W, K);
+    auto it = g_plans.find(key);
+    if (it != g_plans.end()) return it->second;
+
+    ConvPlan p;
+    CK(cudnnCreateTensorDescriptor(&p.xd));
+    CK(cudnnSetTensor4dDescriptor(p.xd, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, N, C, H, W));
+    CK(cudnnCreateTensorDescriptor(&p.od));
+    CK(cudnnSetTensor4dDescriptor(p.od, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, N, K, H, W));
+    CK(cudnnCreateFilterDescriptor(&p.fd));
+    CK(cudnnSetFilter4dDescriptor(p.fd, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NHWC, K, C, 3, 3));
+    CK(cudnnCreateConvolutionDescriptor(&p.cd));
+    CK(cudnnSetConvolution2dDescriptor(p.cd, 1, 1, 1, 1, 1, 1,
+                                       CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+    // CUDNN_DEFAULT_MATH == TF32 allowed for fp32 data (identical to allow_tf32=True).
+    CK(cudnnSetConvolutionMathType(p.cd, CUDNN_DEFAULT_MATH));
+    CK(cudnnSetConvolutionGroupCount(p.cd, 1));
+
+    cudnnHandle_t h = at::native::getCudnnHandle();
+
+    const size_t WS_CAP = 64ull * 1024ull * 1024ull;
+    bool found = false;
+    int cnt = 0;
+    std::vector<cudnnConvolutionFwdAlgoPerf_t> perf(CUDNN_CONVOLUTION_FWD_ALGO_COUNT);
+    if (cudnnGetConvolutionForwardAlgorithm_v7(h, p.xd, p.fd, p.cd, p.od,
+            CUDNN_CONVOLUTION_FWD_ALGO_COUNT, &cnt, perf.data()) == CUDNN_STATUS_SUCCESS) {
+        for (int i = 0; i < cnt; ++i) {
+            if (perf[i].status == CUDNN_STATUS_SUCCESS && perf[i].memory <= WS_CAP) {
+                p.algo = perf[i].algo;
+                p.ws   = perf[i].memory;
+                found  = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        p.algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+        size_t sz = 0;
+        if (cudnnGetConvolutionForwardWorkspaceSize(h, p.xd, p.fd, p.cd, p.od,
+                                                    p.algo, &sz) != CUDNN_STATUS_SUCCESS) {
+            sz = 0;
+        }
+        p.ws = sz;
+    }
+
+    auto res = g_plans.emplace(key, p);
+    return res.first->second;
+}
+
+std::vector<int64_t> conv3x3_plan(int64_t N, int64_t C, int64_t H, int64_t W, int64_t K) {
+    ConvPlan& p = get_plan((int)N, (int)C, (int)H, (int)W, (int)K);
+    return std::vector<int64_t>{(int64_t)p.algo, (int64_t)p.ws};
+}
+
+void conv3x3_nhwc_cuda(at::Tensor x, at::Tensor w, at::Tensor out, at::Tensor ws) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat, "fp32 cuda input expected");
+    TORCH_CHECK(w.is_cuda() && w.scalar_type() == at::kFloat, "fp32 cuda weight expected");
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kFloat, "fp32 cuda output expected");
+    TORCH_CHECK(x.dim() == 4 && w.dim() == 4 && out.dim() == 4, "4d tensors expected");
+    TORCH_CHECK(x.is_contiguous(at::MemoryFormat::ChannelsLast), "x must be channels_last");
+    TORCH_CHECK(w.is_contiguous(at::MemoryFormat::ChannelsLast), "w must be channels_last");
+    TORCH_CHECK(out.is_contiguous(at::MemoryFormat::ChannelsLast), "out must be channels_last");
+    TORCH_CHECK(w.size(2) == 3 && w.size(3) == 3, "3x3 filter expected");
+
+    const int N = (int)x.size(0), C = (int)x.size(1);
+    const int H = (int)x.size(2), W_ = (int)x.size(3);
+    const int K = (int)w.size(0);
+    TORCH_CHECK(w.size(1) == C, "weight channel mismatch");
+    TORCH_CHECK(out.size(0) == N && out.size(1) == K && out.size(2) == H && out.size(3) == W_,
+                "output shape mismatch");
+
+    ConvPlan& p = get_plan(N, C, H, W_, K);
+
+    const size_t ws_bytes = (size_t)ws.numel() * (size_t)ws.element_size();
+    TORCH_CHECK(ws_bytes >= p.ws, "workspace too small");
+
+    // The ATen cuDNN handle already tracks the current stream -> capture safe and
+    // it follows the python `with torch.cuda.stream(s)` guard.
+    cudnnHandle_t h = at::native::getCudnnHandle();
+
+    const float one = 1.0f, zero = 0.0f;
+    cudnnStatus_t st = cudnnConvolutionForward(
+        h, &one,
+        p.xd, x.data_ptr(),
+        p.fd, w.data_ptr(),
+        p.cd, p.algo,
+        (ws_bytes > 0 ? ws.data_ptr() : nullptr), ws_bytes,
+        &zero,
+        p.od, out.data_ptr());
+    TORCH_CHECK(st == CUDNN_STATUS_SUCCESS, "cudnnConvolutionForward failed: ", (int)st);
+}
+"""
+
+_CONV_CPP_SRC = r"""
+#include <vector>
+std::vector<int64_t> conv3x3_plan(int64_t N, int64_t C, int64_t H, int64_t W, int64_t K);
+void conv3x3_nhwc_cuda(at::Tensor x, at::Tensor w, at::Tensor out, at::Tensor ws);
+"""
+
+
+def _build_conv_ext():
+    inc, ldf = [], []
+    try:
+        import nvidia.cudnn  # type: ignore
+        root = os.path.dirname(nvidia.cudnn.__file__)
+        i = os.path.join(root, "include")
+        l = os.path.join(root, "lib")
+        if os.path.isdir(i):
+            inc.append("-I" + i)
+        if os.path.isdir(l):
+            ldf += ["-L" + l, "-Wl,-rpath," + l]
+    except Exception:
+        pass
+
+    base_cuda = [
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+    ]
+    for attempt_ld in (ldf + ["-lcudnn"], ldf):
+        try:
+            return load_inline(
+                name="cudnn_conv3x3_nhwc_v7_a",
+                cpp_sources=_CONV_CPP_SRC,
+                cuda_sources=_CONV_CUDA_SRC,
+                functions=["conv3x3_plan", "conv3x3_nhwc_cuda"],
+                verbose=False,
+                extra_cflags=["-O3", "-std=c++20"] + inc,
+                extra_cuda_cflags=base_cuda + inc,
+                extra_ldflags=attempt_ld,
+            )
+        except Exception:
+            continue
+    return None
+
+
+try:
+    _CONV_EXT = _build_conv_ext()
+except Exception:
+    _CONV_EXT = None
+
+
+def _is_capturing():
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+# plan item 2: skew stage enumeration
+_SKEW_NONE = 0
+_SKEW_AFTER_CONV1 = 1
+_SKEW_AFTER_APPLY1 = 2
+
+
+class ModelNew(nn.Module):
+    """Fused VAE res-block + CUDA-graph capture + conv plan re-selection
+       + 2-way batch-split stream pipelining with stage skew."""
+
+    _MAX_GRAPHS = 8
+    _MIN_N_FOR_SPLIT = 4          # plan item 6 (unchanged)
+
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+        # let cuDNN TIME its engine configs (untouched)
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
+        # LRU cache: key -> (graph, out_tensor)  |  key -> None (capture refused)
+        self._graphs = OrderedDict()
+
+        # v7 conv state (per-slot to avoid cross-stream buffer races, plan item 4)
+        self._conv_ext = _CONV_EXT
+        self._v7_ok = _CONV_EXT is not None
+        self._v7_validated = False
+        self._conv_state = {}      # (slot,idx,N,C,H,W,K) -> (out_buffer, workspace)
+
+        # exactly two persistent side streams
+        self._streams = None
+        try:
+            if torch.cuda.is_available():
+                self._streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        except Exception:
+            self._streams = None
+
+        # plan item 4(i): all events pre-created OUTSIDE any capture region
+        self._ev_fork = torch.cuda.Event()
+        self._ev_skew = torch.cuda.Event()
+        self._ev_end0 = torch.cuda.Event()
+        self._ev_end1 = torch.cuda.Event()
+
+    # ------------------------------------------------------------------
+    # per-shape output + workspace allocated ONCE (in warmup), per slot
+    # ------------------------------------------------------------------
+    def _make_conv_state(self, x, w, idx, slot):
+        N, C, H, W_ = int(x.size(0)), int(x.size(1)), int(x.size(2)), int(x.size(3))
+        K = int(w.size(0))
+        algo, ws_bytes = self._conv_ext.conv3x3_plan(N, C, H, W_, K)
+        out = torch.empty((N, K, H, W_), dtype=x.dtype, device=x.device,
+                          memory_format=torch.channels_last)
+        ws = torch.empty(max(int(ws_bytes), 1), dtype=torch.uint8, device=x.device)
+
+        # one-time numeric self-check against the vendor path
+        if not self._v7_validated:
+            ref = F.conv2d(x, w, None, 1, 1)
+            self._conv_ext.conv3x3_nhwc_cuda(x, w, out, ws)
+            if not torch.allclose(out, ref.contiguous(memory_format=torch.channels_last),
+                                  atol=1e-3, rtol=1e-3):
+                raise RuntimeError("cudnn v7 conv numeric mismatch")
+            self._v7_validated = True
+
+        self._conv_state[(slot, idx, N, C, H, W_, K)] = (out, ws)
+        return out, ws
+
+    # ------------------------------------------------------------------
+    # single, swappable conv issue point (slot = chunk index)
+    # ------------------------------------------------------------------
+    def _conv(self, x, w, idx, slot=0):
+        if not self._v7_ok:
+            return F.conv2d(x, w, None, 1, 1)
+
+        key = (slot, idx, int(x.size(0)), int(x.size(1)), int(x.size(2)),
+               int(x.size(3)), int(w.size(0)))
+        try:
+            st = self._conv_state.get(key)
+            if st is None:
+                if _is_capturing():
+                    # never allocate / plan inside a capture
+                    return F.conv2d(x, w, None, 1, 1)
+                st = self._make_conv_state(x, w, idx, slot)
+            out, ws = st
+            self._conv_ext.conv3x3_nhwc_cuda(x, w, out, ws)
+            return out
+        except Exception:
+            # permanent, silent revert to F.conv2d
+            self._v7_ok = False
+            self._conv_state.clear()
+            return F.conv2d(x, w, None, 1, 1)
+
+    # ------------------------------------------------------------------
+    # single-stream forward body (capture-safe): unchanged
+    # ------------------------------------------------------------------
+    def _forward_impl(self, x, conv1_weight, norm1_weight, norm1_bias,
+                      conv2_weight, norm2_weight, norm2_bias, eps_f):
+        x_c = x if x.is_contiguous() else x.contiguous()
+
+        x_nhwc = self.ext.to_nhwc_cuda(x_c)
+
+        w1 = conv1_weight if conv1_weight.is_contiguous(memory_format=torch.channels_last) \
+            else conv1_weight.contiguous(memory_format=torch.channels_last)
+        w2 = conv2_weight if conv2_weight.is_contiguous(memory_format=torch.channels_last) \
+            else conv2_weight.contiguous(memory_format=torch.channels_last)
+
+        g1 = norm1_weight if norm1_weight.is_contiguous() else norm1_weight.contiguous()
+        b1 = norm1_bias if norm1_bias.is_contiguous() else norm1_bias.contiguous()
+        g2 = norm2_weight if norm2_weight.is_contiguous() else norm2_weight.contiguous()
+        b2 = norm2_bias if norm2_bias.is_contiguous() else norm2_bias.contiguous()
+
+        y1 = self._conv(x_nhwc, w1, 0, 0)
+        if not y1.is_contiguous(memory_format=torch.channels_last):
+            y1 = y1.contiguous(memory_format=torch.channels_last)
+
+        z = self.ext.gn_silu_nhwc_cuda(y1, g1, b1, eps_f)
+
+        y2 = self._conv(z, w2, 1, 0)
+        if not y2.is_contiguous(memory_format=torch.channels_last):
+            y2 = y2.contiguous(memory_format=torch.channels_last)
+
+        out = self.ext.gn_silu_add_nchw_cuda(y2, x_c, g2, b2, eps_f)
+        return out
+
+    # ------------------------------------------------------------------
+    # plan items 1/2/4/5/9: 2-way batch split with a stage-skew edge
+    # ------------------------------------------------------------------
+    def _forward_impl_multi(self, x, conv1_weight, norm1_weight, norm1_bias,
+                            conv2_weight, norm2_weight, norm2_bias, eps_f,
+                            skew_stage=_SKEW_NONE):
+        x_c = x if x.is_contiguous() else x.contiguous()
+        N = int(x_c.size(0))
+        C = int(x_c.size(1))
+        H = int(x_c.size(2))
+        W = int(x_c.size(3))
+
+        # plan item 9: balanced split, unchanged bounds
+        c0 = N // 2
+        bounds = ((0, c0), (c0, N))
+        assert bounds[0][0] == 0 and bounds[0][1] == N // 2 and bounds[1][1] == N
+
+        w1 = conv1_weight if conv1_weight.is_contiguous(memory_format=torch.channels_last) \
+            else conv1_weight.contiguous(memory_format=torch.channels_last)
+        w2 = conv2_weight if conv2_weight.is_contiguous(memory_format=torch.channels_last) \
+            else conv2_weight.contiguous(memory_format=torch.channels_last)
+
+        g1 = norm1_weight if norm1_weight.is_contiguous() else norm1_weight.contiguous()
+        b1 = norm1_bias if norm1_bias.is_contiguous() else norm1_bias.contiguous()
+        g2 = norm2_weight if norm2_weight.is_contiguous() else norm2_weight.contiguous()
+        b2 = norm2_bias if norm2_bias.is_contiguous() else norm2_bias.contiguous()
+
+        # ONE output buffer; the two chunks write disjoint batch slices (plan item 5).
+        out = torch.empty((N, C, H, W), dtype=x_c.dtype, device=x_c.device)
+
+        cur = torch.cuda.current_stream()
+        capturing = _is_capturing()
+
+        s0, s1 = self._streams[0], self._streams[1]
+        ev_fork = self._ev_fork
+        ev_skew = self._ev_skew
+        ev_end0 = self._ev_end0
+        ev_end1 = self._ev_end1
+
+        ev_fork.record(cur)
+        s0.wait_event(ev_fork)
+        s1.wait_event(ev_fork)
+
+        skew_recorded = False
+
+        # ---------------- chunk 0 : full pipeline on stream 0 ----------------
+        n0, n1 = bounds[0]
+        with torch.cuda.stream(s0):
+            x0 = x_c[n0:n1]
+            out0 = out[n0:n1]
+            if not capturing:
+                try:
+                    out.record_stream(s0)
+                except Exception:
+                    pass
+
+            x0_nhwc = self.ext.to_nhwc_cuda(x0)
+
+            y1 = self._conv(x0_nhwc, w1, 0, 0)
+            if not y1.is_contiguous(memory_format=torch.channels_last):
+                y1 = y1.contiguous(memory_format=torch.channels_last)
+
+            # plan item 1/2: skew edge right after chunk0's conv1
+            if skew_stage == _SKEW_AFTER_CONV1:
+                ev_skew.record(s0)
+                skew_recorded = True
+
+            z = self.ext.gn_silu_nhwc_cuda(y1, g1, b1, eps_f)
+
+            # plan item 2: alternative skew point after chunk0's GN+SiLU
+            if skew_stage == _SKEW_AFTER_APPLY1:
+                ev_skew.record(s0)
+                skew_recorded = True
+
+            y2 = self._conv(z, w2, 1, 0)
+            if not y2.is_contiguous(memory_format=torch.channels_last):
+                y2 = y2.contiguous(memory_format=torch.channels_last)
+
+            self.ext.gn_silu_add_nchw_out_cuda(y2, x0, g2, b2, eps_f, out0)
+
+            ev_end0.record(s0)
+
+        # ---------------- chunk 1 : FULL pipeline on stream 1 ----------------
+        # already waited on ev_fork; add the skew edge (plan item 1)
+        if skew_recorded:
+            s1.wait_event(ev_skew)
+
+        m0, m1 = bounds[1]
+        with torch.cuda.stream(s1):
+            x1t = x_c[m0:m1]
+            out1 = out[m0:m1]
+            if not capturing:
+                try:
+                    out.record_stream(s1)
+                except Exception:
+                    pass
+
+            x1_nhwc = self.ext.to_nhwc_cuda(x1t)
+
+            u1 = self._conv(x1_nhwc, w1, 0, 1)
+            if not u1.is_contiguous(memory_format=torch.channels_last):
+                u1 = u1.contiguous(memory_format=torch.channels_last)
+
+            v = self.ext.gn_silu_nhwc_cuda(u1, g1, b1, eps_f)
+
+            u2 = self._conv(v, w2, 1, 1)
+            if not u2.is_contiguous(memory_format=torch.channels_last):
+                u2 = u2.contiguous(memory_format=torch.channels_last)
+
+            self.ext.gn_silu_add_nchw_out_cuda(u2, x1t, g2, b2, eps_f, out1)
+
+            ev_end1.record(s1)
+
+        # ---------------- join (plan item 5, unchanged) ----------------
+        cur.wait_event(ev_end0)
+        cur.wait_event(ev_end1)
+
+        return out
+
+    def _use_multi(self, x):
+        return (self._streams is not None) and (int(x.size(0)) >= self._MIN_N_FOR_SPLIT)
+
+    # ------------------------------------------------------------------
+    # plan item 3: warmup + A/B gate over candidates, then capture the winner
+    # ------------------------------------------------------------------
+    def _select_and_capture(self, args, candidates):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+
+        best = candidates[0]
+        with torch.cuda.stream(s):
+            # force cudaEventCreate for all reused events OUTSIDE the capture
+            for ev in (self._ev_fork, self._ev_skew, self._ev_end0, self._ev_end1):
+                try:
+                    ev.record(s)
+                except Exception:
+                    pass
+
+            # warm every candidate (allocates conv buffers / workspaces / temps)
+            tmp = None
+            for fn in candidates:
+                for _ in range(2):
+                    tmp = fn(*args)
+            del tmp
+            s.synchronize()
+
+            if len(candidates) > 1:
+                best_t = None
+                for fn in candidates:
+                    st_ev = torch.cuda.Event(enable_timing=True)
+                    en_ev = torch.cuda.Event(enable_timing=True)
+                    st_ev.record(s)
+                    tmp = None
+                    for _ in range(3):
+                        tmp = fn(*args)
+                    en_ev.record(s)
+                    s.synchronize()
+                    del tmp
+                    try:
+                        t = st_ev.elapsed_time(en_ev)
+                    except Exception:
+                        t = float("inf")
+                    if (best_t is None) or (t < best_t):
+                        best_t = t
+                        best = fn
+
+            # final warmup of the elected variant
+            tmp = None
+            for _ in range(3):
+                tmp = best(*args)
+            del tmp
+            s.synchronize()
+
+        torch.cuda.current_stream().wait_stream(s)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = best(*args)
+        return g, out
+
+    def _warmup_and_capture(self, args, fn):
+        return self._select_and_capture(args, [fn])
+
+    # ------------------------------------------------------------------
+    # Dispatcher (plan item 7: fallback ordering unchanged)
+    # ------------------------------------------------------------------
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        eps_f = float(eps)
+        assert x.dtype == torch.float32, "this kernel supports float32 only"
+
+        args = (x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps_f)
+
+        # Guards: nested capture / non-CUDA / non-fp32 -> plain eager path.
+        if (not x.is_cuda) or (x.dtype != torch.float32) or _is_capturing():
+            return self._forward_impl(*args)
+
+        key = (tuple(x.shape),
+               x.data_ptr(),
+               conv1_weight.data_ptr(),
+               conv2_weight.data_ptr(),
+               norm1_weight.data_ptr(),
+               norm1_bias.data_ptr(),
+               norm2_weight.data_ptr(),
+               norm2_bias.data_ptr(),
+               eps_f)
+
+        if key in self._graphs:
+            entry = self._graphs[key]
+            if entry is None:            # capture previously refused -> eager
+                return self._forward_impl(*args)
+            self._graphs.move_to_end(key)
+            g, out = entry
+            g.replay()
+            return out
+
+        # Bound the private memory pools (LRU-drop oldest).
+        while len(self._graphs) >= self._MAX_GRAPHS:
+            old_key, old_entry = self._graphs.popitem(last=False)
+            del old_key, old_entry
+
+        # multi-stream (skew A/B) capture -> single-stream capture -> eager
+        if self._use_multi(x):
+            try:
+                cands = [functools.partial(self._forward_impl_multi, skew_stage=k)
+                         for k in (_SKEW_NONE, _SKEW_AFTER_CONV1, _SKEW_AFTER_APPLY1)]
+                g, out = self._select_and_capture(args, cands)
+                g.replay()
+                self._graphs[key] = (g, out)
+                return out
+            except Exception:
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+
+        try:
+            g, out = self._warmup_and_capture(args, self._forward_impl)
+            g.replay()
+            self._graphs[key] = (g, out)
+            return out
+        except Exception:
+            # If the v7 conv path broke capture, drop it and re-capture once
+            # so the graph benefit is never lost.
+            if self._v7_ok:
+                self._v7_ok = False
+                self._conv_state.clear()
+                try:
+                    g, out = self._warmup_and_capture(args, self._forward_impl)
+                    g.replay()
+                    self._graphs[key] = (g, out)
+                    return out
+                except Exception:
+                    pass
+            self._graphs[key] = None     # sentinel: permanently eager for this key
+            return self._forward_impl(*args)

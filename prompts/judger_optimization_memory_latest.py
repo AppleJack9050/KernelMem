@@ -798,9 +798,21 @@ def build_judger_optimization_prompts(
             if isinstance(strategy, dict):
                 # Include all fields from optimization_strategy for completeness
                 bottleneck = strategy.get("bottleneck", "N/A")
-                method = strategy.get("optimisation method", strategy.get("optimization method", "N/A"))
+                # Two output schemas are asked for above -- underscored (line 119/121)
+                # and spaced (line 387/389) -- and opt_round_*.json stores whichever
+                # the judge emitted, in practice the underscored form. Only the spaced
+                # spellings were looked up here, so both always missed and every prior
+                # attempt rendered as "N/A". That blanked the only two fields that say
+                # what was actually DONE, while bottleneck/evidence/expected_metric_change/
+                # headroom matched and came through -- leaving each round able to see a
+                # past attempt's diagnosis and result but never its change, so it could
+                # neither iterate on a near-miss nor avoid re-proposing one. Read both.
+                method = strategy.get("primary_optimisation_method",
+                                      strategy.get("optimisation method",
+                                                   strategy.get("optimization method", "N/A")))
                 method_name = strategy.get("method_name", "N/A")
-                plan = strategy.get("modification plan", "N/A")
+                plan = strategy.get("modification_plan",
+                                    strategy.get("modification plan", "N/A"))
                 evidence = strategy.get("evidence", "N/A")
                 expected_metric_change = strategy.get("expected_metric_change", "N/A")
                 headroom = strategy.get("headroom", "N/A")

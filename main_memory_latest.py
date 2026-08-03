@@ -1980,7 +1980,13 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 "speedup": None,   # Will be updated after testing
                                 "test_passed": False,
                                 "repaired": False,  # Will be set to True if repaired
-                                "kernel_source": getattr(ind, "code", ""),  # Save generated kernel source for this round
+                                # Previous round's kernel. `ind` holds it on a fresh run only
+                                # because an earlier loop iteration bound it; after --resume the
+                                # loop starts mid-run and `ind` is unbound, raising
+                                # UnboundLocalError. current_kernel is assigned `ind` at the end of
+                                # every round AND restored from the checkpoint, so it is the same
+                                # object on a fresh run and the correct one after a resume.
+                                "kernel_source": getattr(current_kernel, "code", ""),
                             }
                             opt_history_file.write_text(json.dumps(opt_history, indent=2, ensure_ascii=False), encoding="utf-8")
                             # Track this opt history file for potential repair updates

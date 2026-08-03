@@ -1,0 +1,19 @@
+```json
+{
+  "critical_issue": "Persisting-L2 carve-out set in __init__ and never restored leaks device-global state",
+  "evidence": [
+    "Candidate leaked device-global state.",
+    "persisting_l2_bytes: 18874368 -> 50331648"
+  ],
+  "root_cause": "ModelNew.__init__ calls ext.init_l2_persist(48MB), which issues cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 48MB) once at construction. Nothing saves the prior 18MB value or resets it, so the reservation outlives forward() and shrinks normal L2 for all later work, including the reference. The known-good kernel has no such device-level call.",
+  "trigger_condition": "Any run: ModelNew construction executes the one-shot cudaDeviceSetLimit; the harness compares persisting_l2_bytes before/after the candidate.",
+  "must_hold_invariants": [
+    "No cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize) outside forward()",
+    "If set inside forward, save old value and restore + cudaCtxResetPersistingL2Cache() before returning",
+    "Device-global limits unchanged after candidate execution"
+  ],
+  "minimal_fix": "Delete the init_l2_persist call in __init__ (and the carve-out helper), leaving g_l2_persist_budget=0 so persist_flag returns 0 and the ld_cg path runs, matching the known-good kernel.",
+  "patch_anchor": "self.ext.init_l2_persist(48 * 1024 * 1024)",
+  "confidence": "high"
+}
+```

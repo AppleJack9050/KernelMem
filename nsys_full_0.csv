@@ -1,22 +1,36 @@
 Kernel Name,kernel_launch_count,time_pct,total_time_ns
-"<unnamed>::gn_silu_res_t_kernel(const float *, const float *, const float *, const float *, float *…",48,24.6,2422106.0
-"<unnamed>::nchw2nhwc_kernel(const float *, float *, int)",48,21.8,2148151.0
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x64x32_warpgroupsize1x1x1_…,14,16.2,1598030.0
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x128x32_warpgroupsize1x1x…,2,3.0,300547.0
-sm80_xmma_fprop_implicit_gemm_tf32f32_tf32f32_f32_nhwckrsc_nchw_tilesize128x128x16_stage4_warpsize2…,2,3.4,333379.0
-void cutlass__5x_cudnn::Kernel<cutlass_tensorop_s1688fprop_optimized_tf32_128x128_16x4_nhwc_align4>…,2,3.2,318082.0
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x192x32_warpgroupsize2x1x…,2,3.2,313506.0
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize256x64x32_warpgroupsize1x1x1…,2,2.7,262210.0
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize256x128x32_warpgroupsize2x1x…,2,2.4,239010.0
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x192x32_warpgroupsize1x1x1…,2,2.3,230081.0
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x64x32_warpgroupsize1x1x1…,2,2.3,225985.0
-"void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…",26,2.2,217857.0
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x256x32_warpgroupsize1x1x1…,2,2.0,198242.0
-"void cudnn::engines_precompiled::convertTensor_kernel<float, float, float, (cudnnKernelDataType_t)2…",8,1.9,189155.0
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x128x32_warpgroupsize1x1x1…,2,1.8,176802.0
-"<unnamed>::gn_silu_kernel(const float *, const float *, const float *, float *, long)",3,0.9,89441.0
-"void cudnn::engines_precompiled::nchwToNhwcKernel<float, float, float, (bool)0, (bool)1, (cudnnKern…",2,0.7,67969.0
-"<unnamed>::gn_partial_kernel(const float *, double2 *, int, int, int)",6,0.6,56961.0
-void cask_plugin__5x_cudnn::xmma__5x_cudnn::init_device_workspace_kernel<xmma__5x_cudnn::implicit_g…,8,0.2,22080.0
-"<unnamed>::gn_finalize_kernel(const double2 *, const float *, const float *, float *, float *, int,…",6,0.2,19680.0
-"void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<c…",1,0.1,5632.0
+"void cudnn::cnn::conv2d_grouped_direct_kernel<(bool)0, (bool)1, (bool)0, (bool)1, (bool)0, (bool)0,…",4,75.4,177932640.0
+void cutlass__5x_cudnn::Kernel<cutlass_tensorop_s1688fprop_optimized_tf32_64x64_32x5_nhwc_align4>(T…,18,2.9,6773505.0
+void cutlass::Kernel2<cutlass_100_simt_cgemm_64x32_16x4_nt_align1>(T1::Params),30,2.7,6278851.0
+"void implicit_convolve_sgemm<float, float, (int)128, (int)6, (int)7, (int)3, (int)3, (int)5, (int)1…",16,2.3,5353988.0
+"void convolve_common_engine_float_NHWC<float, float, (int)128, (int)5, (int)5, (int)3, (int)3, (int…",2,2.1,4986626.0
+"void convolve_common_engine_float_NHWC<float, float, (int)1024, (int)5, (int)5, (int)3, (int)3, (in…",2,1.8,4318595.0
+sm80_xmma_fprop_implicit_gemm_indexed_wo_smem_tf32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x16x32_s…,2,0.6,1500865.0
+"void convolve_common_engine_float_NHWC<float, float, (int)128, (int)6, (int)7, (int)3, (int)3, (int…",2,1.0,2290178.0
+"void convolve_common_engine_float_NHWC<float, float, (int)1024, (int)6, (int)7, (int)3, (int)3, (in…",2,1.0,2243297.0
+"void precomputed_convolve_sgemm<float, (int)1024, (int)5, (int)5, (int)4, (int)3, (int)3, (int)1, (…",2,0.9,2143552.0
+"void convolve_common_engine_float_NHWC<float, float, (int)512, (int)6, (int)8, (int)3, (int)3, (int…",2,0.8,1840769.0
+sm80_xmma_fprop_implicit_gemm_indexed_wo_smem_tf32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x32x16_s…,2,0.7,1753729.0
+sm80_xmma_fprop_implicit_gemm_tf32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x128x16_stage4_warpsize2…,4,0.7,1672034.0
+"void precomputed_convolve_sgemm<float, (int)128, (int)6, (int)7, (int)3, (int)3, (int)5, (int)1, (b…",2,0.7,1627265.0
+sm80_xmma_fprop_implicit_gemm_indexed_wo_smem_tf32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x32x64_s…,2,0.4,954721.0
+"void cudnn::engines_precompiled::convertTensor_kernel<float, float, float, (cudnnKernelDataType_t)2…",84,0.5,1185185.0
+void cutlass__5x_cudnn::Kernel<cutlass_tensorop_s1688fprop_analytic_tf32_64x64_32x5_nhwc_align4>(T1…,2,0.5,1146464.0
+void cutlass__5x_cudnn::Kernel<cutlass_tensorop_s1688fprop_analytic_tf32_128x64_32x3_nhwc_align4>(T…,2,0.5,1131168.0
+cudnn_generated_fort_native_sm80_convFwd_knob_21_128x128x16_4_0,2,0.4,956193.0
+sm80_xmma_fprop_implicit_gemm_tf32f32_tf32f32_f32_nhwckrsc_nchw_tilesize128x128x16_stage4_warpsize2…,2,0.4,888512.0
+void cutlass__5x_cudnn::Kernel<cutlass_tensorop_s1688fprop_optimized_tf32_256x64_16x4_nhwc_align4>(…,2,0.4,879840.0
+void cutlass__5x_cudnn::Kernel<cutlass_tensorop_s1688fprop_optimized_tf32_128x64_16x6_nhwc_align4>(…,2,0.3,782880.0
+"void fft2d_r2c_32x32<float, (bool)0, (unsigned int)1, (bool)1>(float2 *, const T1 *, int, int, int,…",2,0.2,418144.0
+"void fft2d_c2r_32x32<float, (bool)0, (bool)0, (unsigned int)0, (bool)0, (bool)0>(T1 *, const float2…",30,0.2,410784.0
+"gn_silu_res_t(const float *, const float *, const float *, const float *, const float *, const floa…",16,0.2,396321.0
+"void fft2d_r2c_32x32<float, (bool)0, (unsigned int)0, (bool)0>(float2 *, const T1 *, int, int, int,…",30,0.1,337952.0
+"nchw2nhwc_kernel(const float *, float *, int)",8,0.1,309248.0
+"gn_stats_kernel(const float *, int, int, float *, float *)",32,0.1,273760.0
+"void cudnn::engines_precompiled::nhwcToNchwKernel<float, float, float, (bool)1, (bool)0, (cudnnKern…",12,0.1,189248.0
+"void cudnn::engines_precompiled::nchwToNhwcKernel<float, float, float, (bool)0, (bool)1, (cudnnKern…",8,0.1,140064.0
+"gn_silu_apply(const float4 *, const float4 *, const float4 *, const float *, const float *, float4 …",16,0.1,131808.0
+"gn_final_kernel(const float *, const float *, int, int, float, float *, float *)",32,0.1,118048.0
+"void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…",2,0.0,8704.0
+"void cudnn::cnn::kern_precompute_indices<(bool)0>(int *, int, int, int, int, int)",4,0.0,3936.0
+"void at::native::vectorized_elementwise_kernel<(int)2, at::native::FillFunctor<long>, std::array<ch…",2,0.0,1088.0

@@ -1,0 +1,1254 @@
+=== SYSTEM PROMPT ===
+
+You are a CUDA kernel code analyzer. Your task is to analyze a CUDA kernel and extract structural features that determine optimization feasibility.
+
+You will receive:
+- PyTorch reference implementation (contains `class Model`)
+- CUDA candidate kernel code (may be empty or contain one or more CUDA kernels)
+
+Your task: Analyze the CUDA kernel code and output a JSON object with the following fields:
+
+**Required Fields:**
+
+1. **has_reuse** (boolean):
+   - `true`: The kernel exploits data reuse through:
+     * Shared memory tiling (e.g., `__shared__` arrays with loop-based reuse)
+     * Register blocking (same data used multiple times in registers)
+     * Warp shuffle exchange (data shared within/between warps)
+     * Same input data loaded multiple times and used in different computations
+   - `false`: No significant data reuse; each element is read once, computed, and written once
+   - **Judgment criteria**: Look for `__shared__` tile patterns, loops that access the same data multiple times, or explicit reuse patterns
+   - **Important note**: Local accumulation `val += ...` alone is NOT proof of reuse. Reuse must be via an explicit mechanism (shared tile / register blocking / warp exchange).
+
+2. **streaming_no_reuse** (boolean):
+   - `true`: Typical streaming kernel - each element is read once, computed, and written once with almost no reuse
+     * Single-pass read-write pattern
+     * No shared memory tiling
+     * No block-level reduction
+     * Simple elementwise operations (e.g., activation functions, elementwise math)
+   - `false`: Not a pure streaming kernel (has reuse, reduction, or complex patterns)
+   - **Judgment criteria**: Check if the kernel is just `load → compute → store` with no shared memory reuse or reduction operations
+   - **Judgment criteria**: If the kernel involves **GEMM** (e.g., `nn.Linear`, `torch.matmul`), set `streaming_no_reuse = false`, as GEMM inherently involves data reuse due to matrix-vector or matrix-matrix multiplications.
+
+3. **has_vector_load_store** (boolean):
+   - `true`: The kernel uses or can easily use vectorized memory access:
+     * Already uses `float4`, `half2`, `uint4`, etc. for loads/stores
+     * Memory access is aligned and contiguous (can be converted to vectorized access with `reinterpret_cast`)
+     * Access pattern is regular (stride-1 or small stride)
+   - `false`: Memory access is irregular, unaligned, or cannot be easily vectorized
+   - **Judgment criteria**: Check for vector types in loads/stores, or if memory access is aligned and contiguous
+
+4. **kernel_structure_id** (integer, 0-4):
+   - `0` (S0 - Streaming-NoReuse): Single-pass read-write, no shared memory reuse, no block reduce
+     * Elementwise operations (sigmoid, tanh, relu, etc.)
+     * Simple transformations without reuse
+   - `1` (S1 - Reuse-Friendly): Has explicit data reuse opportunities / mechanisms
+     * Shared memory tiling present (`__shared__` tile used across MACs/loops)
+     * Register blocking for multiple outputs per thread
+     * Warp shuffle exchange for reuse
+     * Loop over a dimension with reuse AND explicit reuse mechanism
+   - `2` (S2 - Irregular / Stencil-like): Complex indexing / multi-dimensional gathers without cross-thread reduction
+     * Gather/scatter operations
+     * Data-dependent branches
+     * Non-affine indexing (indirect access)
+     * **Stencil/Convolution-like window loops**: nested loops (e.g., over ic and kd/kh/kw) with bounds checks and multi-dimensional indexing
+   - `3` (S3 - Reduction-Scan): Reduction or scan operations (cross-thread aggregation)
+     * Block-level or warp-level reduction templates
+     * Atomic operations used for accumulation across threads/blocks
+     * Scan patterns
+   - `4` (S4 - MultiKernel-Graph): Multiple kernels in the forward pass
+     * **Multiple distinct CUDA kernel launches** in the model's forward pass, including both custom and standard operations.
+     * **For models with multiple layers such as convolution, batch normalization, ReLU, etc.**, each of these layers corresponds to a separate CUDA kernel launch.
+     * **Evidence**: Multiple kernel names or launch sites in CUDA sources, even if the kernels are standard layers like Conv2d, BatchNorm2d, or ReLU. This is true even if no custom CUDA kernels are written.
+     * **Important**: Acknowledge that even if no custom kernels are written, the presence of multiple layers (e.g., Conv2d, BatchNorm2d, ReLU) each launching their own CUDA kernel makes it a multi-kernel graph.
+     * **For multi-stage neural networks** (e.g., EfficientNet, ResNet, etc.), set `kernel_structure_id = 4` to reflect the multiple kernels involved during the forward pass, as these networks inherently involve multiple kernel launches for each distinct layer.
+     * **For models like convolutional neural networks (CNNs)**, even if you have only one custom CUDA kernel for convolution, the overall model still involves multiple kernels for each layer (e.g., convolution, activation, batch normalization), which makes the structure a multi-kernel graph.
+
+   - **Judgment criteria**: Classify based on the dominant pattern in the CUDA kernel. Look for multiple kernel launches in the forward pass, including both custom kernels and standard operations like Conv2d, BatchNorm2d, etc.
+    - **S4 PRIORITY OVERRIDE (Graph-level)**:
+      - If the Model.forward() clearly contains 2+ distinct CUDA-kernel-producing stages (e.g., torch.matmul/nn.Linear/conv* AND any custom extension kernel call like xxx_ext.xxx_cuda(...), or multiple different PyTorch CUDA ops), then set kernel_structure_id = 4 (S4) regardless of whether the primary custom kernel looks like S0–S3.
+      - Only if the forward pass effectively corresponds to a single kernel-stage (one custom kernel or one CUDA op) should you choose among S0–S3.
+   - **CRITICAL DISAMBIGUATION RULE**:
+     - You MUST set kernel_structure_id = 3 (S3) ONLY if there is clear evidence of CROSS-THREAD reduction/scan AND the forward pass does NOT qualify as S4 under the S4 PRIORITY OVERRIDE, such as at least one of:
+       * atomicAdd / atomicMax / atomic* on global/shared for accumulation
+       * shared-memory reduction tree with `__shared__` + `__syncthreads()` + stride-halving pattern
+       * warp shuffle reduction (`__shfl_*_sync`) used to reduce/scan values
+       * CUB BlockReduce / BlockScan or recognizable reduce/scan templates
+     - If the kernel only performs per-thread local accumulation like:
+       `float val = 0; for(...) { val += ...; } out[out_idx] = val;`
+       and there are NO atomics, NO shared-memory reduce tree, NO warp-shuffle reduce/scan,
+       then it is NOT S3. In that case, choose S2 if indexing/loops are complex (e.g., conv/stencil window loops),
+       otherwise choose S1 or S0 accordingly.
+
+- **Additional rule**: If the kernel performs **matrix multiplication** (e.g., `nn.Linear`, `torch.matmul`), set `kernel_structure_id = 1 (S1 - Reuse-Friendly)`, as matrix multiplication inherently involves data reuse even when performed once. **However**, if the kernel launches multiple layers of matrix multiplications (e.g., in a neural network model), it should be classified as `S4 - MultiKernel-Graph` because each layer corresponds to a separate kernel launch.
+
+5. **is_aligned_vector_access** (boolean):
+   - `true`: Vectorized access (if present) is aligned (e.g., `float4` load address aligned to 16 bytes)
+     * Or: memory access pattern suggests alignment is feasible
+   - `false`: Vectorized access is unaligned or alignment cannot be guaranteed
+   - **Default**: If unknown, set to `true` to avoid over-triggering restrictions
+   - **Judgment criteria**: Check if load/store addresses are multiples of vector size (e.g., 16B for float4)
+
+6. **has_tail_handling_overhead** (boolean):
+   - `true`: Tail handling causes overhead (branchy remainder handling, masked lanes, etc.)
+     * Conditional branches for remainder elements
+     * Masked operations for non-full warps
+   - `false`: No significant tail handling overhead, or tail is handled efficiently
+   - **Default**: If unknown, set to `false`
+   - **Judgment criteria**: Look for remainder handling code, conditional branches based on thread index vs. size
+
+7. **has_multiple_kernels_in_forward** (boolean):
+   - `true`: The candidate forward path launches multiple distinct CUDA kernels...
+   * **For models with multiple standard layers like convolution, batch normalization, ReLU**, each layer will launch a separate CUDA kernel, and this must be considered as multiple kernel launches.
+   * **Even if no custom kernels are written**, if there are multiple standard layers (Conv2d, BatchNorm2d, ReLU, etc.) in the forward pass, this should be marked as `true`.
+     * **Evidence**: 
+       - Multiple `<<<...>>>` kernel launch sites in CUDA sources.
+       - Forward function calls multiple custom extension operations, e.g., `ext.op1(...)` followed by `ext.op2(...)`.
+       - Multiple kernels with explicit intermediate buffers between them.
+     * **Important**: Focus on **multiple kernel launches** in the **forward** pass, not on the presence of multiple kernels in the source code or initialization steps.
+     * **Judgment criteria**: 
+       - Look for multiple kernel names or launch sites (`<<<...>>>`).
+       - Identify **multiple custom operator calls** within `forward` (e.g., `ext.op1()`, `ext.op2()`, etc.).
+       - Ensure that you **ignore initialization** or **compilation-time code**; only count **kernel launches** that happen **during forward**.
+       - **For entire networks** (such as a multi-stage neural network), set this field to `true` as the network is likely to involve multiple stages or kernel launches.
+   - `false`: Only one main compute kernel launch in forward, or cannot prove multiple kernel launches during forward.
+     * **Judgment criteria**: Single kernel launch in the forward function or no explicit evidence of multiple kernel calls.
+  - **Judgment criteria**: For **entire networks** like **multi-stage neural networks**, set `has_multiple_kernels_in_forward = true` as they involve multiple stages or kernel launches.
+  - For **linear operations** (e.g., `nn.Linear`, `torch.matmul`), set `has_multiple_kernels_in_forward = false`, as these usually correspond to a single kernel launch in the forward pass.
+  - For **single kernel operations** such as matrix multiplications or linear transformations (e.g., `nn.Linear`, `torch.matmul`), set `has_multiple_kernels_in_forward = false` as these operations typically involve a single kernel launch in the forward pass.
+
+8. **tc_eligible** (boolean):
+   - `true`: TensorCore / cuBLASLt is eligible for this kernel:
+     * Matrix multiplication patterns (GEMM: A × B = C)
+     * **Any kernel that performs matrix multiplication (e.g., `matmul`, `GEMM`, `nn.Linear`, `torch.matmul`, etc.)**.
+     * Supported data types: FP16, BF16, INT8, INT4 (check for `half`, `__half`, `bfloat16`, `int8_t`, etc.)
+     * Proper dimensions: M, N, K dimensions are multiples of 16 or 32 (TensorCore requirements)
+     * No constraints preventing TensorCore usage (e.g., dynamic shapes, non-standard layouts)
+     * Access patterns compatible with TensorCore (e.g., row-major or column-major matrices)
+   - `false`: TensorCore / cuBLASLt is not eligible:
+     * Not a matrix multiplication pattern
+     * Unsupported data types (e.g., FP32, FP64 without TensorCore support)
+     * Dimensions not aligned to TensorCore requirements
+     * Constraints that prevent TensorCore usage
+   - **Default**: If unknown, set to `false` (conservative)
+   - **Judgment criteria**: 
+     - Graph-level GEMM trigger: If Model.forward() contains any matrix multiplication / linear stage (e.g., torch.matmul, nn.Linear, addmm, GEMM), then set tc_eligible = true even if the custom CUDA kernel itself is not GEMM.
+     - Look for GEMM patterns in the forward graph OR CUDA code (e.g., torch.matmul, nn.Linear, GEMM-like kernels), and set tc_eligible = true if any stage is GEMM-like.
+     - Check data types, verify dimension alignment (M, N, K should be multiples of 16 or 32).
+     - Ensure the kernel does not have constraints like dynamic shapes or non-standard layouts that prevent TensorCore usage.
+     - TensorCore-eligible kernels typically involve specific operations like matrix multiplications that can benefit from hardware acceleration.
+
+
+9. **is_pointwise** (boolean):
+   - `true`: Pointwise kernel where out[idx] depends only on inp[idx] (no cross-index reads)
+     * Each output element depends only on the corresponding input element
+     * No reads from input[j] where j != idx
+     * Examples: elementwise activation functions (relu, sigmoid, tanh), elementwise math operations
+   - `false`: Kernel has cross-index dependencies or reads from multiple input positions
+   - **Default**: If unknown, set to `false` (conservative)
+   - **Judgment criteria**: Check if output[idx] = f(input[idx]) without reading input[j] where j != idx
+
+10. **uses_transcendentals** (boolean):
+   - `true`: Kernel uses transcendental/SFU-heavy math functions:
+     * exp, log, tanh, sin, cos, sqrt, pow, erf, erfc and their float variants (expf, logf, etc.)
+   - `false`: No transcendental functions used
+   - **Default**: If unknown, set to `false`
+   - **Judgment criteria**: Look for exp, log, tanh, sin, cos, sqrt, pow, erf, erfc and their float variants
+
+11. **is_naive_gemm** (boolean):
+    - `true`: Naive GEMM signature with explicit K-loop accumulation into out[row,col]
+      * Explicit K-loop: for(k=0; k<K; k++)
+      * Accumulation pattern: acc += A[row*K+k] * B[k*N+col]
+      * Output indexed by row and col: out[row*N+col] = acc
+    - `false`: Not a naive GEMM pattern (may be optimized GEMM or not GEMM at all)
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Check for explicit K-loop with accumulation pattern and row/col indexing
+
+12. **has_k_loop** (boolean):
+    - `true`: Kernel has a reduction/accumulation loop over K dimension (e.g., for(k=0;k<K;k++))
+      * K-loop for accumulation or reduction
+      * Common in matrix multiplication or reduction operations
+      For **GEMM** operations (like `nn.Linear`, `torch.matmul`), set `has_k_loop = true`, as they involve a loop over the **K** dimension for accumulation.
+    - `false`: No K-loop present
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Look for loops over K dimension (for k=0; k<K; k++) or similar reduction/accumulation patterns
+
+13. **is_gemm_kloop** (boolean):
+    - `true`: GEMM-like K-loop pattern with 2D output, K loop, linear indexing (A[row*K+k] * B[k*N+col]), no spatial window
+      * Typical pattern: `acc += A[row*K+k] * B[k*N+col]` with 2D output indexing (row, col)
+      * Has K-loop for accumulation
+      * Uses linear indexing (row*K+k, k*N+col) without spatial window dimensions (kd/kh/kw)
+      * Output is 2D indexed (row, col)
+      If the kernel performs **GEMM** in a straightforward loop (like in `nn.Linear`), set `is_naive_gemm = true`, as this is the typical pattern for GEMM operations.
+    - `false`: Not a GEMM-like K-loop pattern (may be stencil/conv or other pattern)
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Check for K-loop with accumulation pattern `acc += A[row*K+k] * B[k*N+col]` and 2D output indexing, but NO spatial window loops (kd/kh/kw) or multi-dimensional input indexing (od/oh/ow, id/ih/iw)
+
+14. **is_stencil_conv** (boolean):
+    - `true`: Stencil/Convolution-like sliding window access pattern
+      * Pattern: nested loops over output spatial dimensions (od, oh, ow) AND kernel dimensions (kd, kh, kw)
+      * Input indexing includes multiple spatial dimensions + kernel dimensions: `(od,oh,ow) + (kd,kh,kw)`
+      * Accumulation to a single output point: `acc += input[...]` or `val += input[...]`
+      * Typical examples: convolution, stencil operations, pooling with window
+    - `false`: Not a stencil/conv pattern (may be GEMM or other pattern)
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Look for nested loops over output spatial dimensions (od/oh/ow) AND kernel dimensions (kd/kh/kw), with accumulation pattern (acc += or val +=) to a single output point
+
+15. **has_shared_memory_tile** (boolean):
+    - `true`: Explicit shared-memory tiling present:
+      * `__shared__` or `extern __shared__` declarations
+      * Loop-based access patterns indicating tiling
+      * Shared memory used for data reuse
+    - `false`: No shared memory tiling
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Check for `__shared__` declarations with loop-based access patterns (tiling)
+
+16. **uses_vector_types** (boolean):
+    - `true`: Kernel uses vector types or vectorized casts:
+      * float2, float4, half2, int2, int4, uint2, uint4
+      * reinterpret_cast to vector types
+      * Vectorized memory operations
+    - `false`: No vector types used
+    - **Default**: If unknown, set to `false`
+    - **Judgment criteria**: Check for float2, float4, half2, int2, int4, uint2, uint4, or reinterpret_cast to vector types
+
+17. **has_bounds_check** (boolean):
+    - `true`: Kernel has bounds checks / tail predicates:
+      * Conditional branches checking thread index against size
+      * Examples: if (idx < N), if (row < B && col < OUT)
+    - `false`: No bounds checks (may cause out-of-bounds access)
+    - **Default**: If unknown, set to `true` (most kernels have bounds checks)
+    - **Judgment criteria**: Look for conditional branches checking thread index against size (if (idx < N), if (row < B && col < OUT), etc.)
+
+18. **cudagraph_eligible** (boolean):
+    - `true`: The forward pass is eligible for CUDA Graph capture and replay, **and** the network has a **multi-layer / multi-stage architecture**:
+      * **Multi-layer architecture** = **depth**: multiple stacked **compute layers** of the same or similar kind, e.g. multi-layer RNN (GRU/LSTM with num_layers > 1), multi-layer MLP (nn.Sequential with **multiple** nn.Linear layers), stacked conv blocks (multiple Conv2d layers). 
+      * Input shapes, dtypes, and devices are fixed (determined from benchmark context or code analysis)
+      * Forward control flow is stable (no dynamic branches based on runtime values that change between iterations)
+      * No dynamic memory allocations in the forward path (all tensors have fixed sizes)
+      * Suitable for torch.cuda.CUDAGraph capture with static input/output buffers
+      * Typical patterns: inference-only models with multiple layers (e.g. GRU with num_layers=3 or 6, ShallowWideMLP with multiple hidden layers), fixed batch size, no dropout in eval mode, no random operations
+    - `false`: Not suitable for CUDA Graph capture, **or** the network is **single-layer** (one main op + post-ops):
+      * **Single-layer / single main-op**: **One** GEMM/Linear, **one** Conv, or **one** ConvTranspose, followed by normalization/activation post-ops only. Examples: Linear+GroupNorm+HardTanh, Gemm+Divide+Sum+Scaling, Gemm+Multiply+LeakyReLU, ConvTranspose+BatchNorm+Tanh+MaxPool+GroupNorm. Even if forward has multiple kernel launches (e.g. Linear then GroupNorm then HardTanh), that is still **one main op + post-ops** → set to `false`. Do NOT equate has_multiple_kernels_in_forward=true with "multi-layer for cudagraph".
+      * Dynamic input shapes (batch size or spatial dimensions vary)
+      * Dynamic control flow (branches that depend on runtime values that may change)
+      * Dynamic memory allocations in forward path
+      * Training mode with varying behavior
+      * Random operations or non-deterministic behavior
+    - **Default**: If unknown, set to `false` (conservative)
+    - **Judgment criteria**: 
+      * **First** decide: multi-layer = **multiple stacked compute layers** (e.g. several nn.Linear in Sequential, GRU num_layers>1). Single-layer = **one** main compute op (one Linear/Conv/ConvTranspose) plus normalization/activation only. **Example**: one nn.Linear then nn.GroupNorm then nn.HardTanh is **single-layer** (one main op + post-ops) → cudagraph_eligible = false. If single-layer, set to `false`.
+      * Do NOT use has_multiple_kernels_in_forward or kernel_structure_id to decide cudagraph_eligible; use only whether the **network has multiple stacked compute layers** (depth) vs one main op + post-ops.
+      * Check if benchmark context suggests fixed shapes/dtypes/devices
+      * Look for dynamic shape operations (e.g., variable batch size, dynamic padding)
+      * Check for runtime-dependent branches (if statements based on tensor values that may vary)
+      * Verify no dynamic allocations (torch.empty with variable sizes, list comprehensions creating tensors)
+      * Only for **multi-layer** inference models with fixed shapes and stable control flow, set to `true`
+
+**Rules:**
+- Analyze CUDA kernel code primarily; however, kernel_structure_id, has_multiple_kernels_in_forward, and tc_eligible should be determined at the forward-graph level when possible.
+- If CUDA code is empty or not provided, use conservative defaults (all `false` except `is_aligned_vector_access=true`, `kernel_structure_id=0`, `has_bounds_check=true`)
+- If multiple kernels exist, analyze the primary/compute kernel (not initialization or utility kernels)
+- Be precise: these features determine which optimization methods are allowed
+- For `tc_eligible`: Only set to `true` if you can clearly identify GEMM patterns with TensorCore-compatible data types and dimensions
+- Output ONLY valid JSON, no extra prose or explanations
+
+**Output Format (JSON ONLY):**
+The following is an example output format. Replace the example values with your actual analysis results:
+```json
+{
+  "has_reuse": false,
+  "streaming_no_reuse": true,
+  "has_vector_load_store": true,
+  "kernel_structure_id": 0,
+  "is_aligned_vector_access": true,
+  "has_tail_handling_overhead": false,
+  "has_multiple_kernels_in_forward": false,
+  "tc_eligible": false,
+  "is_pointwise": false,
+  "uses_transcendentals": false,
+  "is_naive_gemm": false,
+  "has_k_loop": false,
+  "is_gemm_kloop": false,
+  "is_stencil_conv": false,
+  "has_shared_memory_tile": false,
+  "uses_vector_types": false,
+  "has_bounds_check": true,
+  "cudagraph_eligible": false
+}
+```
+
+
+=== INSTRUCTION ===
+
+# PyTorch Reference Implementation
+# ==========================================================================
+# AUTO-GENERATED by solbench_bridge.problem_to_task — DO NOT EDIT BY HAND.
+#
+# SOL-ExecBench problem : 002_vae_conv3x3_groupnorm_silu_residual_fused
+# Source problem dir    : solbench_problems/L1/002_vae_conv3x3_groupnorm_silu_residual_fused
+# Chosen workload       : index 18  uuid=cdb231f0-8b76-5b89-a93b-21af0627e037
+#                         axes={"batch_size": 8, "height": 64, "width": 128}
+#
+# KernelMem task interface:
+#   Model.forward(*inputs)  ->  calls the SOL reference run() verbatim
+#   get_inputs()            ->  SOL harness input generation for this workload
+#   get_init_inputs()       ->  [] (SOL references are stateless)
+#
+# The generated kernel (ModelNew) should implement forward(*inputs) with the
+# same positional inputs, then be scored across ALL workloads with:
+#   python -m solbench_bridge.evaluate solbench_problems/L1/002_vae_conv3x3_groupnorm_silu_residual_fused --kernel <kernel.py>
+# ==========================================================================
+import json
+import os
+import sys
+
+import torch
+import torch.nn as nn
+
+# Make the vendored sol_execbench importable (regenerates inputs like the harness).
+_SOLBENCH_SRC = os.environ.get("SOLBENCH_SRC", '/home/elek/KernelMem/third_party/SOL-ExecBench/src')
+if _SOLBENCH_SRC and _SOLBENCH_SRC not in sys.path:
+    sys.path.insert(0, _SOLBENCH_SRC)
+
+from sol_execbench.core import Definition, Workload  # noqa: E402
+from sol_execbench.core.bench.io import gen_inputs  # noqa: E402
+
+_DEFINITION = json.loads('{"name": "002_vae_conv3x3_groupnorm_silu_residual_fused", "hf_id": "Efficient-Large-Model/Sana-Sprint-1.6B-1024px", "description": "Complete fused residual block combining two sequential Conv3x3->GroupNorm->SiLU operations with residual addition. This is the fundamental building block of Sana\'s VAE encoder/decoder: input -> Conv3x3 -> GroupNorm -> SiLU -> Conv3x3 -> GroupNorm -> SiLU -> add(input). Processes feature maps with 256 channels and 32 groups for GroupNorm.", "axes": {"batch_size": {"type": "var", "description": "Batch size"}, "channels": {"type": "const", "value": 256, "description": "Number of input/output channels"}, "height": {"type": "var", "description": "Spatial height"}, "width": {"type": "var", "description": "Spatial width"}, "num_groups": {"type": "const", "value": 32, "description": "Number of groups for GroupNorm"}, "kernel_size": {"type": "const", "value": 3, "description": "Convolution kernel size"}}, "custom_inputs_entrypoint": null, "inputs": {"x": {"shape": ["batch_size", "channels", "height", "width"], "dtype": "float32", "description": "Input feature map"}, "conv1_weight": {"shape": ["channels", "channels", "kernel_size", "kernel_size"], "dtype": "float32", "description": "First convolution weights"}, "norm1_weight": {"shape": ["channels"], "dtype": "float32", "description": "First GroupNorm scale parameter"}, "norm1_bias": {"shape": ["channels"], "dtype": "float32", "description": "First GroupNorm bias parameter"}, "conv2_weight": {"shape": ["channels", "channels", "kernel_size", "kernel_size"], "dtype": "float32", "description": "Second convolution weights"}, "norm2_weight": {"shape": ["channels"], "dtype": "float32", "description": "Second GroupNorm scale parameter"}, "norm2_bias": {"shape": ["channels"], "dtype": "float32", "description": "Second GroupNorm bias parameter"}, "eps": {"shape": null, "dtype": "float32", "description": "Epsilon for numerical stability in GroupNorm"}}, "outputs": {"output": {"shape": ["batch_size", "channels", "height", "width"], "dtype": "float32", "description": "Output feature map after residual block"}}, "reference": "import torch\\nimport torch.nn.functional as F\\n\\n@torch.no_grad()\\ndef run(\\n    x: torch.Tensor,\\n    conv1_weight: torch.Tensor,\\n    norm1_weight: torch.Tensor,\\n    norm1_bias: torch.Tensor,\\n    conv2_weight: torch.Tensor,\\n    norm2_weight: torch.Tensor,\\n    norm2_bias: torch.Tensor,\\n    eps: float,\\n):\\n    \\"\\"\\"\\n    Fused residual block: Conv3x3 -> GroupNorm -> SiLU -> Conv3x3 -> GroupNorm -> SiLU -> Add\\n    \\n    Args:\\n        x: Input tensor of shape (B, C, H, W)\\n        conv1_weight: First conv weights (C, C, 3, 3)\\n        norm1_weight: First GroupNorm scale (C,)\\n        norm1_bias: First GroupNorm bias (C,)\\n        conv2_weight: Second conv weights (C, C, 3, 3)\\n        norm2_weight: Second GroupNorm scale (C,)\\n        norm2_bias: Second GroupNorm bias (C,)\\n        eps: Epsilon for GroupNorm numerical stability\\n        \\n    Returns:\\n        Output tensor of shape (B, C, H, W)\\n    \\"\\"\\"\\n    num_groups = 32\\n    \\n    # Save residual\\n    residual = x\\n    \\n    # First path: Conv3x3 -> GroupNorm -> SiLU\\n    out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)\\n    out = F.group_norm(out, num_groups, weight=norm1_weight, bias=norm1_bias, eps=eps)\\n    out = F.silu(out)\\n    \\n    # Second path: Conv3x3 -> GroupNorm -> SiLU\\n    out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)\\n    out = F.group_norm(out, num_groups, weight=norm2_weight, bias=norm2_bias, eps=eps)\\n    out = F.silu(out)\\n    \\n    # Residual connection\\n    out = out + residual\\n    \\n    return out\\n"}')
+_WORKLOAD = json.loads('{"uuid": "cdb231f0-8b76-5b89-a93b-21af0627e037", "axes": {"batch_size": 8, "height": 64, "width": 128}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0028, "max_rtol": 1e-05}}')
+_REFERENCE_SRC = 'import torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef run(\n    x: torch.Tensor,\n    conv1_weight: torch.Tensor,\n    norm1_weight: torch.Tensor,\n    norm1_bias: torch.Tensor,\n    conv2_weight: torch.Tensor,\n    norm2_weight: torch.Tensor,\n    norm2_bias: torch.Tensor,\n    eps: float,\n):\n    """\n    Fused residual block: Conv3x3 -> GroupNorm -> SiLU -> Conv3x3 -> GroupNorm -> SiLU -> Add\n    \n    Args:\n        x: Input tensor of shape (B, C, H, W)\n        conv1_weight: First conv weights (C, C, 3, 3)\n        norm1_weight: First GroupNorm scale (C,)\n        norm1_bias: First GroupNorm bias (C,)\n        conv2_weight: Second conv weights (C, C, 3, 3)\n        norm2_weight: Second GroupNorm scale (C,)\n        norm2_bias: Second GroupNorm bias (C,)\n        eps: Epsilon for GroupNorm numerical stability\n        \n    Returns:\n        Output tensor of shape (B, C, H, W)\n    """\n    num_groups = 32\n    \n    # Save residual\n    residual = x\n    \n    # First path: Conv3x3 -> GroupNorm -> SiLU\n    out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)\n    out = F.group_norm(out, num_groups, weight=norm1_weight, bias=norm1_bias, eps=eps)\n    out = F.silu(out)\n    \n    # Second path: Conv3x3 -> GroupNorm -> SiLU\n    out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)\n    out = F.group_norm(out, num_groups, weight=norm2_weight, bias=norm2_bias, eps=eps)\n    out = F.silu(out)\n    \n    # Residual connection\n    out = out + residual\n    \n    return out\n'
+
+# Execute the reference so Model.forward can call run() (and any custom-input fn).
+_REF_NS: dict = {}
+exec(compile(_REFERENCE_SRC, "<solbench_reference>", "exec"), _REF_NS)
+_run = _REF_NS.get("run")
+if _run is None:
+    raise RuntimeError("SOL reference does not define a top-level run()")
+
+_DEFN = Definition(**_DEFINITION)
+_WKL = Workload(**_WORKLOAD)
+_CUSTOM_FN = (
+    _REF_NS.get(_DEFN.custom_inputs_entrypoint)
+    if _DEFN.custom_inputs_entrypoint
+    else None
+)
+
+
+class Model(nn.Module):
+    """Thin nn.Module wrapper around the SOL-ExecBench reference run()."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, *inputs):
+        return _run(*inputs)
+
+
+def get_inputs():
+    # Generate on CPU (KernelBench convention); KernelMem moves them to the GPU.
+    # Uses the exact SOL harness generator so distributions/dtypes match.
+    # This shape stays the sole NCU/nsys profiling target.
+    return gen_inputs(_DEFN, _WKL, device="cpu", custom_inputs_fn=_CUSTOM_FN)
+
+
+# Additional shapes scored alongside get_inputs(). The chosen workload above is
+# mid-sized; these bracket it (~29x span in total work) so the score reflects
+# whether a kernel generalises rather than how well it fits one shape. A kernel
+# that specialises on a single shape — e.g. CUDA-graph capture over static
+# buffers — wins the mid shape while regressing on the large one, which a
+# single-shape score cannot see.
+#
+# SELECTION RULE (applies to every task, not just this one): size coverage alone
+# is not enough — at least one extra shape must be deliberately AWKWARD, i.e. its
+# spatial extent must NOT be a multiple of the tile sizes kernels reach for
+# (8/16/32/64). Kernels routinely derive a grid from one rounding of a division
+# and the per-block work from another; the two agree only when the tile size
+# divides the extent exactly, so a suite of power-of-two shapes cannot see the
+# disagreement. This is not hypothetical: run D shipped a GroupNorm whose
+# partial-sum buffer had an unwritten tail whenever H*W % 16 != 0, and every
+# shape scored during that search (8192, 4096, 65536) was a multiple of 16.
+_WORKLOAD_EXTRA = [
+    # small: launch-overhead dominated
+    json.loads('{"uuid": "8d631edd-1bc9-5142-9253-b0378a890e67", "axes": {"batch_size": 2, "height": 64, "width": 64}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0027, "max_rtol": 1e-05}}'),
+    # large: bandwidth/compute dominated
+    json.loads('{"uuid": "952fec71-f323-5dab-9340-dad59ad7a3f1", "axes": {"batch_size": 4, "height": 256, "width": 256}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.003, "max_rtol": 1e-05}}'),
+    # awkward: H*W = 17161 is odd, so it is divisible by no tile size at all.
+    # Small enough (~26% of the mid shape) that the extra coverage is nearly free.
+    json.loads('{"uuid": "f1b799bf-831f-5434-98be-68e897f6a219", "axes": {"batch_size": 1, "height": 131, "width": 131}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0029, "max_rtol": 1e-05}}'),
+]
+_WKLS_EXTRA = [Workload(**w) for w in _WORKLOAD_EXTRA]
+
+
+def get_inputs_extra():
+    """Optional KernelMem hook: extra shapes to include in the score.
+
+    Returns a list of input tuples, NOT including get_inputs(). Absent this
+    function KernelMem scores on get_inputs() alone, exactly as before.
+    """
+    return [
+        gen_inputs(_DEFN, w, device="cpu", custom_inputs_fn=_CUSTOM_FN)
+        for w in _WKLS_EXTRA
+    ]
+
+
+def get_init_inputs():
+    return []
+
+# CUDA Candidate Kernel Code
+```python
+# ============================================================================
+# ModelNew — fused VAE residual block (Conv3x3 -> GN -> SiLU -> Conv3x3 -> GN
+#            -> SiLU -> +residual), C=256, groups=32, fp32.
+#
+# THIS REVISION: L2 cache-blocking (chunk-resident scheduling) of the
+#   stats -> apply pair inside the GroupNorm+SiLU segment.  Instead of sweeping
+#   the whole (sub)batch twice (once for gn_stats_kernel, once for
+#   gn_silu_apply / gn_silu_res_t) 33.5 MB apart -- which guaranteed a 1-2%
+#   L2 sector hit rate -- we loop over image chunks sized to fit in L2 and run
+#   stats + final + apply per chunk, so the second read of the conv output hits
+#   L2.  Additionally the apply kernels traverse blocks in reverse order so the
+#   most-recently-touched tail of a chunk is consumed first (partial reuse even
+#   when a single image exceeds L2).
+#
+#   Everything else (multistream fork/join pipeline, CUDA-graph capture,
+#   exhaustive cuDNN engine autotune during warm-up only) is preserved
+#   verbatim; the convolutions remain whole-(sub)batch vendor mainloops.
+#
+# PRECISION: float32 end to end; TF32 only inside the convolutions, exactly as
+# the reference does.  Reductions accumulate in float/double as before.
+# ============================================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r'''
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+
+#define CTOT   256
+#define NGRP   32
+#define CPG    8
+
+// ---------------------------------------------------------------------------
+// NCHW -> NHWC tiled transpose (tile: 32 spatial x 64 channels, 256 threads)
+// ---------------------------------------------------------------------------
+__global__ void nchw2nhwc_kernel(const float* __restrict__ src,
+                                 float* __restrict__ dst,
+                                 int HW)
+{
+    __shared__ float sm[32 * 65];
+    const int hw0 = blockIdx.x * 32;
+    const int c0  = blockIdx.y * 64;
+    const int n   = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const long long nbaseS = (long long)n * CTOT * (long long)HW;
+    // load : coalesced along hw (NCHW)
+    {
+        const int lh = tid & 31;
+        const int lc = tid >> 5;      // 0..7
+        const int hw = hw0 + lh;
+        if (hw < HW) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int cl = lc + i * 8;
+                sm[lh * 65 + cl] = src[nbaseS + (long long)(c0 + cl) * HW + hw];
+            }
+        }
+    }
+    __syncthreads();
+    // store : coalesced along c (NHWC)
+    {
+        const int lc = tid & 63;
+        const int lh = tid >> 6;      // 0..3
+        const long long nbaseD = (long long)n * (long long)HW * CTOT + (c0 + lc);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int hh = lh + i * 4;
+            const int hw = hw0 + hh;
+            if (hw < HW) {
+                dst[nbaseD + (long long)hw * CTOT] = sm[hh * 65 + lc];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GroupNorm partial moments over NHWC data.  grid=(P,nb), block=256 (1/channel)
+// Every entry of the partial buffers is written (even for empty chunks).
+// UNCHANGED body -- only the launch decomposition (per image-chunk) changed.
+// ---------------------------------------------------------------------------
+__global__ void gn_stats_kernel(const float* __restrict__ y,
+                                int HW, int P,
+                                float* __restrict__ psum,
+                                float* __restrict__ psq)
+{
+    const int p = blockIdx.x;
+    const int n = blockIdx.y;
+    const int c = threadIdx.x;
+
+    const int chunk = (HW + P - 1) / P;
+    int hw0 = p * chunk;
+    int hw1 = hw0 + chunk;
+    if (hw1 > HW) hw1 = HW;
+
+    float s = 0.f, q = 0.f;
+    if (hw0 < hw1) {
+        const float* base = y + (long long)n * (long long)HW * CTOT
+                              + (long long)hw0 * CTOT + c;
+        int cnt = hw1 - hw0;
+        #pragma unroll 4
+        for (int i = 0; i < cnt; ++i) {
+            float v = base[(long long)i * CTOT];
+            s += v;
+            q += v * v;
+        }
+    }
+    // reduce the 8 lanes belonging to one group
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+        s += __shfl_down_sync(0xffffffffu, s, off);
+        q += __shfl_down_sync(0xffffffffu, q, off);
+    }
+    if ((c & 7) == 0) {
+        const long long o = ((long long)n * P + p) * NGRP + (c >> 3);
+        psum[o] = s;
+        psq[o]  = q;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// deterministic reduction of the partials -> mean / rstd (one block per group)
+// UNCHANGED (double accumulation preserved).
+// ---------------------------------------------------------------------------
+__global__ void gn_final_kernel(const float* __restrict__ psum,
+                                const float* __restrict__ psq,
+                                int P, int HW, float eps,
+                                float* __restrict__ mean,
+                                float* __restrict__ rstd)
+{
+    const int idx = blockIdx.x;           // n*32 + g   (n local to the chunk)
+    const int n = idx >> 5;
+    const int g = idx & 31;
+
+    double s = 0.0, q = 0.0;
+    for (int p = threadIdx.x; p < P; p += blockDim.x) {
+        const long long o = ((long long)n * P + p) * NGRP + g;
+        s += (double)psum[o];
+        q += (double)psq[o];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s += __shfl_down_sync(0xffffffffu, s, off);
+        q += __shfl_down_sync(0xffffffffu, q, off);
+    }
+    __shared__ double ss[8], sq[8];
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (lane == 0) { ss[warp] = s; sq[warp] = q; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int nw = blockDim.x >> 5;
+        double ts = 0.0, tq = 0.0;
+        for (int i = 0; i < nw; ++i) { ts += ss[i]; tq += sq[i]; }
+        const double cnt = (double)HW * (double)CPG;
+        const double m = ts / cnt;
+        double v = tq / cnt - m * m;
+        if (v < 0.0) v = 0.0;
+        mean[idx] = (float)m;
+        rstd[idx] = (float)(1.0 / sqrt(v + (double)eps));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GN affine + SiLU, NHWC -> NHWC, float4 vectorised.  grid=(x,nb)
+// PLAN ITEM 5: reverse block traversal (LRU-friendly w.r.t. the forward stats
+// sweep).  The block->element mapping stays a bijection, semantics unchanged.
+// ---------------------------------------------------------------------------
+__global__ void gn_silu_apply(const float4* __restrict__ y,
+                              const float4* __restrict__ w,
+                              const float4* __restrict__ b,
+                              const float* __restrict__ mean,
+                              const float* __restrict__ rstd,
+                              float4* __restrict__ out,
+                              int n4perimg)
+{
+    const int n = blockIdx.y;
+    const int i = (gridDim.x - 1 - blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n4perimg) return;
+
+    const int c4 = i & 63;              // float4 index inside the 256 channels
+    const int g  = c4 >> 1;             // 8 channels per group == 2 float4
+    const float m = mean[n * NGRP + g];
+    const float r = rstd[n * NGRP + g];
+
+    const long long o = (long long)n * n4perimg + i;
+    const float4 v  = y[o];
+    const float4 ww = w[c4];
+    const float4 bb = b[c4];
+
+    float t0 = (v.x - m) * r * ww.x + bb.x;
+    float t1 = (v.y - m) * r * ww.y + bb.y;
+    float t2 = (v.z - m) * r * ww.z + bb.z;
+    float t3 = (v.w - m) * r * ww.w + bb.w;
+
+    float4 o4;
+    o4.x = t0 / (1.f + __expf(-t0));
+    o4.y = t1 / (1.f + __expf(-t1));
+    o4.z = t2 / (1.f + __expf(-t2));
+    o4.w = t3 / (1.f + __expf(-t3));
+    out[o] = o4;
+}
+
+// ---------------------------------------------------------------------------
+// GN affine + SiLU + residual add + NHWC->NCHW transpose in ONE pass.
+// tile: 32 spatial x 64 channels, 256 threads, padded shared stride 65.
+// PLAN ITEM 5: reverse spatial-tile traversal.
+// ---------------------------------------------------------------------------
+__global__ void gn_silu_res_t(const float* __restrict__ y,
+                              const float* __restrict__ res,
+                              const float* __restrict__ w,
+                              const float* __restrict__ b,
+                              const float* __restrict__ mean,
+                              const float* __restrict__ rstd,
+                              float* __restrict__ out,
+                              int HW)
+{
+    __shared__ float sm[32 * 65];
+    const int bx  = gridDim.x - 1 - blockIdx.x;
+    const int hw0 = bx * 32;
+    const int c0  = blockIdx.y * 64;
+    const int n   = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    // ---- load NHWC (coalesced along c), normalise + silu into shared -------
+    {
+        const int lc = tid & 63;
+        const int lh = tid >> 6;                 // 0..3
+        const int c  = c0 + lc;
+        const int g  = c >> 3;
+        const float m  = mean[n * NGRP + g];
+        const float r  = rstd[n * NGRP + g];
+        const float ww = w[c];
+        const float bb = b[c];
+        const float* base = y + (long long)n * (long long)HW * CTOT + c;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int hh = lh + i * 4;
+            const int hw = hw0 + hh;
+            if (hw < HW) {
+                const float v = base[(long long)hw * CTOT];
+                const float t = (v - m) * r * ww + bb;
+                sm[hh * 65 + lc] = t / (1.f + __expf(-t));
+            }
+        }
+    }
+    __syncthreads();
+
+    // ---- store NCHW (coalesced along hw) + residual ------------------------
+    {
+        const int lh = tid & 31;
+        const int lc = tid >> 5;                 // 0..7
+        const int hw = hw0 + lh;
+        if (hw < HW) {
+            const long long nb = (long long)n * CTOT * (long long)HW;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int cl = lc + i * 8;
+                const long long o = nb + (long long)(c0 + cl) * HW + hw;
+                out[o] = sm[lh * 65 + cl] + res[o];
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// host side
+// ===========================================================================
+static inline int pick_P(int B, int HW)
+{
+    int p = (HW + 31) / 32;
+    if (p < 1) p = 1;
+    int target = 1024 / (B > 0 ? B : 1);
+    if (target < 1) target = 1;
+    if (p > target) p = target;
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// PLAN ITEM 1 + 8: L2 chunk size in images (16 MB budget, conservative under
+// any plausible L2 >= 32 MB, leaving room for the concurrent write stream),
+// plus a node-count guard capping the per-call chunk count at 4.
+// ---------------------------------------------------------------------------
+static inline int chunk_imgs(int B, int HW)
+{
+    const long long bpi = (long long)CTOT * (long long)HW * 4LL;  // bytes/image
+    int k = (int)((16LL << 20) / (bpi > 0 ? bpi : 1));
+    if (k < 1) k = 1;
+    if (k > B) k = B;
+    // PLAN ITEM 8: bound the number of emitted GN node groups per call.
+    const int nch = (B + k - 1) / k;
+    if (nch > 4) {
+        k = (B + 3) / 4;
+        if (k < 1) k = 1;
+        if (k > B) k = B;
+    }
+    return k;
+}
+
+// ---------------------------------------------------------------------------
+// PLAN ITEM 4: one chunk's stats.  grid is exactly (P, nb) and gn_final reads
+// exactly the nb*P*NGRP slots that gn_stats wrote -> no unwritten tail.
+// ---------------------------------------------------------------------------
+static inline void stats_chunk(const float* y, int nb, int HW, int P, float eps,
+                               float* psum, float* psq,
+                               float* mean, float* rstd,
+                               cudaStream_t stream)
+{
+    dim3 g1(P, nb);
+    gn_stats_kernel<<<g1, 256, 0, stream>>>(y, HW, P, psum, psq);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    gn_final_kernel<<<nb * NGRP, 128, 0, stream>>>(psum, psq, P, HW, eps,
+                                                   mean, rstd);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor nchw_to_nhwc(torch::Tensor x)
+{
+    TORCH_CHECK(x.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "fp32 only");
+    TORCH_CHECK(x.dim() == 4, "4D only");
+    const int B = (int)x.size(0), C = (int)x.size(1);
+    const int H = (int)x.size(2), W = (int)x.size(3);
+    TORCH_CHECK(C == CTOT, "C must be 256");
+    const int HW = H * W;
+    TORCH_CHECK(x.is_contiguous(), "expect contiguous NCHW");
+
+    auto out = torch::empty({B, C, H, W},
+                            x.options().memory_format(at::MemoryFormat::ChannelsLast));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dim3 g((HW + 31) / 32, C / 64, B);
+    nchw2nhwc_kernel<<<g, 256, 0, stream>>>(x.data_ptr<float>(),
+                                            out.data_ptr<float>(), HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PLAN ITEM 2: chunked stats -> final -> apply (L2 cache-blocking).
+// ---------------------------------------------------------------------------
+torch::Tensor gn_silu_nhwc(torch::Tensor y, torch::Tensor w, torch::Tensor b,
+                           double eps)
+{
+    TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(y.is_contiguous(at::MemoryFormat::ChannelsLast),
+                "expect channels_last conv output");
+    const int B = (int)y.size(0), C = (int)y.size(1);
+    const int H = (int)y.size(2), W = (int)y.size(3);
+    TORCH_CHECK(C == CTOT, "C must be 256");
+    const int HW = H * W;
+
+    auto opts = y.options();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int ic = chunk_imgs(B, HW);
+    const int P  = pick_P(ic, HW);
+
+    // hoisted allocations (capture-friendly: fixed sizes, done once)
+    auto mean = torch::empty({(long long)B * NGRP}, opts);
+    auto rstd = torch::empty({(long long)B * NGRP}, opts);
+    auto psum = torch::empty({(long long)ic * P * NGRP}, opts);
+    auto psq  = torch::empty({(long long)ic * P * NGRP}, opts);
+
+    auto out = torch::empty({B, C, H, W},
+                            opts.memory_format(at::MemoryFormat::ChannelsLast));
+
+    const float* ybase = y.data_ptr<float>();
+    float*       obase = out.data_ptr<float>();
+    float*       mbase = mean.data_ptr<float>();
+    float*       rbase = rstd.data_ptr<float>();
+    float*       ps    = psum.data_ptr<float>();
+    float*       pq    = psq.data_ptr<float>();
+
+    const int n4 = HW * (CTOT / 4);
+    const long long img_elems = (long long)CTOT * (long long)HW;
+
+    for (int n0 = 0; n0 < B; n0 += ic) {
+        const int nb = (ic < (B - n0)) ? ic : (B - n0);
+        const float* yc = ybase + (long long)n0 * img_elems;
+        float*       oc = obase + (long long)n0 * img_elems;
+        float*       mc = mbase + (long long)n0 * NGRP;
+        float*       rc = rbase + (long long)n0 * NGRP;
+
+        stats_chunk(yc, nb, HW, P, (float)eps, ps, pq, mc, rc, stream);
+
+        dim3 g((n4 + 255) / 256, nb);
+        gn_silu_apply<<<g, 256, 0, stream>>>(
+            reinterpret_cast<const float4*>(yc),
+            reinterpret_cast<const float4*>(w.data_ptr<float>()),
+            reinterpret_cast<const float4*>(b.data_ptr<float>()),
+            mc, rc,
+            reinterpret_cast<float4*>(oc), n4);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PLAN ITEM 3: identical chunk loop for the fused residual/transpose variant.
+// ---------------------------------------------------------------------------
+torch::Tensor gn_silu_res_nchw(torch::Tensor y, torch::Tensor res,
+                               torch::Tensor w, torch::Tensor b, double eps)
+{
+    TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(y.is_contiguous(at::MemoryFormat::ChannelsLast),
+                "expect channels_last conv output");
+    TORCH_CHECK(res.is_contiguous(), "residual must be contiguous NCHW");
+    const int B = (int)y.size(0), C = (int)y.size(1);
+    const int H = (int)y.size(2), W = (int)y.size(3);
+    TORCH_CHECK(C == CTOT, "C must be 256");
+    const int HW = H * W;
+
+    auto opts = y.options();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int ic = chunk_imgs(B, HW);
+    const int P  = pick_P(ic, HW);
+
+    auto mean = torch::empty({(long long)B * NGRP}, opts);
+    auto rstd = torch::empty({(long long)B * NGRP}, opts);
+    auto psum = torch::empty({(long long)ic * P * NGRP}, opts);
+    auto psq  = torch::empty({(long long)ic * P * NGRP}, opts);
+
+    auto out = torch::empty({B, C, H, W}, opts);
+
+    const float* ybase = y.data_ptr<float>();
+    const float* rsbase = res.data_ptr<float>();
+    float*       obase = out.data_ptr<float>();
+    float*       mbase = mean.data_ptr<float>();
+    float*       rbase = rstd.data_ptr<float>();
+    float*       ps    = psum.data_ptr<float>();
+    float*       pq    = psq.data_ptr<float>();
+
+    const long long img_elems = (long long)CTOT * (long long)HW;
+
+    for (int n0 = 0; n0 < B; n0 += ic) {
+        const int nb = (ic < (B - n0)) ? ic : (B - n0);
+        const float* yc  = ybase  + (long long)n0 * img_elems;
+        const float* rsc = rsbase + (long long)n0 * img_elems;
+        float*       oc  = obase  + (long long)n0 * img_elems;
+        float*       mc  = mbase  + (long long)n0 * NGRP;
+        float*       rc  = rbase  + (long long)n0 * NGRP;
+
+        stats_chunk(yc, nb, HW, P, (float)eps, ps, pq, mc, rc, stream);
+
+        dim3 g((HW + 31) / 32, C / 64, nb);
+        gn_silu_res_t<<<g, 256, 0, stream>>>(yc, rsc,
+                                             w.data_ptr<float>(),
+                                             b.data_ptr<float>(),
+                                             mc, rc, oc, HW);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// out-parameter variant.  Same chunked schedule; writes into the caller-supplied
+// contiguous NCHW tensor (a batch slice of the final output).
+// ---------------------------------------------------------------------------
+void gn_silu_res_nchw_out(torch::Tensor y, torch::Tensor res,
+                          torch::Tensor w, torch::Tensor b, double eps,
+                          torch::Tensor out)
+{
+    TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(y.is_contiguous(at::MemoryFormat::ChannelsLast),
+                "expect channels_last conv output");
+    TORCH_CHECK(res.is_contiguous(), "residual must be contiguous NCHW");
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat32,
+                "out must be CUDA fp32");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous NCHW");
+    TORCH_CHECK(out.dim() == 4, "out must be 4D");
+    TORCH_CHECK(out.size(0) == y.size(0) && out.size(1) == y.size(1) &&
+                out.size(2) == y.size(2) && out.size(3) == y.size(3),
+                "out shape mismatch");
+    TORCH_CHECK(res.size(0) == y.size(0) && res.size(1) == y.size(1) &&
+                res.size(2) == y.size(2) && res.size(3) == y.size(3),
+                "res shape mismatch");
+
+    const int B = (int)y.size(0), C = (int)y.size(1);
+    const int H = (int)y.size(2), W = (int)y.size(3);
+    TORCH_CHECK(C == CTOT, "C must be 256");
+    const int HW = H * W;
+
+    auto opts = y.options();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int ic = chunk_imgs(B, HW);
+    const int P  = pick_P(ic, HW);
+
+    auto mean = torch::empty({(long long)B * NGRP}, opts);
+    auto rstd = torch::empty({(long long)B * NGRP}, opts);
+    auto psum = torch::empty({(long long)ic * P * NGRP}, opts);
+    auto psq  = torch::empty({(long long)ic * P * NGRP}, opts);
+
+    const float* ybase  = y.data_ptr<float>();
+    const float* rsbase = res.data_ptr<float>();
+    float*       obase  = out.data_ptr<float>();
+    float*       mbase  = mean.data_ptr<float>();
+    float*       rbase  = rstd.data_ptr<float>();
+    float*       ps     = psum.data_ptr<float>();
+    float*       pq     = psq.data_ptr<float>();
+
+    const long long img_elems = (long long)CTOT * (long long)HW;
+
+    for (int n0 = 0; n0 < B; n0 += ic) {
+        const int nb = (ic < (B - n0)) ? ic : (B - n0);
+        const float* yc  = ybase  + (long long)n0 * img_elems;
+        const float* rsc = rsbase + (long long)n0 * img_elems;
+        float*       oc  = obase  + (long long)n0 * img_elems;
+        float*       mc  = mbase  + (long long)n0 * NGRP;
+        float*       rc  = rbase  + (long long)n0 * NGRP;
+
+        stats_chunk(yc, nb, HW, P, (float)eps, ps, pq, mc, rc, stream);
+
+        dim3 g((HW + 31) / 32, C / 64, nb);
+        gn_silu_res_t<<<g, 256, 0, stream>>>(yc, rsc,
+                                             w.data_ptr<float>(),
+                                             b.data_ptr<float>(),
+                                             mc, rc, oc, HW);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+}
+'''
+
+_CPP_SRC = r'''
+torch::Tensor nchw_to_nhwc(torch::Tensor x);
+torch::Tensor gn_silu_nhwc(torch::Tensor y, torch::Tensor w, torch::Tensor b, double eps);
+torch::Tensor gn_silu_res_nchw(torch::Tensor y, torch::Tensor res, torch::Tensor w, torch::Tensor b, double eps);
+void gn_silu_res_nchw_out(torch::Tensor y, torch::Tensor res, torch::Tensor w, torch::Tensor b, double eps, torch::Tensor out);
+'''
+
+_ext = load_inline(
+    name="vae_resblock_fused_l2blk_ext",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["nchw_to_nhwc", "gn_silu_nhwc", "gn_silu_res_nchw",
+               "gn_silu_res_nchw_out"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
+# PLAN ITEM 7(c): locally-scoped cuDNN exhaustive-autotune context manager,
+# unchanged.  benchmark=True + benchmark_limit=0 -> exhaustive engine timing.
+# Always restored on exit; never active during CUDA-graph capture.
+# ---------------------------------------------------------------------------
+class _Autotune:
+    def __enter__(self):
+        self._ok = False
+        try:
+            self.pb = torch.backends.cudnn.benchmark
+            torch.backends.cudnn.benchmark = True
+            self._ok = True
+        except Exception:
+            self.pb = None
+        self._lim_ok = False
+        try:
+            self.pl = getattr(torch.backends.cudnn, "benchmark_limit", 10)
+            torch.backends.cudnn.benchmark_limit = 0
+            self._lim_ok = True
+        except Exception:
+            self.pl = None
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._lim_ok:
+            try:
+                torch.backends.cudnn.benchmark_limit = self.pl
+            except Exception:
+                pass
+        if self._ok:
+            try:
+                torch.backends.cudnn.benchmark = self.pb
+            except Exception:
+                pass
+        return False
+
+
+class ModelNew(nn.Module):
+    """Fused VAE residual block: L2 cache-blocked GN/SiLU + multistream +
+    CUDA-graph capture + cuDNN engine autotune."""
+
+    _MAX_GRAPHS = 8
+    _MAX_TUNED = 8
+
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+        # multi-stream resources (lazily created)
+        self._streams = None
+        # graph cache + shared memory pool
+        self._graphs = {}
+        self._pool = None
+        # per-(shape, memory-format) autotuned key set
+        self._tuned = set()
+
+    # ---- lazy stream + event creation with safe fallback --------------------
+    def _get_streams(self):
+        if self._streams is None:
+            try:
+                sA = torch.cuda.Stream()
+                sB = torch.cuda.Stream()
+                ev0 = torch.cuda.Event()
+                evStage = torch.cuda.Event()
+                evA = torch.cuda.Event()
+                evB = torch.cuda.Event()
+                self._streams = (sA, sB, ev0, evStage, evA, evB)
+            except Exception:
+                self._streams = False  # permanent single-stream fallback
+        return self._streams if self._streams else None
+
+    # ======================================================================
+    # The graph-capturable pipeline body.
+    #   * B < 4  -> legacy single-stream path
+    #   * B >= 4 -> two-chunk, two-stream fork/join pipeline
+    # PLAN ITEM 7(a): the L2 chunk loop lives INSIDE each ext call, so both
+    # streams keep their independent half-batch pipelines and the evStage
+    # stagger; no grid-wide barrier or device sync is introduced.
+    # ======================================================================
+    def _run_pipeline(self, x, w1c, nw1, nb1, w2c, nw2, nb2, eps):
+        B = int(x.size(0))
+        st = self._get_streams()
+
+        if (st is None) or (B < 4):
+            xl = self.ext.nchw_to_nhwc(x)
+            y = F.conv2d(xl, w1c, None, 1, 1)
+            y = self.ext.gn_silu_nhwc(y, nw1, nb1, eps)
+            y = F.conv2d(y, w2c, None, 1, 1)
+            return self.ext.gn_silu_res_nchw(y, x, nw2, nb2, eps)
+
+        sA, sB, ev0, evStage, evA, evB = st
+        s0 = B // 2
+
+        out = torch.empty_like(x)
+        cur = torch.cuda.current_stream()
+
+        # fork
+        ev0.record(cur)
+        sA.wait_event(ev0)
+        sB.wait_event(ev0)
+
+        # chunk 0 on stream A
+        with torch.cuda.stream(sA):
+            xa = x[0:s0]
+            xla = self.ext.nchw_to_nhwc(xa)
+            evStage.record(sA)                       # stagger marker
+            ya = F.conv2d(xla, w1c, None, 1, 1)
+            ya = self.ext.gn_silu_nhwc(ya, nw1, nb1, eps)
+            ya = F.conv2d(ya, w2c, None, 1, 1)
+            self.ext.gn_silu_res_nchw_out(ya, xa, nw2, nb2, eps, out[0:s0])
+            evA.record(sA)
+
+        # chunk 1 on stream B, one stage out of phase
+        with torch.cuda.stream(sB):
+            sB.wait_event(evStage)
+            xb = x[s0:B]
+            xlb = self.ext.nchw_to_nhwc(xb)
+            yb = F.conv2d(xlb, w1c, None, 1, 1)
+            yb = self.ext.gn_silu_nhwc(yb, nw1, nb1, eps)
+            yb = F.conv2d(yb, w2c, None, 1, 1)
+            self.ext.gn_silu_res_nchw_out(yb, xb, nw2, nb2, eps, out[s0:B])
+            evB.record(sB)
+
+        # join
+        cur.wait_event(evA)
+        cur.wait_event(evB)
+        return out
+
+    # ======================================================================
+    # One exhaustive-autotune pipeline run per new key.  Result discarded;
+    # the selected cuDNN plan stays in torch's plan cache.
+    # ======================================================================
+    def _autotune_once(self, key, x, w1c, nw1, nb1, w2c, nw2, nb2, eps):
+        if (key in self._tuned) or (len(self._tuned) >= self._MAX_TUNED):
+            return
+        self._tuned.add(key)
+        try:
+            with _Autotune():
+                tmp = self._run_pipeline(x, w1c, nw1, nb1, w2c, nw2, nb2, eps)
+                del tmp
+            torch.cuda.synchronize()
+        except Exception:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _tune_key(x):
+        try:
+            cl = bool(x.is_contiguous(memory_format=torch.channels_last))
+        except Exception:
+            cl = False
+        return (tuple(x.shape), str(x.dtype), cl)
+
+    # ---- eager (non-captured) path, keeps record_stream bookkeeping --------
+    def _forward_eager(self, x, conv1_weight, norm1_weight, norm1_bias,
+                       conv2_weight, norm2_weight, norm2_bias, eps):
+        x = x if x.is_contiguous() else x.contiguous()
+        nw1 = norm1_weight if norm1_weight.is_contiguous() else norm1_weight.contiguous()
+        nb1 = norm1_bias if norm1_bias.is_contiguous() else norm1_bias.contiguous()
+        nw2 = norm2_weight if norm2_weight.is_contiguous() else norm2_weight.contiguous()
+        nb2 = norm2_bias if norm2_bias.is_contiguous() else norm2_bias.contiguous()
+        w1c = conv1_weight.contiguous(memory_format=torch.channels_last)
+        w2c = conv2_weight.contiguous(memory_format=torch.channels_last)
+
+        if x.is_cuda and x.dim() == 4 and x.dtype == torch.float32:
+            self._autotune_once(self._tune_key(x), x, w1c, nw1, nb1,
+                                w2c, nw2, nb2, eps)
+
+        B = int(x.size(0))
+        st = self._get_streams()
+        if (st is None) or (B < 4) or (x.dim() != 4) or \
+           (x.dtype != torch.float32) or (not x.is_cuda):
+            xl = self.ext.nchw_to_nhwc(x)
+            y = F.conv2d(xl, w1c, None, 1, 1)
+            y = self.ext.gn_silu_nhwc(y, nw1, nb1, eps)
+            y = F.conv2d(y, w2c, None, 1, 1)
+            return self.ext.gn_silu_res_nchw(y, x, nw2, nb2, eps)
+
+        sA, sB, ev0, evStage, evA, evB = st
+        s0 = B // 2
+        out = torch.empty_like(x)
+        cur = torch.cuda.current_stream()
+        ev0.record(cur)
+        sA.wait_event(ev0)
+        sB.wait_event(ev0)
+
+        with torch.cuda.stream(sA):
+            x.record_stream(sA); out.record_stream(sA)
+            w1c.record_stream(sA); w2c.record_stream(sA)
+            nw1.record_stream(sA); nb1.record_stream(sA)
+            nw2.record_stream(sA); nb2.record_stream(sA)
+            xa = x[0:s0]
+            xla = self.ext.nchw_to_nhwc(xa)
+            evStage.record(sA)
+            ya = F.conv2d(xla, w1c, None, 1, 1)
+            ya = self.ext.gn_silu_nhwc(ya, nw1, nb1, eps)
+            ya = F.conv2d(ya, w2c, None, 1, 1)
+            self.ext.gn_silu_res_nchw_out(ya, xa, nw2, nb2, eps, out[0:s0])
+            evA.record(sA)
+
+        with torch.cuda.stream(sB):
+            sB.wait_event(evStage)
+            x.record_stream(sB); out.record_stream(sB)
+            w1c.record_stream(sB); w2c.record_stream(sB)
+            nw1.record_stream(sB); nb1.record_stream(sB)
+            nw2.record_stream(sB); nb2.record_stream(sB)
+            xb = x[s0:B]
+            xlb = self.ext.nchw_to_nhwc(xb)
+            yb = F.conv2d(xlb, w1c, None, 1, 1)
+            yb = self.ext.gn_silu_nhwc(yb, nw1, nb1, eps)
+            yb = F.conv2d(yb, w2c, None, 1, 1)
+            self.ext.gn_silu_res_nchw_out(yb, xb, nw2, nb2, eps, out[s0:B])
+            evB.record(sB)
+
+        cur.wait_event(evA)
+        cur.wait_event(evB)
+        return out
+
+    # ======================================================================
+    # Warm up (with autotune), capture, cache.
+    # PLAN ITEM 7(b): shapes are static so the chunked GN sequence is a fixed
+    # node list; buffers come from the same graph pool as before.
+    # ======================================================================
+    def _try_capture(self, key, x, conv1_weight, norm1_weight, norm1_bias,
+                     conv2_weight, norm2_weight, norm2_bias, eps):
+        try:
+            nw1 = norm1_weight if norm1_weight.is_contiguous() else norm1_weight.contiguous()
+            nb1 = norm1_bias if norm1_bias.is_contiguous() else norm1_bias.contiguous()
+            nw2 = norm2_weight if norm2_weight.is_contiguous() else norm2_weight.contiguous()
+            nb2 = norm2_bias if norm2_bias.is_contiguous() else norm2_bias.contiguous()
+            w1c = conv1_weight.contiguous(memory_format=torch.channels_last)
+            w2c = conv2_weight.contiguous(memory_format=torch.channels_last)
+
+            s_warm = torch.cuda.Stream()
+            s_warm.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s_warm):
+                tmp = None
+                with _Autotune():
+                    for _ in range(3):
+                        tmp = self._run_pipeline(x, w1c, nw1, nb1,
+                                                 w2c, nw2, nb2, eps)
+                    del tmp
+                tmp = self._run_pipeline(x, w1c, nw1, nb1, w2c, nw2, nb2, eps)
+                del tmp
+            torch.cuda.current_stream().wait_stream(s_warm)
+            torch.cuda.synchronize()
+
+            self._tuned.add(self._tune_key(x))
+
+            if self._pool is None:
+                self._pool = torch.cuda.graph_pool_handle()
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=self._pool):
+                out = self._run_pipeline(x, w1c, nw1, nb1, w2c, nw2, nb2, eps)
+
+            self._graphs[key] = (g, out, w1c, w2c, nw1, nb1, nw2, nb2, x)
+
+            g.replay()
+            return out
+        except Exception:
+            self._graphs[key] = False
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            return None
+
+    # ======================================================================
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        if isinstance(eps, torch.Tensor):
+            eps = float(eps.item())
+        else:
+            eps = float(eps)
+
+        if x.is_cuda and x.dim() == 4 and x.dtype == torch.float32 and x.is_contiguous():
+            key = (tuple(x.shape), x.dtype, x.data_ptr(),
+                   conv1_weight.data_ptr(), conv2_weight.data_ptr(),
+                   norm1_weight.data_ptr(), norm1_bias.data_ptr(),
+                   norm2_weight.data_ptr(), norm2_bias.data_ptr(), eps)
+
+            entry = self._graphs.get(key, None)
+            if entry is not None:
+                if entry is not False:
+                    g, out = entry[0], entry[1]
+                    g.replay()
+                    return out
+            elif len(self._graphs) < self._MAX_GRAPHS:
+                res = self._try_capture(key, x, conv1_weight, norm1_weight,
+                                        norm1_bias, conv2_weight, norm2_weight,
+                                        norm2_bias, eps)
+                if res is not None:
+                    return res
+
+        return self._forward_eager(x, conv1_weight, norm1_weight, norm1_bias,
+                                   conv2_weight, norm2_weight, norm2_bias, eps)
+```
+
+Analyze the CUDA kernel code above and extract the structural features. Return the JSON object with all required fields.
