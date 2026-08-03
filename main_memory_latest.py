@@ -9,6 +9,8 @@ import csv
 import os
 import signal
 import importlib.util
+import hashlib
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -73,7 +75,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "cross-round, so the margin must sit below the attenuated value. Re-derive "
                         "this for a different GPU or task. Use 0 to accept any improvement, or a "
                         "large value to pin the base to the seed (the pre-fix behaviour).")
-    p.add_argument("--max_tokens", type=int, default=16384, help="LLM max new tokens")
+    p.add_argument("--base_reps", type=int, default=3,
+                   help="Interleaved repeats used to compare a candidate against the base. The "
+                        "base is re-measured alongside the candidate instead of being read from "
+                        "a score stored when it last advanced, because that stored number goes "
+                        "stale: one unchanged kernel re-measured 30 min later on RTX 5090 read "
+                        "+1.06%%, twice the --base_margin it feeds. 3 reps resolve ~0.4%%, which "
+                        "settles most rounds outright.")
+    p.add_argument("--base_max_reps", type=int, default=8,
+                   help="Cap on interleaved repeats when the decision is close. Reps are added "
+                        "only while the measured difference sits within 3 standard errors of "
+                        "--base_margin, so clear wins and clear losses stop at --base_reps and "
+                        "only genuine coin-flips pay for precision. On rounds 13-20 of the exp3 "
+                        "run six of seven candidates (-0.66%% to -11.06%%) would stop early and "
+                        "one (+0.49%%) would escalate. At 3.6 s per measurement that is roughly "
+                        "+4%% on an 8.6-minute round. Set 0 to disable the paired re-measure and "
+                        "compare against the stored base score, as before.")
+    p.add_argument("--patience", type=int, default=4,
+                   help="Stop after this many consecutive rounds that fail to improve best_score "
+                        "by more than --base_margin (0 disables). Late rounds are where a run "
+                        "spends its time without earning anything: on vae_block_002 the last 10 "
+                        "of 21 rounds took 46%% of the wall clock and moved the score by +0.017%%. "
+                        "Measured on that run, every value from 3 up stops after the same real "
+                        "improvement and costs the same 0.017%%, so the default buys a round of "
+                        "headroom over the boundary. Do NOT lower this to 2: that run had a "
+                        "2-round drought before its four best rounds, and stopping there would "
+                        "have cost 6.5%%.")
     p.add_argument("--temperature", type=float, default=1, help="LLM temperature")
     p.add_argument("--top_p", type=float, default=1.0, help="LLM top_p")
     # multi-task controls
@@ -167,6 +194,74 @@ def _build_history_block(code_dir: Path, keep_last: int = 10) -> str:
     return "## Existing kernels\n" + "\n\n".join(snippets) + "\n"
 
 
+def _ncu_profile_cached(
+    *,
+    bench_py: str,
+    kernel_names,
+    kernel_file,
+    out_csv,
+    device_idx,
+    repeat: int,
+    timeout_override,
+    cache_dir: Path,
+) -> Path:
+    """profile_bench, skipping the ncu run when this exact source was profiled before.
+
+    A rejected candidate leaves the base kernel unchanged, so the next round
+    re-profiles source that was already measured -- 56s and 263s on the two
+    occurrences in the 20260731 run. ncu over fixed source, fixed input shapes
+    and a fixed device is deterministic, so the cached CSV is what the re-run
+    would produce: the judge prompt is byte-identical either way and the search
+    trajectory cannot change.
+
+    Keyed on the kernel source itself, so any edit misses and profiles for real.
+    Every cache failure falls through to a normal profile -- this must never be
+    the reason a round dies.
+    """
+    out_path = Path(out_csv)
+    key = None
+    try:
+        h = hashlib.sha256()
+        h.update(Path(kernel_file).read_bytes())
+        h.update(repr(sorted(kernel_names or [])).encode())
+        h.update(f"|dev={device_idx}|rep={repeat}".encode())
+        try:
+            # The harness fixes the input shapes the metrics describe, so a
+            # regenerated bench must not read as the same profile.
+            h.update(Path(bench_py).read_bytes())
+        except OSError:
+            pass
+        key = h.hexdigest()[:32]
+        cached = cache_dir / f"{key}.csv"
+        if cached.exists() and cached.stat().st_size > 0:
+            shutil.copy2(cached, out_path)
+            print(f"[ncu] cache hit ({key[:8]}): source unchanged since a previous "
+                  f"profile, skipping ncu run", flush=True)
+            return out_path.resolve()
+    except Exception as exc:
+        print(f"[ncu] cache lookup skipped ({exc.__class__.__name__}: {exc})", flush=True)
+        key = None
+
+    result = profile_bench(
+        bench_py=bench_py,
+        kernel_names=kernel_names,
+        kernel_file=kernel_file,
+        out_csv=out_csv,
+        device_idx=device_idx,
+        repeat=repeat,
+        timeout_override=timeout_override,
+    )
+    produced = Path(result) if result else out_path.resolve()
+    if key:
+        try:
+            if produced.exists() and produced.stat().st_size > 0:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(produced, cache_dir / f"{key}.csv")
+        except Exception as exc:
+            print(f"[ncu] cache store skipped ({exc.__class__.__name__}: {exc})", flush=True)
+    return produced
+
+
 # ------------------- LLM & eval steps ------------------
 def _make_llm_caller(args):
 
@@ -183,7 +278,6 @@ def _make_llm_caller(args):
             system_prompt=sp,
             server_type=args.server_type,
             model_name=args.model_name,
-        max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
             server_address=args.server_address,
@@ -858,6 +952,11 @@ def _save_checkpoint(task_root: Path, eval_dir: Path, *, task_path: Path,
         "scores": [float(s) for s in state.get("scores") or []],
         "err_flags": [bool(e) for e in state.get("err_flags") or []],
         "last_score_for_curve": float(state.get("last_score_for_curve") or 0.0),
+        # Plateau streaks outlive a session: on vae_block_002 the 8-round drought
+        # spanned a restart, so a counter kept only in memory would reset on
+        # --resume and the stop would fire late or never.
+        "rounds_since_improvement": int(state.get("rounds_since_improvement") or 0),
+        "stop_reason": state.get("stop_reason"),
         "opt_history_files": {str(k): str(v) for k, v in (state.get("opt_history_files") or {}).items()},
         # Ids name the eval_XXXX.json files; rewinding this would overwrite
         # results from rounds that already finished.
@@ -881,6 +980,96 @@ def _load_checkpoint(task_root: Path) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         print(f"[resume] WARNING: checkpoint unreadable ({exc}); starting from round 0.")
         return None
+
+
+def _paired_verdict_worker(reference: str, base_py: str, cand_py: str,
+                           device_idx: int, warmup: int, repeat: int, tol: float,
+                           margin: float, min_reps: int, max_reps: int, conn) -> None:
+    """Subprocess entry for the paired base re-measure. String paths only, so
+    nothing unpicklable crosses the Pipe."""
+    import torch
+    from pathlib import Path as _P
+    from utils.paired_bench import adaptive_paired_verdict
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(device_idx)
+        out = adaptive_paired_verdict(
+            _P(reference), _P(base_py), _P(cand_py),
+            device=device_idx, warmup=warmup, repeat=repeat, tol=tol,
+            margin=margin, min_reps=min_reps, max_reps=max_reps)
+        conn.send(("ok", out))
+    except Exception as e:
+        conn.send(("err", f"{e.__class__.__name__}: {e}"))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _paired_base_verdict(reference: Path, base_py: Path, cand_py: Path, *,
+                         device_idx: int, warmup: int, repeat: int, tol: float,
+                         margin: float, min_reps: int, max_reps: int,
+                         timeout: int = 1800) -> Optional[Dict[str, Any]]:
+    """Re-measure the base and the candidate together, and return the verdict.
+
+    The ratchet otherwise compares a candidate measured now against `base_score`,
+    a float stored when the base last advanced. In the exp3 run that number was
+    taken at 15:15 and still being used as the bar at 17:36. One unchanged kernel
+    re-measured half an hour apart on this machine read 1.2014 then 1.2141 ms --
+    +1.06%, twice the 0.5% margin the comparison feeds. Three candidates landed
+    at +0.40%, +0.47% and +0.49% against that gate, so which side of the line
+    they fell on was partly a question of GPU drift.
+
+    Runs in a spawned subprocess for the same reason the round's own benchmark
+    does: a CUDA context that two kernel modules have been imported into is not
+    something to hand back to the main loop. Both kernels are measured inside
+    THAT one process, interleaved -- which is what makes the drift common-mode
+    and cancel in the difference.
+
+    Never raises. Any failure returns None and the caller keeps the old
+    stored-score comparison, so this can add information but never cost a round.
+    """
+    from multiprocessing import get_context
+
+    ctx = get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    p = ctx.Process(
+        target=_paired_verdict_worker,
+        args=(str(reference), str(base_py), str(cand_py), device_idx,
+              warmup, repeat, tol, margin, min_reps, max_reps, child_conn),
+    )
+    p.start()
+    try:
+        child_conn.close()
+    except Exception:
+        pass
+
+    p.join(timeout=timeout)
+    if p.is_alive():
+        print(f"[base] paired re-measure exceeded {timeout}s; terminating and "
+              f"falling back to the stored base score", flush=True)
+        p.terminate()
+        p.join(timeout=5)
+        if p.is_alive():
+            p.kill()
+            p.join()
+        return None
+
+    payload = None
+    try:
+        if parent_conn.poll():
+            payload = parent_conn.recv()
+    except Exception:
+        payload = None
+
+    if not payload or payload[0] != "ok" or payload[1] is None:
+        if payload and payload[0] == "err":
+            print(f"[base] paired re-measure failed: {payload[1]}; "
+                  f"using the stored base score", flush=True)
+        return None
+    return payload[1]
 
 
 def _base_optimization_inventory(optimization_tree: Dict[str, Any],
@@ -919,7 +1108,13 @@ def _base_optimization_inventory(optimization_tree: Dict[str, Any],
             "round": node.get("round"),
             "speedup": sp,
             "gain_pct": gain,
-            "summary": (strategy.get("primary_optimisation_method") or "")[:200],
+            # The judge is asked for this key under two spellings depending on which
+            # output schema it followed, so accept both -- reading only one silently
+            # blanks the summary and the inventory entry degrades to a bare name.
+            "summary": (strategy.get("primary_optimisation_method")
+                        or strategy.get("optimisation method")
+                        or strategy.get("optimization method")
+                        or "")[:200],
         })
     return inventory
 
@@ -988,6 +1183,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     scores: List[float] = []
     err_flags: List[bool] = []
     last_score_for_curve = 0.0  # default baseline for plotting on early failures
+    rounds_since_improvement = 0  # consecutive rounds not beating best_score by --base_margin
 
     # ---- resume: rebuild the loop's state from the last completed round ----
     start_round = 0
@@ -1010,6 +1206,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             scores = list(ckpt.get("scores") or [])
             err_flags = list(ckpt.get("err_flags") or [])
             last_score_for_curve = float(ckpt.get("last_score_for_curve") or 0.0)
+            rounds_since_improvement = int(ckpt.get("rounds_since_improvement") or 0)
             opt_history_files = {int(k): Path(v) for k, v in (ckpt.get("opt_history_files") or {}).items()}
             # Restoring individuals bumps the id counter, so set it afterwards;
             # rewinding would overwrite eval_XXXX.json files already on disk.
@@ -1019,6 +1216,13 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             _best_txt = f"{best_score:.4f}" if best_score != float("-inf") else "none"
             print(f"[resume] Restored {task_root/_CHECKPOINT_NAME}: continuing at round "
                   f"{start_round}/{args.round}, best={_best_txt}", flush=True)
+            if rounds_since_improvement:
+                print(f"[resume] Carrying a {rounds_since_improvement}-round plateau streak "
+                      f"forward (--patience {args.patience}).", flush=True)
+            if args.patience and rounds_since_improvement >= args.patience:
+                print(f"[resume] WARNING: this run already stopped on the plateau rule. It will "
+                      f"run one more round and stop again unless you raise --patience or pass "
+                      f"--patience 0.", flush=True)
             if start_round >= args.round:
                 print(f"[resume] This run already completed {start_round} rounds. Raise --round "
                       f"above {start_round} to extend it; artifacts will be rewritten as-is.",
@@ -1030,6 +1234,11 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                   f"{args.round} rounds; resume with --resume {batch_dir}", flush=True)
             break
         print(f"[{task_path.name}] Round {round_idx}")
+        # Snapshot for the plateau test. best_score is updated from several
+        # places (opt accept, repair accept, statistics-only bump), so comparing
+        # the round's start against its end catches every path -- including the
+        # repair rounds, which burn wall clock without advancing the search.
+        best_score_at_round_start = best_score
 
         if round_idx == 0:
             print("[Seed] Generating the initial kernel ...")
@@ -1562,7 +1771,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         print(f"[ncu] Profiling kernel from file: {kernel_file_to_profile} (parent_kernel: {parent_kernel.code_path if parent_kernel and hasattr(parent_kernel, 'code_path') else 'N/A'})", flush=True)
                         
                         csv_path_str = f"ncu_temp_{args.subproc_id}.csv"
-                        csv_path_result = profile_bench(
+                        csv_path_result = _ncu_profile_cached(
                             bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
                             kernel_names=kernel_names,  # pass the kernel names so only the specified kernel is monitored
                             kernel_file=kernel_file_to_profile,  # explicitly specify the kernel file to profile
@@ -1570,6 +1779,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             device_idx=args.device,
                             repeat=ncu_repeat,
                             timeout_override=ncu_timeout_seconds,
+                            cache_dir=profile_dir / ".ncu_cache",
                         )
                         # profile_bench returns the CSV path (already resolved), ensure it's a Path object
                         csv_path = Path(csv_path_result) if csv_path_result else Path(csv_path_str).resolve()
@@ -1659,12 +1869,13 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 _rf = Path(f"rejected_kernel_{args.subproc_id}.py")
                                 _rf.write_text(_rej.code, encoding="utf-8")
                                 _rn = extract_cuda_kernel_names(_rf)
-                                _rcsv = profile_bench(
+                                _rcsv = _ncu_profile_cached(
                                     bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
                                     kernel_names=_rn, kernel_file=_rf,
                                     out_csv=f"ncu_rejected_{args.subproc_id}.csv",
                                     device_idx=args.device, repeat=ncu_repeat,
                                     timeout_override=ncu_timeout_seconds,
+                                    cache_dir=profile_dir / ".ncu_cache",
                                 )
                                 _rdf, _rsec = load_ncu_metrics(
                                     Path(_rcsv), extra_keep=("Kernel Name", "Block Size", "Grid Size"),
@@ -2132,6 +2343,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             # Note: special cases where an unprofilable base is replaced by its repair are handled
             # in the pre-compile / ncu handlers above, and intentionally bypass this margin.
             should_update_base = False
+            _paired_note = None   # set only when a side-by-side measurement was taken
             if base_score == float("-inf"):
                 # First valid score, always update
                 should_update_base = True
@@ -2139,15 +2351,59 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 # Base is unusable (negative/zero); any real speedup is an improvement
                 should_update_base = (this_score > 0)
             else:
-                should_update_base = this_score >= base_score * (1.0 + args.base_margin)
+                # Decide against the base MEASURED NOW, not against base_score --
+                # a float stored when the base last advanced, hours earlier. On
+                # this machine one unchanged kernel drifted +1.06% in 30 minutes,
+                # twice the margin, so the stored comparison mixes "is this better"
+                # with "which way did the GPU go since then". _paired_base_verdict
+                # interleaves the two kernels in one process so that term cancels,
+                # and returns None on any failure, leaving the old path intact.
+                _verdict = None
+                _base_path = getattr(base_kernel, "code_path", None) if base_kernel else None
+                _cand_path = getattr(ind, "code_path", None)
+                if (args.base_max_reps > 0 and _base_path and _cand_path
+                        and Path(_base_path).exists() and Path(_cand_path).exists()):
+                    print(f"[base] Re-measuring base and candidate side by side "
+                          f"({args.base_reps}-{args.base_max_reps} interleaved reps)...", flush=True)
+                    _verdict = _paired_base_verdict(
+                        task_path, Path(_base_path), Path(_cand_path),
+                        device_idx=args.device, warmup=args.warmup, repeat=args.repeat,
+                        tol=args.tol, margin=args.base_margin,
+                        min_reps=args.base_reps, max_reps=args.base_max_reps)
+
+                if _verdict is not None:
+                    should_update_base = bool(_verdict["beats_margin"])
+                    _paired_note = (
+                        f"paired {_verdict['rel_pct']:+.2f}% +/-{_verdict['se_pct']:.2f}% "
+                        f"(t={_verdict['t']:+.1f}, {_verdict['reps']} reps"
+                        f"{', escalated' if _verdict['escalated'] else ''}, "
+                        f"{'resolved' if _verdict['resolved'] else 'UNRESOLVED'}; "
+                        f"{_verdict['base_ms']:.4f} -> {_verdict['cand_ms']:.4f} ms)")
+                    # Persist it: an unresolved near-miss looks identical to a
+                    # regression in the round record otherwise, which is exactly
+                    # how round 19's +0.49% -- later the best kernel of the run --
+                    # was reported to the next round as a failure.
+                    try:
+                        _hf = opt_history_files.get(round_idx)
+                        if _hf and Path(_hf).exists():
+                            _hd = json.loads(Path(_hf).read_text(encoding="utf-8"))
+                            _hd["paired_verdict"] = _verdict
+                            Path(_hf).write_text(json.dumps(_hd, indent=2, ensure_ascii=False),
+                                                 encoding="utf-8")
+                    except Exception as _exc:
+                        print(f"[base] Warning: could not record paired verdict: {_exc}", flush=True)
+                else:
+                    should_update_base = this_score >= base_score * (1.0 + args.base_margin)
+                    _paired_note = None
 
             if should_update_base:
                 if base_score == float("-inf"):
                     print(f"[base] Setting initial base_kernel: {this_score:.4f}", flush=True)
                 else:
                     gain = (this_score / base_score - 1.0) * 100.0 if base_score > 0 else float("nan")
+                    _how = _paired_note or f"stored-score {gain:+.2f}%"
                     print(f"[base] Ratchet: base_kernel {base_score:.4f} -> {this_score:.4f} "
-                          f"(+{gain:.2f}%, margin {args.base_margin * 100:.1f}%); "
+                          f"[{_how}, margin {args.base_margin * 100:.1f}%]; "
                           f"later rounds now optimize from this kernel", flush=True)
                 base_score = this_score
                 base_kernel = ind
@@ -2155,9 +2411,10 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     f.write(base_kernel.code)
             elif base_score not in (float("-inf"), 0):
                 delta = (this_score / base_score - 1.0) * 100.0 if base_score > 0 else float("nan")
-                print(f"[base] Keeping base_kernel {base_score:.4f} ({this_score:.4f} is "
-                      f"{delta:+.2f}%, below the {args.base_margin * 100:.1f}% margin)", flush=True)
-            
+                _how = _paired_note or f"stored-score {delta:+.2f}%"
+                print(f"[base] Keeping base_kernel {base_score:.4f} ({this_score:.4f}: "
+                      f"{_how}, below the {args.base_margin * 100:.1f}% margin)", flush=True)
+
             # Update best_kernel unconditionally if score is higher (for statistics)
             if this_score > best_score:
                 print(f"[best] Updating best_kernel (statistics): {this_score:.4f} vs {best_score:.4f}", flush=True)
@@ -2195,6 +2452,19 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             scores.append(last_score_for_curve)
             err_flags.append(True)
 
+        # ---- plateau tracking ------------------------------------------------
+        # Gated by the SAME margin the base uses. A gain inside it is not
+        # resolvable from cross-round GPU drift, so it must not read as progress
+        # and reset the counter -- on vae_block_002 the final "improvement" was
+        # +0.017%, which is noise, and treating it as real would have kept the
+        # loop alive for another 7 rounds.
+        if best_score_at_round_start > 0:
+            _improved = best_score > best_score_at_round_start * (1.0 + args.base_margin)
+        else:
+            _improved = best_score > best_score_at_round_start
+        rounds_since_improvement = 0 if _improved else rounds_since_improvement + 1
+        _plateau_stop = bool(args.patience and rounds_since_improvement >= args.patience)
+
         # Round finished (whatever its outcome) -- snapshot so a stop or a crash
         # after this point resumes from the NEXT round rather than replaying this one.
         _save_checkpoint(
@@ -2213,9 +2483,21 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 "scores": scores,
                 "err_flags": err_flags,
                 "last_score_for_curve": last_score_for_curve,
+                "rounds_since_improvement": rounds_since_improvement,
+                "stop_reason": "plateau" if _plateau_stop else None,
                 "opt_history_files": opt_history_files,
             },
         )
+
+        if _plateau_stop:
+            _best_txt = f"{best_score:.4f}" if best_score != float("-inf") else "none"
+            print(f"[plateau] No gain above the {args.base_margin * 100:.1f}% margin for "
+                  f"{rounds_since_improvement} consecutive rounds (best={_best_txt}). Stopping "
+                  f"after round {round_idx} of {args.round}; the remaining "
+                  f"{args.round - round_idx - 1} would very likely have cost wall clock without "
+                  f"moving the score. Resume with --resume {batch_dir} --patience 0 to override.",
+                  flush=True)
+            break
 
     # plot per-task curve
     fig_path = fig_dir / f"{task_path.stem}_score.png"

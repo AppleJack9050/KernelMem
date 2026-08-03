@@ -147,7 +147,6 @@ def query_server(
     temperature: float = 1.0,
     top_p: float = 1.0,
     top_k: int = 50,
-    max_tokens: int = 128,
     num_completions: int = 1,
     server_port: int = 30000,
     server_address: str = "localhost",
@@ -200,7 +199,7 @@ def query_server(
     finish_reason = getattr(result, "stop_reason", None) or getattr(result, "subtype", None)
     print(colorize_finish_reason(finish_reason))
     if finish_reason in {"length", "max_tokens"}:
-        print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
+        print("Warning: Output truncated at the CLI's output limit")
 
     if not texts:
         raise RuntimeError("Claude Agent SDK returned no text output")

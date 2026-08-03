@@ -46,7 +46,7 @@ import json
 import math
 import statistics as st
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from utils.compile_and_run import compare_and_bench
 
@@ -73,6 +73,119 @@ def _welch(a: List[float], b: List[float]) -> Dict[str, float]:
         "rel_diff_pct": (ma / mb - 1.0) * 100.0 if mb else float("nan"),
         "se": se,
         "t": (ma - mb) / se if se > 0 else float("inf") if ma != mb else 0.0,
+    }
+
+
+def adaptive_paired_verdict(
+    reference: Path,
+    base_py: Path,
+    cand_py: Path,
+    *,
+    device: int = 0,
+    warmup: int = 25,
+    repeat: int = 100,
+    tol: float = 1e-2,
+    margin: float = 0.005,
+    min_reps: int = 3,
+    max_reps: int = 8,
+    escalate_k: float = 3.0,
+    log: Optional[Callable[[str], None]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Decide whether ``cand_py`` beats ``base_py`` by ``margin``, measuring BOTH now.
+
+    Why this exists
+    ---------------
+    The ratchet compares a candidate measured this minute against ``base_score``,
+    a float stored when the base last advanced -- possibly hours earlier and never
+    re-taken. That number goes stale fast. Measured here on an RTX 5090, one
+    byte-identical kernel read 1.2014 ms and then 1.2141 ms half an hour later:
+    **+1.06%, twice the 0.5% margin that decides whether the base advances**. So
+    a meaningful share of "did this improve" was really "which way did the GPU
+    drift since the base was measured".
+
+    Re-running the base in the same session removes that term. The base and the
+    candidate are interleaved -- base, cand, base, cand -- rather than run in
+    blocks, because a clock ramp part-way through a block reads as a difference
+    between the kernels rather than as drift. The reps in one of today's runs
+    climbed 1.2065 -> 1.2210 monotonically inside a single session; blocked
+    sampling would have charged all of that to whichever kernel ran second.
+
+    Adaptive reps
+    -------------
+    Most rounds are not close and do not need precision: of the seven measured
+    candidates in rounds 13-20 of the exp3 run, six landed at -0.66% to -11.06%
+    and one at +0.49%. So sample ``min_reps`` first and stop as soon as the
+    DECISION is safe -- what matters is distance from the margin, not from zero,
+    since +5% and -5% are both unambiguous against a 0.5% gate while +0.49% sits
+    on the line. Only the genuinely close calls pay for ``max_reps``.
+
+    Returns None if measurement fails, so the caller can fall back to the stored
+    score rather than lose the round.
+
+    The returned ``rel_pct`` is the candidate's advantage in ABSOLUTE kernel time,
+    never in ``score``: ``score`` is ``T_ref / T_k`` with a separately measured
+    ``T_ref``, so a candidate that slows the reference down outranks one that is
+    genuinely faster (see the module docstring for the case where that reported
+    "+9.35%, REAL" for a kernel 1.28x slower).
+    """
+    say = log or (lambda _m: None)
+    base_ms: List[float] = []
+    cand_ms: List[float] = []
+
+    def _one(path: Path) -> float:
+        # Diagnostic path: measure and report a leaking kernel rather than refuse
+        # it. compare_and_bench still restores device state after every call, so
+        # one kernel's leak cannot reach the next one measured here.
+        res = compare_and_bench(reference, path, device_idx=device, warmup=warmup,
+                                repeat=repeat, tol=tol, reject_on_state_leak=False)
+        return _geo([p["test_ms"] for p in res["per_shape"]])
+
+    def _stats() -> tuple:
+        # Welch on speed (1/time) so "positive" keeps meaning "candidate better".
+        sb = [1.0 / t for t in base_ms]
+        sc = [1.0 / t for t in cand_ms]
+        w = _welch(sc, sb)
+        mean_b = st.mean(sb)
+        return w["rel_diff_pct"], (w["se"] / mean_b * 100.0 if mean_b else float("nan")), w["t"]
+
+    try:
+        while len(base_ms) < max_reps:
+            base_ms.append(_one(base_py))
+            cand_ms.append(_one(cand_py))
+            if len(base_ms) < min_reps:
+                continue
+            rel, se, _t = _stats()
+            if not (se > 0):        # zero variance -- more reps cannot help
+                break
+            if abs(rel - margin * 100.0) >= escalate_k * se:
+                break
+    except Exception as exc:
+        say(f"[base] paired re-measure failed ({exc.__class__.__name__}: {exc}); "
+            f"falling back to the stored base score")
+        return None
+
+    if len(base_ms) < min_reps:
+        return None
+
+    rel, se, t = _stats()
+    return {
+        "rel_pct": rel,
+        "se_pct": se,
+        "t": t,
+        "reps": len(base_ms),
+        "escalated": len(base_ms) > min_reps,
+        "base_ms": st.mean(base_ms),
+        "cand_ms": st.mean(cand_ms),
+        "base_ms_all": base_ms,
+        "cand_ms_all": cand_ms,
+        "margin_pct": margin * 100.0,
+        "beats_margin": rel >= margin * 100.0,
+        # "Resolved" is about the DECISION, not the effect: a +0.49% that cannot
+        # be told apart from a 0.50% gate is unresolved even though the kernel
+        # plainly changed something. Rounds 13-20 reported every such case to the
+        # next round as a failure, which is why one of them re-ran a mechanism
+        # that had in fact been the run's best kernel.
+        "resolved": abs(rel - margin * 100.0) >= 2.0 * se if se > 0 else True,
     }
 
 
