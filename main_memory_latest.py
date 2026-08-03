@@ -1103,11 +1103,25 @@ def _base_optimization_inventory(optimization_tree: Dict[str, Any],
         parent = optimization_tree.get(node.get("parent") or "") or {}
         sp, psp = node.get("speedup"), parent.get("speedup")
         gain = ((sp / psp - 1.0) * 100.0) if (sp and psp) else None
+        # `gain` is this kernel's score over its parent's, and the two were taken in
+        # different sessions, so it carries GPU drift -- +0.9..+1.7% on this machine,
+        # against a 0.5% adoption margin. Ablating the five mechanisms of the exp3
+        # round-9 base showed what that is worth: three claimed +0.90%, +1.12% and
+        # +1.18% but measured 0.09-0.17% when removed and re-measured side by side,
+        # i.e. indistinguishable from zero. `measured_*` carries the paired,
+        # same-session figure the ratchet recorded, and is None for any mechanism
+        # adopted before that machinery existed -- which is the honest state, not a
+        # gap to paper over with `gain_pct`.
+        _pv = node.get("paired_verdict") or {}
         inventory.append({
             "method_name": method,
             "round": node.get("round"),
             "speedup": sp,
             "gain_pct": gain,
+            "measured_pct": _pv.get("rel_pct"),
+            "measured_se_pct": _pv.get("se_pct"),
+            "measured_t": _pv.get("t"),
+            "measured_resolved": _pv.get("resolved"),
             # The judge is asked for this key under two spellings depending on which
             # output schema it followed, so accept both -- reading only one silently
             # blanks the summary and the inventory entry degrades to a bare name.
@@ -2392,6 +2406,23 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                                  encoding="utf-8")
                     except Exception as _exc:
                         print(f"[base] Warning: could not record paired verdict: {_exc}", flush=True)
+                    # Also hang it on the tree node. The round record above is
+                    # per-round; _base_optimization_inventory walks the tree's
+                    # parent links to list what the BASE carries, so this is the
+                    # only path by which a mechanism's measured contribution can
+                    # follow it forward once later rounds inherit it. The tree is
+                    # serialized to optimization_tree.json and checkpointed, so it
+                    # also survives --resume.
+                    try:
+                        _kn = getattr(ind, "code_path", None)
+                        if _kn and _kn.stem in optimization_tree:
+                            optimization_tree[_kn.stem]["paired_verdict"] = {
+                                k: _verdict[k] for k in
+                                ("rel_pct", "se_pct", "t", "reps", "resolved")
+                            }
+                    except Exception as _exc:
+                        print(f"[base] Warning: could not attach paired verdict to "
+                              f"the optimization tree: {_exc}", flush=True)
                 else:
                     should_update_base = this_score >= base_score * (1.0 + args.base_margin)
                     _paired_note = None
