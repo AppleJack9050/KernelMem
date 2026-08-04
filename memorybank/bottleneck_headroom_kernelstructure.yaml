@@ -619,6 +619,35 @@ machine_check:
             - KernelFission
           expected_speedup: medium
 
+        # The ONLY Tier-L case in this table, and deliberately so.
+        #
+        # Tier-L means "primary_limiter_util_pct > 80 AND bytes structurally
+        # unavoidable" -- near the ceiling with nothing left to reclaim. Every
+        # other case requires Tier-H/Tier-M, so a kernel that reaches Tier-L
+        # matches nothing and the run has no legal move left. That is correct
+        # ONLY while the algorithm is held fixed: the tier measures how close
+        # the CURRENT arithmetic runs to peak, not whether that arithmetic is
+        # necessary. A kernel at 97% of FLOP peak cannot be scheduled faster --
+        # it can only be asked to do less work.
+        #
+        # Measured on vae_block_002 (RTX 5090): the vendor conv is 74.1% of
+        # reference GPU time at 102 of 104.8 TFLOPS. 24 rounds of scheduling
+        # and data-movement methods moved the score +7% and then plateaued,
+        # because every allowed method was a no-op against that wall.
+        - id: CMP_ArithmeticBound_AlgorithmicSubstitution
+          headroom: [Tier-L, Tier-M]
+          kernel_structure: [S1, S2, S3]
+          gate_when: "stencil_conv_like = true AND high_sm_throughput = true AND memory_not_dominant = true"
+          allowed_methods:
+            - Algorithmic_Substitution_Winograd
+            - Own_And_Fuse_Vendor_Operator
+          expected_speedup: large
+          note: >
+            Only fires when the arithmetic is the wall. Do NOT reach for these
+            while any Tier-H/Tier-M case still applies -- reducing operation
+            count is strictly harder than scheduling the operations you have,
+            and is worth attempting only once scheduling is exhausted.
+
 
     register_pressure:
       ncu_signature: [occupancy_limited_by_registers, high_registers_per_thread]
@@ -968,6 +997,75 @@ llm_assist:
       forbidden_patterns:
         - "reduce occupancy at the same time via increased register pressure"
         - "change algorithmic work or precision"
+
+    Algorithmic_Substitution_Winograd:
+      intent: >
+        Replace direct/implicit-GEMM 3x3 stride-1 convolution with Winograd
+        F(2x2,3x3): 16 multiplies per 2x2 output tile instead of 36, i.e. 2.25x
+        fewer multiplies. This is the only method in this catalog that reduces
+        the OPERATION COUNT rather than scheduling the operations better, so it
+        is the only one that can help a kernel already near FLOP peak.
+      applicability: >
+        conv 3x3 stride 1, compute-bound, arithmetic intensity well above the
+        machine balance (FLOP/byte >> peak_FLOPS/peak_bandwidth). Check this
+        first: after a 2.25x FLOP cut the kernel must STILL be compute-bound or
+        the saving is absorbed by memory. On vae_block_002 / RTX 5090 the direct
+        conv is 577 FLOP/byte against a machine balance of 58.5, so it stays
+        compute-bound by 4.4x after the cut and the reduction does convert to
+        wall-clock.
+      mechanism_requirements:
+        - transforms_fused_in_registers_or_shared
+        - f_2x2_3x3_only
+        - fp32_storage_and_accumulate
+      expected_metric_change:
+        - kernel_duration_us down
+        - sm__inst_executed down (fewer multiplies)
+        - dram traffic FLAT (if it rises, the transforms are being materialized)
+      forbidden_patterns:
+        - >
+          calling cuDNN CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED, or any
+          implementation that materializes the transformed tensors to global
+          memory. The transform domain is 4x the tensor (16 values per 2x2
+          tile), so materializing costs ~4x tensor traffic and erases the entire
+          2.25x. This is not hypothetical: on vae_block_002 the NONFUSED vendor
+          algorithm measured 1.1581 against 1.2039 for the implicit-GEMM path it
+          replaced -- it LOST. The fused variant is the only one worth writing.
+        - >
+          F(4x4,3x3) or larger tiles. F(2,3) transform entries are 0, +/-1,
+          +/-1/2 -- all exactly representable in binary floating point, so the
+          transforms introduce no representation error. F(4,3) uses +/-1/4 and
+          +/-1/8 and degrades accuracy materially against a 3e-3 tolerance.
+        - reduced precision of any kind to buy throughput
+
+    Own_And_Fuse_Vendor_Operator:
+      intent: >
+        Take ownership of a vendor GEMM/conv that dominates runtime, so the
+        surrounding work can be fused into its prologue/epilogue and the
+        intermediate never round-trips through global memory.
+      applicability: >
+        The vendor kernel is >60% of time AND the work around it is already at
+        its own roofline, so nothing further can be reclaimed while the
+        intermediate must be materialized for the vendor kernel to read.
+      mechanism_requirements:
+        - vendor_operator_fraction_measured
+        - surrounding_work_fused_into_prologue_or_epilogue
+        - intermediate_never_written_to_global
+      expected_metric_change:
+        - dram traffic down by the deleted intermediate passes
+        - kernel launch count down
+      forbidden_patterns:
+        - >
+          adopting this without first computing what it can pay. If your own
+          operator merely MATCHES the vendor's throughput, the entire gain is
+          the deleted traffic -- which may be small. On vae_block_002 that
+          ceiling was +8% (1.31x vs the 1.2039 incumbent), because the existing
+          kernel had already fused everything except one unavoidable pass.
+          Compute the ceiling before spending rounds on it.
+        - >
+          assuming a hand-written GEMM will reach vendor throughput. Three
+          independent seed attempts on vae_block_002 landed at ~45% of cuDNN.
+          Pair this method with Algorithmic_Substitution_Winograd when the goal
+          is to BEAT the vendor rather than merely to fuse around it.
 
     SharedMemoryTiling:
       intent: "Use shared-memory tiling to exploit data reuse across threads/outputs (e.g., stencil/conv spatial reuse)."

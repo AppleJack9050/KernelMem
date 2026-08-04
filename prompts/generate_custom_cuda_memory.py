@@ -76,7 +76,7 @@ SEED GRANULARITY SELECTION (STRICT)
   4) what remains in PyTorch and why (one line each).
   All planning notes MUST be inside Python code comments; do not output any extra prose.
   If this header comment is missing or incomplete, the output is invalid.
-
+$granularity_mandate
 CRITICAL CONSTRAINT
 - You MUST preserve parameter parity with the reference PyTorch module(s).
 - You MAY keep an equivalent PyTorch module ONLY as a PARAMETER HOLDER (for initialization / state_dict parity).
@@ -224,6 +224,8 @@ def build_seed_prompt(
     arch_path: Path,
     gpu_name: str | None = None,
     reference_profile: str | None = None,
+    force_granularity: str | None = None,
+    force_algorithm: str | None = None,
 ) -> str:
     """Build LLM prompt for CUDA‑kernel optimisation (seed generation).
 
@@ -231,6 +233,14 @@ def build_seed_prompt(
     reference spends GPU time (see utils.reference_profile). It is injected
     directly above the granularity choice, because that choice fixes what the
     model may rewrite for the whole run and is otherwise made blind.
+
+    *force_granularity* pins that choice instead of leaving it to the model.
+    None (the default) leaves the prompt byte-identical to before. It exists
+    because the choice is made once, at round 0, from a single sample, and is
+    never revisited -- on vae_block_002 every seed took (A)/(B)/(C), which
+    accepted a 1.35x Amdahl cap that the following 24 rounds then spent
+    themselves against. Pinning it makes that a controlled variable rather
+    than a coin flip.
     """
     gpu_info = _load_gpu_spec()
 
@@ -287,7 +297,90 @@ def build_seed_prompt(
         kernel_src=kernel_src,
         gencode_flag=gencode_flag,
         reference_profile=profile_block,
+        granularity_mandate=_granularity_mandate(force_granularity, force_algorithm),
     )
+
+
+_GRANULARITY_NAMES = {
+    "A": "optimize a single hotspot op",
+    "B": "replace several ops + schedule multiple kernels",
+    "C": "fuse many ops into one/few kernels",
+    "D": "fully rewrite forward",
+}
+
+
+_ALGORITHM_MANDATE = {
+    "implicit_gemm": [
+        "- ALGORITHM: implement the convolution as a tiled implicit GEMM.",
+    ],
+    "winograd_f2x3": [
+        "- ALGORITHM (BINDING): implement the 3x3 stride-1 convolution with the WINOGRAD",
+        "  F(2x2, 3x3) minimal filtering algorithm, NOT a direct or implicit-GEMM",
+        "  convolution. It needs 16 multiplies per 2x2 output tile where direct needs 36",
+        "  -- 2.25x fewer. That reduction, not better scheduling, is the entire reason",
+        "  this lineage exists: the vendor kernel already runs at ~97% of FLOP peak, so",
+        "  it cannot be out-scheduled, only out-counted.",
+        "- THE TRANSFORMS MUST BE FUSED. Keep the 4x4 transform tiles in registers or",
+        "  shared memory and never write them to global memory. The transform domain is",
+        "  4x the size of the tensor (16 values per 2x2 output tile), so materializing it",
+        "  costs roughly 4x tensor traffic and gives back the whole 2.25x. This is",
+        "  measured, not theoretical: cuDNN's WINOGRAD_NONFUSED algorithm scored 1.1581",
+        "  on this task against 1.2039 for the implicit-GEMM path it replaced -- it LOST,",
+        "  and it lost precisely because it materializes the transforms.",
+        "- Use F(2x2,3x3) ONLY. Its transform entries are 0, +/-1, +/-1/2, all exactly",
+        "  representable in binary floating point, so the transforms add no representation",
+        "  error. F(4x4,3x3) uses +/-1/4 and +/-1/8 and degrades accuracy materially.",
+        "- Expect this to be register-pressure bound: 16 accumulators per tile is the",
+        "  binding constraint. Choose the tile/warp decomposition around that.",
+    ],
+}
+
+
+def _granularity_mandate(level: str | None, algorithm: str | None = None) -> str:
+    """Binding override for the granularity menu, or "" to leave it a free choice."""
+    if not level:
+        return ""
+    level = level.upper()
+    if level not in _GRANULARITY_NAMES:
+        raise ValueError(f"granularity must be one of {sorted(_GRANULARITY_NAMES)}, got {level!r}")
+    lines = [
+        "",
+        "SEED GRANULARITY OVERRIDE (BINDING - overrides the menu above)",
+        f"- The granularity for this run is FIXED to ({level}) {_GRANULARITY_NAMES[level]}.",
+        f"  Do not choose any other level. Still emit the header comment, stating ({level}).",
+    ]
+    if level == "D":
+        lines += [
+            "- (D) here means you OWN the vendor GEMM/convolution named in the reference profile:",
+            "  implement it yourself (your own CUDA, or CUTLASS/cuBLASLt device-side from inside",
+            "  your extension). Do NOT satisfy it with cuDNN, at::conv2d, or at::cudnn_convolution.",
+            "- Owning it is only worth anything if you FUSE the surrounding work into its",
+            "  prologue/epilogue so intermediates never round-trip through global memory. A",
+            "  standalone reimplementation that merely matches the vendor kernel wins nothing --",
+            "  the whole point is the traffic you delete, not the GEMM you rewrite.",
+            "- Matching the vendor kernel's raw throughput is NOT the target and is not expected.",
+            "  The target is total forward time. A convolution at 80% of the vendor's throughput",
+            "  that eliminates a full read AND write of the intermediate tensors is a clear win;",
+            "  one at 100% that still materializes them is not.",
+            "- Correctness still governs: the reference uses TF32 tensor cores with fp32 accumulate.",
+            "  Reduced-precision accumulation that breaks the tolerance is a failed kernel, not a",
+            "  fast one.",
+            "- SCOPE OF THIS SEED: a correct, sound structure beats a fast one here. ONE",
+            "  straightforward tiled implicit-GEMM (shared-memory tiling, mma/wmma or plain FMA)",
+            "  with the surrounding work fused into its epilogue is the right size of first draft.",
+            "  Do NOT write a multi-stage software-pipelined CUTLASS-class kernel in the seed:",
+            "  later rounds exist to tune it, and an over-long first reply is the most common way",
+            "  this seed fails outright rather than merely scoring low.",
+            "- Emit ONE complete Python file and nothing else. Do not restate the reference, do not",
+            "  offer alternative implementations, do not include benchmarking or test code.",
+        ]
+    if algorithm:
+        extra = _ALGORITHM_MANDATE.get(algorithm)
+        if extra is None:
+            raise ValueError(f"unknown seed algorithm {algorithm!r}; "
+                             f"known: {sorted(_ALGORITHM_MANDATE)}")
+        lines += extra
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------

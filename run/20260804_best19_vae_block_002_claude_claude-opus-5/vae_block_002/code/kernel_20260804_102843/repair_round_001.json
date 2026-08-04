@@ -1,0 +1,31 @@
+{
+  "round": 24,
+  "repair_round": 1,
+  "kernel_to_repair": "/home/otter77/git_project/KernelMem/run/20260804_best19_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_102843.py",
+  "kernel_to_repair_name": "kernel_20260804_102843",
+  "error_log": "Traceback (most recent call last):\n  File \"/home/otter77/git_project/KernelMem/utils/compile_and_run.py\", line 965, in compare_and_bench\n    raise ValueError(msg)\nValueError: Outputs are not close (atol=0.01, rtol=0.01). max_abs_err=8.493e+00, mean_abs_err=6.082e-01\nmismatched_elements=15855950/16777216 (94.51%)\nin[0]: shape=(8, 256, 64, 128), dtype=torch.float32, contiguous=True, device=cpu\nin[1]: shape=(256, 256, 3, 3), dtype=torch.float32, contiguous=True, device=cpu\nin[2]: shape=(256,), dtype=torch.float32, contiguous=True, device=cpu\nin[3]: shape=(256,), dtype=torch.float32, contiguous=True, device=cpu\nin[4]: shape=(256, 256, 3, 3), dtype=torch.float32, contiguous=True, device=cpu\nin[5]: shape=(256,), dtype=torch.float32, contiguous=True, device=cpu\nin[6]: shape=(256,), dtype=torch.float32, contiguous=True, device=cpu\nin[7]: type=float (non-tensor)\nref_out: shape=(8, 256, 64, 128), dtype=torch.float32, device=cuda:0\ntest_out: shape=(8, 256, 64, 128), dtype=torch.float32, device=cu",
+  "problem_identification": {
+    "critical_issue": "Cross-stream tensor handoff without record_stream in graph-captured pipeline causes allocator-reuse data race",
+    "evidence": [
+      "Outputs are not close (atol=0.01, rtol=0.01). max_abs_err=8.493e+00, mean_abs_err=6.082e-01",
+      "this kernel's output depends on what the CUDA caching allocator previously stored, on shape 8x256x64x128"
+    ],
+    "root_cause": "The stage-offset pipeline allocates xl[k]/z[k] on sMem and consumes them on sConv (and y1/y2 vice-versa), then frees them (`= None`) immediately. The graph-capture call path uses rec=False, so no record_stream/event protects the blocks; the caching allocator hands the same memory to the next sMem allocation while sConv still reads it, so conv/GN inputs contain stale or unwritten data. The known-good kernel keeps each chunk's whole chain on one stream, avoiding this entirely.",
+    "trigger_condition": "B>=2 so the two-stream pipeline is taken, and the captured graph (rec=False) frees a tensor on one stream while the other stream still reads it.",
+    "must_hold_invariants": [
+      "every intermediate is produced and consumed on the same stream, or its lifetime is protected by an event/record_stream",
+      "no tensor is freed while another stream's pending kernel still reads it",
+      "gn stats psum/psq slots read by gn_final are all written by gn_stats"
+    ],
+    "minimal_fix": "Keep each chunk's full chain (transpose, conv1, GN, conv2, epilogue) on one stream, as in the known-good _run_pipeline; do not split conv onto sConv and GN onto sMem.",
+    "patch_anchor": "y1[k] = F.conv2d(xl[k], w1c, None, 1, 1)",
+    "confidence": "medium"
+  },
+  "repair_strategy": null,
+  "timestamp": "2026-08-04T10:29:17.083097",
+  "runnable": true,
+  "speedup": 1.204492768313382,
+  "test_passed": true,
+  "repaired_kernel": "/home/otter77/git_project/KernelMem/run/20260804_best19_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_103131.py",
+  "test_timestamp": "2026-08-04T10:31:39.665126"
+}

@@ -31,6 +31,34 @@ from prompts.error_memory import build_error_prompt
 from prompts.optimization_memory_latest import build_optimization_prompt
 from prompts.judger_repair_memory import build_correctness_prompts
 from prompts.judger_optimization_memory_latest import build_judger_optimization_prompts
+from utils.gpu_lock import gpu_section
+
+# ---------------------------------------------------------------------------
+# Serialize every GPU-touching entry point behind one cross-process mutex.
+#
+# Wrapped here, once, rather than at each call site: `compare_and_bench` alone is
+# reached from the seed loop, the repair path and the optimization path, and a
+# single missed site would silently let two lineages measure at the same time --
+# which does not add noise, it invalidates the comparison the ratchet is built
+# on. Wrapping the imported name covers every caller by construction.
+#
+# gpu_section() is a no-op unless KERNELMEM_GPU_LOCK is set, so single-process
+# runs are byte-for-byte unaffected; only the lineage coordinator sets it.
+# ---------------------------------------------------------------------------
+def _serialize_on_gpu(fn, what):
+    def _wrapped(*args, **kwargs):
+        with gpu_section(what):
+            return fn(*args, **kwargs)
+    _wrapped.__name__ = getattr(fn, "__name__", what)
+    _wrapped.__doc__ = getattr(fn, "__doc__", None)
+    return _wrapped
+
+
+compare_and_bench = _serialize_on_gpu(compare_and_bench, "bench")
+profile_bench = _serialize_on_gpu(profile_bench, "ncu")
+nsys_profile_bench = _serialize_on_gpu(nsys_profile_bench, "nsys")
+build_reference_profile_block = _serialize_on_gpu(build_reference_profile_block, "ref_profile")
+
 _INVOCATION_SPLITTER = "Invoked with:"
 
 def _sanitize_error_message(exc: Exception) -> str:
@@ -58,6 +86,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_seeds", type=int, default=3,
                    help="Round-0 seed candidates to draw; the best-scoring one becomes the base "
                         "(1 = previous single-sample behaviour)")
+    p.add_argument("--seed_granularity", default=None, choices=["A", "B", "C", "D"],
+                   help="Pin the round-0 granularity instead of letting the seed choose it. "
+                        "The choice fixes what every later round may rewrite and is never "
+                        "revisited, yet it is made from a single sample. On vae_block_002 all "
+                        "seeds took (A)/(B)/(C), keeping the vendor conv -- 74.1%% of reference "
+                        "GPU time -- which caps the whole run at 1.35x by Amdahl; 24 rounds then "
+                        "reached 1.20x and plateaued. 'D' forces the model to own the vendor "
+                        "GEMM/conv so it can fuse the surrounding work into its epilogue. Default "
+                        "(unset) leaves the prompt byte-identical to before.")
+    p.add_argument("--seed_algorithm", default=None,
+                   choices=["implicit_gemm", "winograd_f2x3"],
+                   help="Pin the ALGORITHM the seed uses for the operator it owns "
+                        "(requires --seed_granularity D to be meaningful). Only an "
+                        "algorithm with a lower operation count can beat a vendor "
+                        "kernel already at ~97%% of FLOP peak: winograd_f2x3 needs "
+                        "16 multiplies per 2x2 tile where direct needs 36 (2.25x). "
+                        "Default (unset) leaves the choice to the model.")
     p.add_argument("--work_dir", type=Path, default=Path("run"), help="Output root directory")
     p.add_argument("--device", type=int, default=0, help="CUDA device index for benchmarking")
     p.add_argument("--warmup", type=int, default=25, help="Warm-up iterations")
@@ -91,6 +136,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "one (+0.49%%) would escalate. At 3.6 s per measurement that is roughly "
                         "+4%% on an 8.6-minute round. Set 0 to disable the paired re-measure and "
                         "compare against the stored base score, as before.")
+    p.add_argument("--base_sigma", type=float, default=3.0,
+                   help="How many standard errors above ZERO a paired gain must sit before it may "
+                        "advance the base. --base_margin asks 'is it big enough'; this asks 'are we "
+                        "sure it is a gain at all', and a point estimate alone cannot answer the "
+                        "second. Calibrated by re-measuring the exp3 chain paired: the two real "
+                        "advances came back at 6.6 and 8.6 sigma while the three that had been "
+                        "adopted on drift came back at -2.1, -1.7 and +0.9, so anything in 1..6 "
+                        "separates them and 3 sits in the middle. It matters most on noisy kernels "
+                        "-- multi-stream ones run ~5x noisier -- where a +0.6%% reading with 0.4%% "
+                        "standard error clears a 0.5%% margin at only 1.5 sigma. Set 0 to decide on "
+                        "the margin alone.")
     p.add_argument("--patience", type=int, default=4,
                    help="Stop after this many consecutive rounds that fail to improve best_score "
                         "by more than --base_margin (0 disables). Late rounds are where a run "
@@ -1033,36 +1089,43 @@ def _paired_base_verdict(reference: Path, base_py: Path, cand_py: Path, *,
     """
     from multiprocessing import get_context
 
-    ctx = get_context("spawn")
-    parent_conn, child_conn = ctx.Pipe(duplex=False)
-    p = ctx.Process(
-        target=_paired_verdict_worker,
-        args=(str(reference), str(base_py), str(cand_py), device_idx,
-              warmup, repeat, tol, margin, min_reps, max_reps, child_conn),
-    )
-    p.start()
-    try:
-        child_conn.close()
-    except Exception:
-        pass
+    # Held across the whole spawned measurement, not just the launch. This is
+    # the most drift-sensitive block in the run -- it interleaves two kernels
+    # specifically so a shared time-varying term cancels -- and another lineage
+    # benchmarking midway through would reintroduce exactly the term the
+    # interleaving exists to remove, biased toward whichever kernel happened to
+    # overlap it. Serialized, or the verdict is worthless.
+    with gpu_section("paired_verdict"):
+        ctx = get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        p = ctx.Process(
+            target=_paired_verdict_worker,
+            args=(str(reference), str(base_py), str(cand_py), device_idx,
+                  warmup, repeat, tol, margin, min_reps, max_reps, child_conn),
+        )
+        p.start()
+        try:
+            child_conn.close()
+        except Exception:
+            pass
 
-    p.join(timeout=timeout)
-    if p.is_alive():
-        print(f"[base] paired re-measure exceeded {timeout}s; terminating and "
-              f"falling back to the stored base score", flush=True)
-        p.terminate()
-        p.join(timeout=5)
+        p.join(timeout=timeout)
         if p.is_alive():
-            p.kill()
-            p.join()
-        return None
+            print(f"[base] paired re-measure exceeded {timeout}s; terminating and "
+                  f"falling back to the stored base score", flush=True)
+            p.terminate()
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+                p.join()
+            return None
 
-    payload = None
-    try:
-        if parent_conn.poll():
-            payload = parent_conn.recv()
-    except Exception:
         payload = None
+        try:
+            if parent_conn.poll():
+                payload = parent_conn.recv()
+        except Exception:
+            payload = None
 
     if not payload or payload[0] != "ok" or payload[1] is None:
         if payload and payload[0] == "err":
@@ -1268,7 +1331,9 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 for _l in ref_profile_block.splitlines()[:3]:
                     print(f"[ref_profile] {_l}", flush=True)
             seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu,
-                                            reference_profile=ref_profile_block)
+                                            reference_profile=ref_profile_block,
+                                            force_granularity=getattr(args, "seed_granularity", None),
+                                            force_algorithm=getattr(args, "seed_algorithm", None))
             prompt_file = io_dir / f"round{round_idx:03d}_seed_prompt.txt"
             prompt_file.write_text(seed_prompt, encoding="utf-8")
             # Best-of-N seeds. Round 0 is a single temperature-1 draw, and the
@@ -1281,11 +1346,25 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             for seed_i in range(n_seeds):
                 if n_seeds > 1:
                     print(f"[Seed] Drawing candidate {seed_i + 1}/{n_seeds} ...", flush=True)
-                cand = _llm_to_kernel(
-                    seed_prompt, code_dir, call_llm, io_dir, round_idx,
-                    log_path=log_path, call_type="seed",
-                    io_tag=f"{round_idx}_seed{seed_i}" if n_seeds > 1 else None,
-                )
+                # A draw that RAISES must cost only that draw. Drawing several
+                # seeds exists precisely so one bad sample cannot cap the run,
+                # but that only held for kernels that came back and failed to
+                # build -- an exception from the LLM call itself propagated out
+                # of main() and killed the process. Round 0 has no checkpoint
+                # yet, so everything already spent was lost with it: on
+                # 2026-08-04 a granularity-D seed raised after 29 minutes and
+                # took the whole run with it, without reaching draw 2 of 5.
+                try:
+                    cand = _llm_to_kernel(
+                        seed_prompt, code_dir, call_llm, io_dir, round_idx,
+                        log_path=log_path, call_type="seed",
+                        io_tag=f"{round_idx}_seed{seed_i}" if n_seeds > 1 else None,
+                    )
+                except Exception as exc:
+                    print(f"[Seed] candidate {seed_i + 1}/{n_seeds} failed to generate "
+                          f"({type(exc).__name__}: {str(exc)[:200]}); skipping this draw",
+                          flush=True)
+                    continue
                 _bench_and_score(
                     cand,
                     ref_py=task_path,
@@ -1297,6 +1376,11 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     metrics_dir=eval_dir,
                 )
                 seed_cands.append(cand)
+
+            if not seed_cands:
+                raise RuntimeError(
+                    f"All {n_seeds} seed draws failed to generate a kernel; nothing to "
+                    f"optimise. See the [Seed] lines above for the per-draw errors.")
 
             def _seed_score(c: KernelIndividual) -> float:
                 # A candidate that did not run must never outrank one that did,
@@ -2358,6 +2442,12 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             # in the pre-compile / ncu handlers above, and intentionally bypass this margin.
             should_update_base = False
             _paired_note = None   # set only when a side-by-side measurement was taken
+            # Must be cleared EVERY round, not just on the branch that measures.
+            # It is read below by the best_kernel gate, and the branches that skip
+            # the paired measurement (first score, unusable base) would otherwise
+            # leave the PREVIOUS round's verdict visible and judge this round's
+            # candidate against it.
+            _verdict = None
             if base_score == float("-inf"):
                 # First valid score, always update
                 should_update_base = True
@@ -2386,13 +2476,29 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         min_reps=args.base_reps, max_reps=args.base_max_reps)
 
                 if _verdict is not None:
-                    should_update_base = bool(_verdict["beats_margin"])
+                    # Two independent questions, two gates. `beats_margin` is a
+                    # point estimate: is the gain big enough. It cannot tell a
+                    # +0.6% with 0.05% error from a +0.6% with 0.4% error, and on
+                    # a noisy kernel the second is ~1.5 sigma from zero -- i.e.
+                    # quite possibly nothing. Since the ratchet is one-way and
+                    # never re-verified, an advance bought with noise is permanent,
+                    # so also require the gain to be clear of zero. A missing or
+                    # zero standard error means there is nothing to resolve, so it
+                    # passes rather than blocking on a division.
+                    _se = _verdict["se_pct"]
+                    _sig = (_verdict["rel_pct"] / _se) if (_se and _se > 0) else float("inf")
+                    _sig_ok = (args.base_sigma <= 0) or (_sig >= args.base_sigma)
+                    should_update_base = bool(_verdict["beats_margin"]) and _sig_ok
                     _paired_note = (
                         f"paired {_verdict['rel_pct']:+.2f}% +/-{_verdict['se_pct']:.2f}% "
-                        f"(t={_verdict['t']:+.1f}, {_verdict['reps']} reps"
+                        f"({_sig:.1f} sigma, t={_verdict['t']:+.1f}, {_verdict['reps']} reps"
                         f"{', escalated' if _verdict['escalated'] else ''}, "
                         f"{'resolved' if _verdict['resolved'] else 'UNRESOLVED'}; "
                         f"{_verdict['base_ms']:.4f} -> {_verdict['cand_ms']:.4f} ms)")
+                    if _verdict["beats_margin"] and not _sig_ok:
+                        _paired_note += (f" -- clears the margin but is under "
+                                         f"--base_sigma {args.base_sigma:.1f}, so it is "
+                                         f"not separable from noise")
                     # Persist it: an unresolved near-miss looks identical to a
                     # regression in the round record otherwise, which is exactly
                     # how round 19's +0.49% -- later the best kernel of the run --
@@ -2446,11 +2552,38 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 print(f"[base] Keeping base_kernel {base_score:.4f} ({this_score:.4f}: "
                       f"{_how}, below the {args.base_margin * 100:.1f}% margin)", flush=True)
 
-            # Update best_kernel unconditionally if score is higher (for statistics)
-            if this_score > best_score:
-                print(f"[best] Updating best_kernel (statistics): {this_score:.4f} vs {best_score:.4f}", flush=True)
+            # best_kernel decides what the run REPORTS, so it needs the same
+            # evidence the base ratchet demands -- it used to take any higher
+            # `this_score` with a bare `>`. `this_score` comes from the blocked
+            # bench in compare_and_bench (reference timed in one block, candidate
+            # in the next), which carries session drift the paired path removes:
+            # on 2026-08-04 round 22 that gap was +0.47% blocked against
+            # -0.06% +/-0.18% paired, for a kernel byte-equivalent in behaviour.
+            # The base correctly refused it; best took it anyway and shipped
+            # 1.2095 to summary.json, a number that does not reproduce. Worse,
+            # best_score is a running maximum over a noisy estimator, so noise
+            # can only ever ratchet it UP -- the error never cancels.
+            #
+            # When a verdict exists it is authoritative, including when it says
+            # the candidate is NOT better. Without one (no base yet, paired
+            # measurement failed, or --base_max_reps 0) fall back to the old
+            # comparison, so disabling the paired path restores prior behaviour
+            # exactly rather than freezing best forever.
+            if _verdict is not None:
+                _best_ok = should_update_base or this_score > best_score * (1.0 + args.base_margin)
+                _best_why = _paired_note or "paired"
+            else:
+                _best_ok = this_score > best_score
+                _best_why = "stored-score (no paired verdict available)"
+            if _best_ok and this_score > best_score:
+                print(f"[best] Updating best_kernel: {this_score:.4f} vs {best_score:.4f} "
+                      f"[{_best_why}]", flush=True)
                 best_score = this_score
                 best_kernel = ind
+            elif this_score > best_score:
+                print(f"[best] Keeping best_kernel {best_score:.4f} ({this_score:.4f} scores "
+                      f"higher but {_best_why}); not separable from measurement drift",
+                      flush=True)
             
             # Update optimization tree: update speedup if kernel already exists
             if ind and hasattr(ind, 'code_path') and ind.code_path:

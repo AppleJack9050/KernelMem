@@ -1,0 +1,600 @@
+```python
+# =============================================================================
+# ModelNew — SOL problem 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# SEED GRANULARITY: (D) FULL FORWARD REWRITE.
+#   The whole reference forward
+#     x -> conv3x3 -> GN(32) -> SiLU -> conv3x3 -> GN(32) -> SiLU -> +x
+#   is executed by kernels written here.  No cuDNN / at::conv2d / at::group_norm
+#   is called anywhere; the two vendor implicit-GEMM convolutions (72% of the
+#   reference GPU time) are OWNED by conv_kernel below.
+#
+# 1) Chosen granularity: (D) fully rewrite forward.
+# 2) Ops replaced: both F.conv2d (3x3, pad 1, C=256 -> C=256), both
+#    F.group_norm (32 groups), both F.silu, and the residual add.
+# 3) Fusion map:
+#      * transpose_w_kernel  : one-off pack of W(C, C*9) -> Wp(K=2304, M=256)
+#                              so the implicit-GEMM A-tile load is fully
+#                              coalesced (2.36 MB, negligible).
+#      * conv_kernel         : shared-memory tiled implicit GEMM
+#                              (BM=128 x BN=128 x BK=8, 8x8 register tile,
+#                              im2col addressing generated on the fly - the
+#                              im2col matrix is NEVER materialised) FUSED with
+#                              the GroupNorm first/second-moment reduction in
+#                              its epilogue: per (image, group) partial sums are
+#                              produced while the accumulators are still in
+#                              registers, so GroupNorm never re-reads the conv
+#                              output.  Deterministic: each (tile, group) slot
+#                              is written by exactly one block, no atomics on
+#                              global memory.
+#      * stats_kernel        : partial sums -> per-(n,c) affine (scale, bias),
+#                              i.e. GroupNorm mean/var/eps/weight/bias folded
+#                              into one multiply-add.  fp64 accumulation.
+#      * act_kernel          : SiLU(GN affine) applied in one pass -> input of
+#                              conv2 (fuses norm + activation).
+#      * final_kernel        : SiLU(GN affine) + residual add fused, single
+#                              pass, produces the output.
+# 4) Left in PyTorch: only tensor allocation (torch::empty) and shape checks -
+#    they are not GPU work.  Nothing of the math remains in ATen.
+#
+# Precision: everything is fp32 storage AND fp32 FMA arithmetic (no TF32/half
+# downcast of the convolution), group statistics accumulate in fp64.
+# =============================================================================
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+
+#define CCH      256
+#define KDIM     2304          /* CCH * 9 */
+#define NGROUPS  32
+#define CPG      8             /* channels per group */
+#define BM       128
+#define BN       128
+#define BK       8
+
+/* ---------------------------------------------------------------- weights */
+/* in : (256, 2304) row-major  ->  out : (2304, 256) row-major             */
+__global__ void transpose_w_kernel(const float* __restrict__ in,
+                                   float* __restrict__ out)
+{
+    __shared__ float tile[32][33];
+    const int x = blockIdx.x * 32 + threadIdx.x;   /* k */
+    const int y = blockIdx.y * 32 + threadIdx.y;   /* m */
+#pragma unroll
+    for (int j = 0; j < 32; j += 8)
+        tile[threadIdx.y + j][threadIdx.x] = in[(size_t)(y + j) * KDIM + x];
+    __syncthreads();
+    const int x2 = blockIdx.y * 32 + threadIdx.x;  /* m */
+    const int y2 = blockIdx.x * 32 + threadIdx.y;  /* k */
+#pragma unroll
+    for (int j = 0; j < 32; j += 8)
+        out[(size_t)(y2 + j) * CCH + x2] = tile[threadIdx.x][threadIdx.y + j];
+}
+
+/* ------------------------------------------------- fused conv + GN moments */
+__global__ __launch_bounds__(256, 2)
+void conv_kernel(const float* __restrict__ X,
+                 const float* __restrict__ Wp,
+                 float* __restrict__ Out,
+                 float* __restrict__ part,
+                 int H, int W, int P, int tilesPerImage)
+{
+    const int tid    = threadIdx.x;
+    const int nTile  = blockIdx.x;
+    const int mBlock = blockIdx.y;
+    const int n      = nTile / tilesPerImage;
+    const int tile   = nTile - n * tilesPerImage;
+    const int pbase  = tile * BN;
+    const int mb     = mBlock * BM;
+
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
+    __shared__ float ssum[16];
+    __shared__ float ssq[16];
+
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    const int aK = tid >> 5;
+    const int aM = (tid & 31) * 4;
+    const int bK = tid >> 5;
+    const int bJ = tid & 31;
+
+    int  ph[4], pw[4];
+    bool pv[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int p = pbase + bJ + 32 * r;
+        pv[r] = (p < P);
+        int pp = pv[r] ? p : 0;
+        ph[r] = pp / W;
+        pw[r] = pp - ph[r] * W;
+    }
+
+    const size_t xbase = (size_t)n * CCH * (size_t)P;
+
+    float acc[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][j] = 0.f;
+
+    float4 aReg;
+    float  bReg[4];
+
+    auto loadA = [&](int k0) {
+        aReg = *(const float4*)(Wp + (size_t)(k0 + aK) * CCH + mb + aM);
+    };
+    auto loadB = [&](int k0) {
+        int k  = k0 + bK;
+        int ic = k / 9;
+        int t  = k - ic * 9;
+        int kh = t / 3;
+        int kw = t - kh * 3;
+        const float* xb = X + xbase + (size_t)ic * (size_t)P;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            int ih = ph[r] + kh - 1;
+            int iw = pw[r] + kw - 1;
+            bool ok = pv[r] && ih >= 0 && ih < H && iw >= 0 && iw < W;
+            bReg[r] = ok ? xb[(size_t)ih * W + iw]
+```python
+# =============================================================================
+# ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
+# GRANULARITY: (D) FULL FORWARD REWRITE.
+#  1) Granularity: (D) fully rewrite forward.
+#  2) Replaced ops: both F.conv2d(3x3,pad1,256->256), both F.group_norm(32),
+#     both F.silu, and the residual add.  No cuDNN / at::conv2d anywhere.
+#  3) Fusion map:
+#     * transpose_w_kernel : packs W(256,2304) -> Wp(2304,256) once per call so
+#       the implicit-GEMM A-tile loads are coalesced (2.36MB, negligible).
+#     * conv_kernel : shared-mem tiled implicit GEMM (BM128 x BN128 x BK8,
+#       8x8 register tile) with im2col addressing generated on the fly (the
+#       im2col matrix is never materialised), FUSED with the GroupNorm
+#       first/second-moment reduction in its epilogue -- moments are produced
+#       while accumulators are still in registers, so GroupNorm never re-reads
+#       the conv output.  Deterministic: each (tile,group) slot is written by
+#       exactly one block; no global atomics.
+#     * stats_kernel : partial moments -> per-(n,c) folded affine (scale,bias)
+#       (mean/var/eps/weight/bias collapsed into one multiply-add), fp64 accum.
+#     * act_kernel : SiLU(affine) in one pass -> input of conv2 (norm+act fused).
+#     * final_kernel : SiLU(affine) + residual add fused, single pass -> output.
+#  4) Left in PyTorch: only torch::empty allocations and shape/dtype checks -
+#     no GPU math remains in ATen.
+# Precision: fp32 storage AND fp32 FMA arithmetic throughout the convolutions
+# (no TF32/half downcast); group statistics accumulate in fp64.
+# =============================================================================
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+
+#define CCH      256
+#define KDIM     2304
+#define NGROUPS  32
+#define CPG      8
+#define BM       128
+#define BN       128
+#define BK       8
+
+__global__ void transpose_w_kernel(const float* __restrict__ in,
+                                   float* __restrict__ out)
+{
+    __shared__ float tile[32][33];
+    const int x = blockIdx.x * 32 + threadIdx.x;   /* k */
+    const int y = blockIdx.y * 32 + threadIdx.y;   /* m */
+#pragma unroll
+    for (int j = 0; j < 32; j += 8)
+        tile[threadIdx.y + j][threadIdx.x] = in[(size_t)(y + j) * KDIM + x];
+    __syncthreads();
+    const int x2 = blockIdx.y * 32 + threadIdx.x;  /* m */
+    const int y2 = blockIdx.x * 32 + threadIdx.y;  /* k */
+#pragma unroll
+    for (int j = 0; j < 32; j += 8)
+        out[(size_t)(y2 + j) * CCH + x2] = tile[threadIdx.x][threadIdx.y + j];
+}
+
+__global__ __launch_bounds__(256, 2)
+void conv_kernel(const float* __restrict__ X,
+                 const float* __restrict__ Wp,
+                 float* __restrict__ Out,
+                 float* __restrict__ part,
+                 int H, int W, int P, int tilesPerImage)
+{
+    const int tid    = threadIdx.x;
+    const int nTile  = blockIdx.x;
+    const int mBlock = blockIdx.y;
+    const int n      = nTile / tilesPerImage;
+    const int tile   = nTile - n * tilesPerImage;
+    const int pbase  = tile * BN;
+    const int mb     = mBlock * BM;
+
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
+    __shared__ float ssum[16];
+    __shared__ float ssq[16];
+
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    const int aK = tid >> 5;
+    const int aM = (tid & 31) * 4;
+    const int bK = tid >> 5;
+    const int bJ = tid & 31;
+
+    int  ph[4], pw[4];
+    bool pv[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int p = pbase + bJ + 32 * r;
+        pv[r] = (p < P);
+        int pp = pv[r] ? p : 0;
+        ph[r] = pp / W;
+        pw[r] = pp - ph[r] * W;
+    }
+
+    const size_t xbase = (size_t)n * CCH * (size_t)P;
+
+    float acc[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][j] = 0.f;
+
+    float4 aReg;
+    float  bReg[4];
+
+    /* ---- prologue: prefetch first k-tile ---- */
+    {
+        aReg = *(const float4*)(Wp + (size_t)(0 + aK) * CCH + mb + aM);
+        int k  = 0 + bK;
+        int ic = k / 9;
+        int t  = k - ic * 9;
+        int kh = t / 3;
+        int kw = t - kh * 3;
+        const float* xb = X + xbase + (size_t)ic * (size_t)P;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            int ih = ph[r] + kh - 1;
+            int iw = pw[r] + kw - 1;
+            bool ok = pv[r] && ih >= 0 && ih < H && iw >= 0 && iw < W;
+            bReg[r] = ok ? xb[(size_t)ih * (size_t)W + iw] : 0.f;
+        }
+    }
+
+    for (int k0 = 0; k0 < KDIM; k0 += BK) {
+        *(float4*)(&As[aK][aM]) = aReg;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) Bs[bK][bJ + 32 * r] = bReg[r];
+        __syncthreads();
+
+        if (k0 + BK < KDIM) {
+            int kn = k0 + BK;
+            aReg = *(const float4*)(Wp + (size_t)(kn + aK) * CCH + mb + aM);
+            int k  = kn + bK;
+            int ic = k / 9;
+            int t  = k - ic * 9;
+            int kh = t / 3;
+            int kw = t - kh * 3;
+            const float* xb = X + xbase + (size_t)ic * (size_t)P;
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                int ih = ph[r] + kh - 1;
+                int iw = pw[r] + kw - 1;
+                bool ok = pv[r] && ih >= 0 && ih < H && iw >= 0 && iw < W;
+                bReg[r] = ok ? xb[(size_t)ih * (size_t)W + iw] : 0.f;
+            }
+        }
+
+#pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            float a[8], b[8];
+            *(float4*)(a)     = *(const float4*)(&As[kk][ty * 4]);
+            *(float4*)(a + 4) = *(const float4*)(&As[kk][64 + ty * 4]);
+            *(float4*)(b)     = *(const float4*)(&Bs[kk][tx * 4]);
+            *(float4*)(b + 4) = *(const float4*)(&Bs[kk][64 + tx * 4]);
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    /* ---------------- epilogue: store + fused GroupNorm moments ---------- */
+    if (tid < 16) { ssum[tid] = 0.f; ssq[tid] = 0.f; }
+    __syncthreads();
+
+    const bool vecOK = ((P & 3) == 0);
+    float s0 = 0.f, q0 = 0.f, s1 = 0.f, q1 = 0.f;
+
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int rl = (i < 4) ? (ty * 4 + i) : (64 + ty * 4 + (i - 4));
+        int ch = mb + rl;
+        float* orow = Out + xbase + (size_t)ch * (size_t)P;
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+            int cbase = (jj == 0) ? (tx * 4) : (64 + tx * 4);
+            int p = pbase + cbase;
+            float v0 = acc[i][jj * 4 + 0];
+            float v1 = acc[i][jj * 4 + 1];
+            float v2 = acc[i][jj * 4 + 2];
+            float v3 = acc[i][jj * 4 + 3];
+            if (vecOK && (p + 3) < P) {
+                float4 vv = make_float4(v0, v1, v2, v3);
+                *(float4*)(orow + p) = vv;
+                float s = v0 + v1 + v2 + v3;
+                float q = v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+                if (i < 4) { s0 += s; q0 += q; } else { s1 += s; q1 += q; }
+            } else {
+                float vs[4] = {v0, v1, v2, v3};
+#pragma unroll
+                for (int t2 = 0; t2 < 4; ++t2) {
+                    int pp = p + t2;
+                    if (pp < P) {
+                        float v = vs[t2];
+                        orow[pp] = v;
+                        if (i < 4) { s0 += v; q0 += v * v; }
+                        else       { s1 += v; q1 += v * v; }
+                    }
+                }
+            }
+        }
+    }
+
+    atomicAdd(&ssum[ty >> 1], s0);
+    atomicAdd(&ssq[ty >> 1],  q0);
+    atomicAdd(&ssum[8 + (ty >> 1)], s1);
+    atomicAdd(&ssq[8 + (ty >> 1)],  q1);
+    __syncthreads();
+
+    if (tid < 16) {
+        int g = mBlock * 16 + tid;
+        size_t off = ((size_t)nTile * NGROUPS + g) * 2;
+        part[off]     = ssum[tid];
+        part[off + 1] = ssq[tid];
+    }
+}
+
+__global__ void stats_kernel(const float* __restrict__ part,
+                             const float* __restrict__ gw,
+                             const float* __restrict__ gb,
+                             float* __restrict__ scale,
+                             float* __restrict__ bias,
+                             int nTiles, long cnt, float eps)
+{
+    const int blk = blockIdx.x;
+    const int n   = blk / NGROUPS;
+    const int g   = blk - n * NGROUPS;
+
+    __shared__ double sh_s[256];
+    __shared__ double sh_q[256];
+
+    double s = 0.0, q = 0.0;
+    for (int t = threadIdx.x; t < nTiles; t += blockDim.x) {
+        size_t off = ((size_t)(n * nTiles + t) * NGROUPS + g) * 2;
+        s += (double)part[off];
+        q += (double)part[off + 1];
+    }
+    sh_s[threadIdx.x] = s;
+    sh_q[threadIdx.x] = q;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) {
+            sh_s[threadIdx.x] += sh_s[threadIdx.x + stride];
+            sh_q[threadIdx.x] += sh_q[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if ((int)threadIdx.x < CPG) {
+        double mean = sh_s[0] / (double)cnt;
+        double var  = sh_q[0] / (double)cnt - mean * mean;
+        if (var < 0.0) var = 0.0;
+        float rstd = (float)(1.0 / sqrt(var + (double)eps));
+        int c = g * CPG + (int)threadIdx.x;
+        float w = gw[c], b = gb[c];
+        scale[n * CCH + c] = w * rstd;
+        bias[n * CCH + c]  = b - (float)mean * w * rstd;
+    }
+}
+
+__global__ void act_kernel(const float* __restrict__ r,
+                           const float* __restrict__ scale,
+                           const float* __restrict__ bias,
+                           float* __restrict__ o, int P)
+{
+    const int row = blockIdx.x;
+    const float s = scale[row];
+    const float b = bias[row];
+    const float* rp = r + (size_t)row * (size_t)P;
+    float* op = o + (size_t)row * (size_t)P;
+    for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < P;
+         i += blockDim.x * gridDim.y) {
+        float y = fmaf(rp[i], s, b);
+        op[i] = y / (1.f + __expf(-y));
+    }
+}
+
+__global__ void final_kernel(const float* __restrict__ r,
+                             const float* __restrict__ scale,
+                             const float* __restrict__ bias,
+                             const float* __restrict__ xres,
+                             float* __restrict__ o, int P)
+{
+    const int row = blockIdx.x;
+    const float s = scale[row];
+    const float b = bias[row];
+    const float* rp = r + (size_t)row * (size_t)P;
+    const float* xp = xres + (size_t)row * (size_t)P;
+    float* op = o + (size_t)row * (size_t)P;
+    for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < P;
+         i += blockDim.x * gridDim.y) {
+        float y = fmaf(rp[i], s, b);
+        op[i] = y / (1.f + __expf(-y)) + xp[i];
+    }
+}
+
+/* ------------------------------------------------------------------ host */
+static void pack_weights(const torch::Tensor& w, torch::Tensor& wp,
+                         cudaStream_t stream)
+{
+    dim3 grid(KDIM / 32, CCH / 32);
+    dim3 blk(32, 8);
+    transpose_w_kernel<<<grid, blk, 0, stream>>>(w.data_ptr<float>(),
+                                                 wp.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+static void run_conv(const torch::Tensor& in, const torch::Tensor& wp,
+                     torch::Tensor& out, torch::Tensor& part,
+                     int B, int H, int W, int P, int tiles,
+                     cudaStream_t stream)
+{
+    dim3 grid(B * tiles, CCH / BM);
+    conv_kernel<<<grid, 256, 0, stream>>>(in.data_ptr<float>(),
+                                          wp.data_ptr<float>(),
+                                          out.data_ptr<float>(),
+                                          part.data_ptr<float>(),
+                                          H, W, P, tiles);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fused_resblock(torch::Tensor x,
+                             torch::Tensor w1, torch::Tensor g1w, torch::Tensor g1b,
+                             torch::Tensor w2, torch::Tensor g2w, torch::Tensor g2b,
+                             double eps)
+{
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "fp32 only");
+    TORCH_CHECK(x.dim() == 4, "x must be NCHW");
+
+    auto xc  = x.is_contiguous()  ? x  : x.contiguous();
+    auto w1c = w1.is_contiguous() ? w1 : w1.contiguous();
+    auto w2c = w2.is_contiguous() ? w2 : w2.contiguous();
+    auto g1wc = g1w.is_contiguous() ? g1w : g1w.contiguous();
+    auto g1bc = g1b.is_contiguous() ? g1b : g1b.contiguous();
+    auto g2wc = g2w.is_contiguous() ? g2w : g2w.contiguous();
+    auto g2bc = g2b.is_contiguous() ? g2b : g2b.contiguous();
+
+    const int B = (int)xc.size(0);
+    const int C = (int)xc.size(1);
+    const int H = (int)xc.size(2);
+    const int W = (int)xc.size(3);
+    TORCH_CHECK(C == CCH, "this kernel is specialised for C=256");
+    TORCH_CHECK(w1c.numel() == (long)CCH * KDIM && w2c.numel() == (long)CCH * KDIM,
+                "weights must be (256,256,3,3)");
+
+    const int P     = H * W;
+    const int tiles = (P + BN - 1) / BN;
+    auto opts = xc.options();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto wp1  = torch::empty({KDIM, CCH}, opts);
+    auto wp2  = torch::empty({KDIM, CCH}, opts);
+    pack_weights(w1c, wp1, stream);
+    pack_weights(w2c, wp2, stream);
+
+    auto r1 = torch::empty({B, CCH, H, W}, opts);
+    auto p1 = torch::empty({(long)B * tiles, NGROUPS, 2}, opts);
+    run_conv(xc, wp1, r1, p1, B, H, W, P, tiles, stream);
+
+    auto sc1 = torch::empty({B, CCH}, opts);
+    auto bi1 = torch::empty({B, CCH}, opts);
+    stats_kernel<<<B * NGROUPS, 256, 0, stream>>>(
+        p1.data_ptr<float>(), g1wc.data_ptr<float>(), g1bc.data_ptr<float>(),
+        sc1.data_ptr<float>(), bi1.data_ptr<float>(),
+        tiles, (long)CPG * (long)P, (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    int gy = (P + 255) / 256;
+    if (gy > 32) gy = 32;
+    if (gy < 1) gy = 1;
+
+    auto a1 = torch::empty({B, CCH, H, W}, opts);
+    {
+        dim3 grid(B * CCH, gy);
+        act_kernel<<<grid, 256, 0, stream>>>(r1.data_ptr<float>(),
+                                             sc1.data_ptr<float>(),
+                                             bi1.data_ptr<float>(),
+                                             a1.data_ptr<float>(), P);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    auto r2 = torch::empty({B, CCH, H, W}, opts);
+    auto p2 = torch::empty({(long)B * tiles, NGROUPS, 2}, opts);
+    run_conv(a1, wp2, r2, p2, B, H, W, P, tiles, stream);
+
+    auto sc2 = torch::empty({B, CCH}, opts);
+    auto bi2 = torch::empty({B, CCH}, opts);
+    stats_kernel<<<B * NGROUPS, 256, 0, stream>>>(
+        p2.data_ptr<float>(), g2wc.data_ptr<float>(), g2bc.data_ptr<float>(),
+        sc2.data_ptr<float>(), bi2.data_ptr<float>(),
+        tiles, (long)CPG * (long)P, (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    auto out = torch::empty({B, CCH, H, W}, opts);
+    {
+        dim3 grid(B * CCH, gy);
+        final_kernel<<<grid, 256, 0, stream>>>(r2.data_ptr<float>(),
+                                               sc2.data_ptr<float>(),
+                                               bi2.data_ptr<float>(),
+                                               xc.data_ptr<float>(),
+                                               out.data_ptr<float>(), P);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return out;
+}
+"""
+
+_CPP_SRC = r"""
+torch::Tensor fused_resblock(torch::Tensor x,
+                             torch::Tensor w1, torch::Tensor g1w, torch::Tensor g1b,
+                             torch::Tensor w2, torch::Tensor g2w, torch::Tensor g2b,
+                             double eps);
+"""
+
+_ext = load_inline(
+    name="vae_resblock_fused_d",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["fused_resblock"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+    ],
+)
+
+
+class ModelNew(nn.Module):
+    """Stateless fused residual block (see header for granularity notes)."""
+
+    def __init__(self):
+        super().__init__()
+        self._ext = _ext
+
+    @torch.no_grad()
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        e = float(eps.item()) if torch.is_tensor(eps) else float(eps)
+        return self._ext.fused_resblock(x, conv1_weight, norm1_weight, norm1_bias,
+                                        conv2_weight, norm2_weight, norm2_bias, e)
+```

@@ -1,0 +1,430 @@
+```python
+# ==========================================================================
+# ModelNew: fused VAE residual block
+#   Conv3x3 -> GroupNorm -> SiLU -> Conv3x3 -> GroupNorm -> SiLU -> +residual
+#
+# HEADER / PLANNING NOTES
+# 1) GRANULARITY: (D) fully rewrite forward.  The vendor implicit-GEMM
+#    convolution (sm80_xmma_fprop_implicit_gemm..., 72% of reference time) is
+#    OWNED here: it is replaced by a hand-written shared-memory tiled
+#    implicit-GEMM conv3x3 kernel (plain FP32 FMA, fp32 accumulate).  No
+#    cuDNN / at::conv2d / at::cudnn_convolution is called anywhere.
+# 2) OPS REPLACED: F.conv2d (x2), F.group_norm (x2), F.silu (x2), residual add,
+#    plus the NCHW<->NHWC layout conversion kernels the vendor path needed
+#    (they simply disappear - we work natively in NCHW).
+# 3) FUSION MAP:
+#    - conv3x3_kernel<APPLY_NORM=false> : conv1, and in its EPILOGUE it
+#      accumulates the GroupNorm(1) per-(n,group) sum / sum-of-squares
+#      partials directly from registers (no extra read of the conv output).
+#    - gn_reduce_kernel : tiny reduction over spatial tiles -> per-(n,channel)
+#      affine (scale,bias) folding gamma/beta/mean/rstd into one mul+add.
+#    - conv3x3_kernel<APPLY_NORM=true>  : conv2, whose PROLOGUE applies
+#      GroupNorm(1)+SiLU to every element while it is staged into shared
+#      memory (the normalized+activated tensor is NEVER materialized in
+#      global memory), and whose EPILOGUE again produces GroupNorm(2)
+#      partials from registers.
+#    - gn_reduce_kernel (2nd call, reuses the partial workspace).
+#    - final_epilogue_kernel : GroupNorm(2) affine + SiLU + residual add in a
+#      single bandwidth-bound pass (vectorized float4 path when H*W%4==0).
+#    Net effect vs reference: two full GroupNorm read passes, two SiLU
+#    read/write passes, one residual pass and four layout conversions are
+#    deleted; only one unavoidable intermediate (conv1 out, conv2 out) is
+#    written.
+# 4) LEFT IN PYTORCH: nothing on the compute path.  Only tensor allocation
+#    (torch::empty_like) and contiguity checks remain, because they are not
+#    compute and must match reference layout/semantics.
+# 5) PRECISION: everything stays float32; all accumulation (conv MACs and
+#    GroupNorm moments) is float32 or wider.  No half/bf16/tf32 downcast of
+#    storage; arithmetic is plain FP32 FMA, i.e. at least as accurate as the
+#    TF32 reference.
+# ==========================================================================
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+
+#define TW      32          // output tile width  (== warp lane dim)
+#define TH      8           // output rows per thread
+#define OCT     64          // output channels per block
+#define CCH     8           // input-channel chunk staged in shared mem
+#define SXR     (TH + 2)    // 10
+#define SXC     (TW + 2)    // 34
+#define NTHREADS 256
+#define NGROUPS 32
+#define GSZ     8           // channels per group (C=256 / 32)
+
+// ---------------------------------------------------------------------------
+// Tiled implicit-GEMM conv3x3 (stride 1, pad 1), NCHW, fp32 accumulate.
+// APPLY_NORM: fuse (x*scale[n,c] + bias[n,c]) -> SiLU into the load prologue.
+// Epilogue emits per-(n,group) partial moments for the following GroupNorm.
+// ---------------------------------------------------------------------------
+template <bool APPLY_NORM>
+__global__ __launch_bounds__(NTHREADS, 2)
+void conv3x3_kernel(const float* __restrict__ inp,
+                    const float* __restrict__ wgt,
+                    const float* __restrict__ pre_scale,
+                    const float* __restrict__ pre_bias,
+                    float* __restrict__ out,
+                    float* __restrict__ partial,   // [B][32][nTiles][2]
+                    int B, int C, int H, int W,
+                    int tilesH, int tilesW, int nTiles)
+{
+    const int tx = threadIdx.x & 31;
+    const int ty = threadIdx.x >> 5;
+
+    const int tile = blockIdx.x;
+    const int th   = tile / tilesW;
+    const int tw   = tile - th * tilesW;
+    const int ocb  = blockIdx.y * OCT;
+    const int n    = blockIdx.z;
+
+    const int h0 = th * TH;
+    const int w0 = tw * TW;
+
+    __shared__ float sX[CCH * SXR * SXC];
+    __shared__ float sW[OCT * CCH * 9];
+    __shared__ float sSc[256];
+    __shared__ float sBi[256];
+
+    if (APPLY_NORM) {
+        for (int i = threadIdx.x; i < C; i += NTHREADS) {
+            sSc[i] = pre_scale[(long)n * C + i];
+            sBi[i] = pre_bias [(long)n * C + i];
+        }
+        __syncthreads();
+    }
+
+    float acc[TH][8];
+#pragma unroll
+    for (int r = 0; r < TH; ++r)
+#pragma unroll
+        for (int o = 0; o < 8; ++o) acc[r][o] = 0.0f;
+
+    const int NX = CCH * SXR * SXC;
+    const int NW = OCT * CCH * 9;
+
+    for (int c0 = 0; c0 < C; c0 += CCH) {
+        __syncthreads();
+
+        // ---- stage weights: sW[o][cc][k] ----
+        for (int idx = threadIdx.x; idx < NW; idx += NTHREADS) {
+            int o   = idx / (CCH * 9);
+            int rem = idx - o * (CCH * 9);
+            sW[idx] = wgt[(long)(ocb + o) * C * 9 + (long)c0 * 9 + rem];
+        }
+
+        // ---- stage input halo tile (fused norm+SiLU prologue) ----
+        for (int idx = threadIdx.x; idx < NX; idx += NTHREADS) {
+            int col = idx % SXC;
+            int t   = idx / SXC;
+            int r   = t % SXR;
+            int cc  = t / SXR;
+            int h   = h0 + r - 1;
+            int w   = w0 + col - 1;
+            float v = 0.0f;
+            if (h >= 0 && h < H && w >= 0 && w < W) {
+                v = inp[(((long)n * C + (c0 + cc)) * H + h) * (long)W + w];
+                if (APPLY_NORM) {
+                    float z = v * sSc[c0 + cc] + sBi[c0 + cc];
+                    v = z / (1.0f + __expf(-z) * 1.0f);
+                    v = z / (1.0f + expf(-z));
+                }
+            }
+            sX[idx] = v;
+        }
+        __syncthreads();
+
+        // ---- compute ----
+#pragma unroll 1
+        for (int cc = 0; cc < CCH; ++cc) {
+            const float* sxc = sX + cc * (SXR * SXC);
+            const float* swc = sW + (ty * 8) * (CCH * 9) + cc * 9;
+#pragma unroll
+            for (int kh = 0; kh < 3; ++kh) {
+#pragma unroll
+                for (int kw = 0; kw < 3; ++kw) {
+                    float wv[8];
+#pragma unroll
+                    for (int o = 0; o < 8; ++o)
+                        wv[o] = swc[o * (CCH * 9) + kh * 3 + kw];
+#pragma unroll
+                    for (int r = 0; r < TH; ++r) {
+                        float xv = sxc[(r + kh) * SXC + (tx + kw)];
+#pragma unroll
+                        for (int o = 0; o < 8; ++o)
+                            acc[r][o] = fmaf(wv[o], xv, acc[r][o]);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- epilogue: store + GroupNorm partial moments ----
+    const int w = w0 + tx;
+    const bool wok = (w < W);
+    float gs = 0.0f, gs2 = 0.0f;
+
+#pragma unroll
+    for (int r = 0; r < TH; ++r) {
+        int h = h0 + r;
+        bool ok = wok && (h < H);
+#pragma unroll
+        for (int o = 0; o < 8; ++o) {
+            float v = acc[r][o];
+            if (ok) {
+                out[(((long)n * C + (ocb + ty * 8 + o)) * H + h) * (long)W + w] = v;
+                gs  += v;
+                gs2 = fmaf(v, v, gs2);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        gs  += __shfl_down_sync(0xffffffffu, gs, off);
+        gs2 += __shfl_down_sync(0xffffffffu, gs2, off);
+    }
+    if (tx == 0) {
+        int g = (ocb >> 3) + ty;              // group index (group size 8)
+        long base = (((long)n * NGROUPS + g) * nTiles + tile) * 2;
+        partial[base + 0] = gs;
+        partial[base + 1] = gs2;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reduce per-(n,group) partials -> folded per-(n,channel) affine params.
+// ---------------------------------------------------------------------------
+__global__ void gn_reduce_kernel(const float* __restrict__ partial,
+                                 const float* __restrict__ gamma,
+                                 const float* __restrict__ beta,
+                                 float* __restrict__ scale,
+                                 float* __restrict__ bias,
+                                 int nTiles, float cnt, float eps, int C)
+{
+    const int idx = blockIdx.x;          // n*32 + g
+    const int n = idx / NGROUPS;
+    const int g = idx - n * NGROUPS;
+
+    float s = 0.0f, s2 = 0.0f;
+    for (int i = threadIdx.x; i < nTiles; i += blockDim.x) {
+        long b = ((long)idx * nTiles + i) * 2;
+        s  += partial[b + 0];
+        s2 += partial[b + 1];
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s  += __shfl_down_sync(0xffffffffu, s, off);
+        s2 += __shfl_down_sync(0xffffffffu, s2, off);
+    }
+    __shared__ float ws[8], ws2[8];
+    __shared__ float m_sh, r_sh;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) { ws[warp] = s; ws2[warp] = s2; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float ts = 0.0f, ts2 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { ts += ws[i]; ts2 += ws2[i]; }
+        float mean = ts / cnt;
+        float var  = ts2 / cnt - mean * mean;
+        if (var < 0.0f) var = 0.0f;
+        m_sh = mean;
+        r_sh = 1.0f / sqrtf(var + eps);
+    }
+    __syncthreads();
+    if (threadIdx.x < GSZ) {
+        int c = g * GSZ + threadIdx.x;
+        float gm = gamma[c];
+        float sc = gm * r_sh;
+        scale[(long)n * C + c] = sc;
+        bias [(long)n * C + c] = beta[c] - m_sh * sc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Final: out = SiLU(y*scale + bias) + residual
+// ---------------------------------------------------------------------------
+__global__ void final_kernel(const float* __restrict__ y,
+                             const float* __restrict__ res,
+                             const float* __restrict__ scale,
+                             const float* __restrict__ bias,
+                             float* __restrict__ out,
+                             long N, long HW)
+{
+    long stride = (long)gridDim.x * blockDim.x;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < N; i += stride) {
+        long sc = i / HW;                    // == n*C + c
+        float z = y[i] * scale[sc] + bias[sc];
+        out[i] = z / (1.0f + expf(-z)) + res[i];
+    }
+}
+
+__global__ void final_kernel_v4(const float4* __restrict__ y,
+                                const float4* __restrict__ res,
+                                const float* __restrict__ scale,
+                                const float* __restrict__ bias,
+                                float4* __restrict__ out,
+                                long N4, long HW4)
+{
+    long stride = (long)gridDim.x * blockDim.x;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < N4; i += stride) {
+        long sc = i / HW4;
+        float s = scale[sc], b = bias[sc];
+        float4 yv = y[i];
+        float4 rv = res[i];
+        float4 o;
+        float z;
+        z = yv.x * s + b; o.x = z / (1.0f + expf(-z)) + rv.x;
+        z = yv.y * s + b; o.y = z / (1.0f + expf(-z)) + rv.y;
+        z = yv.z * s + b; o.z = z / (1.0f + expf(-z)) + rv.z;
+        z = yv.w * s + b; o.w = z / (1.0f + expf(-z)) + rv.w;
+        out[i] = o;
+    }
+}
+
+// ---------------------------------------------------------------------------
+torch::Tensor fused_resblock(torch::Tensor x,
+                             torch::Tensor w1, torch::Tensor g1, torch::Tensor b1,
+                             torch::Tensor w2, torch::Tensor g2, torch::Tensor b2,
+                             double eps)
+{
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat32, "x must be cuda float32");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D");
+    auto xc  = x.is_contiguous()  ? x  : x.contiguous();
+    auto w1c = w1.is_contiguous() ? w1 : w1.contiguous();
+    auto w2c = w2.is_contiguous() ? w2 : w2.contiguous();
+    auto g1c = g1.is_contiguous() ? g1 : g1.contiguous();
+    auto b1c = b1.is_contiguous() ? b1 : b1.contiguous();
+    auto g2c = g2.is_contiguous() ? g2 : g2.contiguous();
+    auto b2c = b2.is_contiguous() ? b2 : b2.contiguous();
+
+    const int B = xc.size(0), C = xc.size(1), H = xc.size(2), W = xc.size(3);
+    TORCH_CHECK(C == 256, "this kernel is specialized for C=256 (32 groups of 8)");
+    TORCH_CHECK(w1c.size(0) == C && w1c.size(2) == 3 && w1c.size(3) == 3, "conv1 shape");
+    TORCH_CHECK(w2c.size(0) == C && w2c.size(2) == 3 && w2c.size(3) == 3, "conv2 shape");
+
+    const int tilesH = (H + TH - 1) / TH;
+    const int tilesW = (W + TW - 1) / TW;
+    const int nTiles = tilesH * tilesW;
+
+    auto opts = xc.options();
+    auto y1  = torch::empty_like(xc);
+    auto y2  = torch::empty_like(xc);
+    auto out = torch::empty_like(xc);
+    auto partial = torch::empty({(long)B, (long)NGROUPS, (long)nTiles, 2}, opts);
+    auto scale1 = torch::empty({(long)B, (long)C}, opts);
+    auto bias1  = torch::empty({(long)B, (long)C}, opts);
+    auto scale2 = torch::empty({(long)B, (long)C}, opts);
+    auto bias2  = torch::empty({(long)B, (long)C}, opts);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dim3 grid(nTiles, C / OCT, B);
+    dim3 blk(NTHREADS);
+
+    conv3x3_kernel<false><<<grid, blk, 0, stream>>>(
+        xc.data_ptr<float>(), w1c.data_ptr<float>(), nullptr, nullptr,
+        y1.data_ptr<float>(), partial.data_ptr<float>(),
+        B, C, H, W, tilesH, tilesW, nTiles);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    float cnt = (float)((long)GSZ * H * W);
+    gn_reduce_kernel<<<B * NGROUPS, 256, 0, stream>>>(
+        partial.data_ptr<float>(), g1c.data_ptr<float>(), b1c.data_ptr<float>(),
+        scale1.data_ptr<float>(), bias1.data_ptr<float>(),
+        nTiles, cnt, (float)eps, C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    conv3x3_kernel<true><<<grid, blk, 0, stream>>>(
+        y1.data_ptr<float>(), w2c.data_ptr<float>(),
+        scale1.data_ptr<float>(), bias1.data_ptr<float>(),
+        y2.data_ptr<float>(), partial.data_ptr<float>(),
+        B, C, H, W, tilesH, tilesW, nTiles);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    gn_reduce_kernel<<<B * NGROUPS, 256, 0, stream>>>(
+        partial.data_ptr<float>(), g2c.data_ptr<float>(), b2c.data_ptr<float>(),
+        scale2.data_ptr<float>(), bias2.data_ptr<float>(),
+        nTiles, cnt, (float)eps, C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const long HW = (long)H * W;
+    const long N  = (long)B * C * HW;
+    if ((HW & 3L) == 0L) {
+        long N4 = N / 4;
+        int threads = 256;
+        int blocks = (int)std::min<long>((N4 + threads - 1) / threads, 65535L);
+        if (blocks < 1) blocks = 1;
+        final_kernel_v4<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const float4*>(y2.data_ptr<float>()),
+            reinterpret_cast<const float4*>(xc.data_ptr<float>()),
+            scale2.data_ptr<float>(), bias2.data_ptr<float>(),
+            reinterpret_cast<float4*>(out.data_ptr<float>()),
+            N4, HW / 4);
+    } else {
+        int threads = 256;
+        int blocks = (int)std::min<long>((N + threads - 1) / threads, 65535L);
+        if (blocks < 1) blocks = 1;
+        final_kernel<<<blocks, threads, 0, stream>>>(
+            y2.data_ptr<float>(), xc.data_ptr<float>(),
+            scale2.data_ptr<float>(), bias2.data_ptr<float>(),
+            out.data_ptr<float>(), N, HW);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+"""
+
+_CPP_SRC = r"""
+torch::Tensor fused_resblock(torch::Tensor x,
+                             torch::Tensor w1, torch::Tensor g1, torch::Tensor b1,
+                             torch::Tensor w2, torch::Tensor g2, torch::Tensor b2,
+                             double eps);
+"""
+
+_ext = load_inline(
+    name="vae_resblock_fused_d",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["fused_resblock"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+    ],
+)
+
+
+class ModelNew(nn.Module):
+    """See file header for the (D) granularity plan / fusion map."""
+
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+
+    def forward(self,
+                x,
+                conv1_weight,
+                norm1_weight,
+                norm1_bias,
+                conv2_weight,
+                norm2_weight,
+                norm2_bias,
+                eps):
+        e = eps.item() if torch.is_tensor(eps) else float(eps)
+        return self.ext.fused_resblock(x,
+                                       conv1_weight, norm1_weight, norm1_bias,
+                                       conv2_weight, norm2_weight, norm2_bias,
+                                       e)
+```

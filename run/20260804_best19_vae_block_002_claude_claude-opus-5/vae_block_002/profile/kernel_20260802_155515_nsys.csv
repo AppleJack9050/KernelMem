@@ -1,0 +1,6 @@
+Kernel Name,kernel_launch_count
+nchw2nhwc_kernel,6
+gn_silu_res_t,6
+gn_stats_kernel,12
+gn_silu_apply,6
+gn_final_kernel,12

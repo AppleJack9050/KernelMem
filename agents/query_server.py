@@ -43,14 +43,35 @@ def retry_with_backoff(
     max_delay: float = 300.0,  # 5 minutes
     backoff_factor: float = 2.0,
     retryable_exceptions: tuple = (CLIConnectionError, CLIJSONDecodeError),
+    retry_if: Optional[Callable[[BaseException], bool]] = None,
+    retry_if_max_retries: int = 1,
 ) -> Any:
+    """Call *func*, retrying the failures that are worth retrying.
+
+    *retry_if* extends the retryable set to exceptions that cannot be named by
+    class -- see ``_is_transient_cli_result_error``. It gets its own, much
+    smaller budget (*retry_if_max_retries*) because those failures surface only
+    after the model has already generated a full reply: one seed draw that hit
+    this took 29 minutes to fail, so spending the full *max_retries* on it would
+    burn hours on what may well be a deterministic failure.
+    """
     delay = initial_delay
     attempt = 0
+    predicate_attempts = 0
 
     while True:
         try:
             return func()
-        except retryable_exceptions as e:
+        except Exception as e:
+            _by_predicate = bool(retry_if and retry_if(e))
+            if not (isinstance(e, retryable_exceptions) or _by_predicate):
+                raise
+            if _by_predicate:
+                predicate_attempts += 1
+                if predicate_attempts > retry_if_max_retries:
+                    print(f"❌ Not retrying again after {predicate_attempts - 1} retry/retries: "
+                          f"{type(e).__name__}: {str(e)[:200]}")
+                    raise
             attempt += 1
             if max_retries is not None and attempt > max_retries:
                 print(f"❌ Failed after {max_retries} attempts. Last error: {type(e).__name__}: {e}")
@@ -63,6 +84,22 @@ def retry_with_backoff(
                 print(f"⚠️  {error_name} occurred (attempt {attempt}, unlimited retries). Retrying in {delay:.1f}s...")
             time.sleep(delay)
             delay = min(delay * backoff_factor, max_delay)
+
+
+def _is_transient_cli_result_error(exc: BaseException) -> bool:
+    """True for 'the CLI reported an error result and exited non-zero'.
+
+    The SDK surfaces this as a BARE ``Exception`` from ``Query.receive_messages``
+    -- it is the CLI's own error text, re-raised in place of the uninformative
+    ProcessError -- so no CLI*Error class covers it and it used to propagate
+    straight out of the run. Seen on 2026-08-04: a seed draw failed this way
+    after 29 minutes with the text "...error result: success", killing a run at
+    round 0 where no checkpoint existed yet.
+
+    Matched on message text because the class carries no other signal. Kept
+    narrow deliberately: a wrong match here would silently retry a real bug.
+    """
+    return isinstance(exc, Exception) and "returned an error result" in str(exc)
 
 
 def colorize_finish_reason(reason: Optional[str]) -> str:
@@ -178,6 +215,7 @@ def query_server(
     texts, result = retry_with_backoff(
         lambda: asyncio.run(_run_query(prompt_text, options)),
         max_retries=3,
+        retry_if=_is_transient_cli_result_error,
     )
 
     if result is not None and result.is_error:
