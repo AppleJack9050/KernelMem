@@ -121,8 +121,20 @@ OUTPUT FORMAT (JSON ONLY; no extra prose):
   "modification_plan": "<max 750 words; numbered checklist; then method steps; If any rewrite is applicable, modification_plan items 1–2 MUST include the exact code actions to implement it (e.g., “move tanh after pooling; remove 4× tanh calls per output”, “precompute a,b for BN per-channel and use FMA in inner loop”, “replace 4 scalar loads of a 2×2 window with two float2 row loads”).>",
   "evidence": "<>=1 numeric metrics + 1 root-cause line + brief refutation of one alternative bottleneck>",
   "expected_metric_change": "<>=2 metric directions + anti-regression constraint>",
-  "headroom": "high|medium|low"
+  "headroom": "high|medium|low",
+  "structural_rewrite": true|false
 }
+
+STRUCTURAL_REWRITE (default false; set it deliberately):
+  true ONLY when the plan replaces the kernel's core structure -- a different MMA
+  primitive or tile geometry, a different memory pipeline (adding cp.async/TMA
+  multi-stage), a different algorithm -- so that the FIRST version is expected to
+  be SLOWER than the current base until it is tuned. Declaring it lets the
+  rewrite become the base despite being slower, for a few rounds, so it can be
+  improved instead of discarded on round one. The debt is called in: if it has
+  not beaten the kernel it displaced by the end of that window, the old base is
+  restored and those rounds are lost. Do NOT set it for tuning, fusion or
+  parameter changes -- those should win immediately and get no grace.
 
 VALIDITY RULES:
   - primary_optimisation_method/method_name must NOT target removable/trivial kernels.
@@ -389,10 +401,18 @@ OUTPUT FORMAT (JSON ONLY; no extra prose):
   "modification plan": "<max 600 words>",
   "evidence": "<must include >=1 numeric metrics + >=1 section-analysis statement + 1 ruled-out bottleneck>",
   "expected_metric_change": "<>=2 metric directions + anti-regression constraint>",
-  "headroom": "high|medium|low"
+  "headroom": "high|medium|low",
+  "structural_rewrite": true|false
 }
 
-CRITICAL: 
+STRUCTURAL_REWRITE: true ONLY when the plan replaces the kernel's core structure
+(different MMA primitive or tile geometry, different memory pipeline, different
+algorithm) so the first version is expected to be SLOWER until tuned. It buys a
+few rounds as the base despite being slower; if it has not beaten the kernel it
+displaced by the end of that window, the old base is restored. Do NOT set it for
+tuning, fusion or parameter changes -- those should win immediately.
+
+CRITICAL:
 - The "method_name" field MUST exactly match one of the method IDs listed in the allowed_methods section of MACHINE_CHECK RESULT. You CANNOT choose a method that is not in that list.
 
 Rules:

@@ -1,0 +1,4 @@
+timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens
+2026-08-04 14:22:17,0,seed,67649,121150,188799
+2026-08-04 14:45:32,0,seed,94144,105605,199749
+2026-08-04 15:37:43,0,seed,99652,104893,204545

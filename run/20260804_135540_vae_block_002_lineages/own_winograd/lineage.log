@@ -1,0 +1,90 @@
+[BATCH] Output folder: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5
+[vae_block_002.py] Round 0
+[Seed] Generating the initial kernel ...
+[ref_profile] Profiling reference model to inform granularity choice ...
+[gpu_lock] own_winograd(D/winograd_f2x3): waiting for the GPU to free up (ref_profile) ...
+[gpu_lock] own_winograd(D/winograd_f2x3): acquired after 7.0s (ref_profile)
+[ref_profile] REFERENCE PROFILE (measured on this GPU, not estimated)
+[ref_profile] The unmodified reference takes 1478.9 us of GPU time per forward.
+[ref_profile] Where that time actually goes:
+[Seed] Drawing candidate 1/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=67649, Out=121150, Total=188799
+[92mFinish reason: end_turn[0m
+[gpu_lock] own_winograd(D/winograd_f2x3): waiting for the GPU to free up (bench) ...
+[gpu_lock] own_winograd(D/winograd_f2x3): acquired after 2.5s (bench)
+[seed] score=0.2060 (geomean over 4 shapes: 8x256x64x128=0.1840x  2x256x64x64=0.2043x  4x256x256x256=0.1827x  1x256x131x131=0.2624x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json
+[Seed] Drawing candidate 2/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=94144, Out=105605, Total=199749
+[92mFinish reason: end_turn[0m
+[extract] recovered kernel across a mid-stream continuation fence (178 -> 520 lines)
+[gpu_lock] own_winograd(D/winograd_f2x3): waiting for the GPU to free up (bench) ...
+[gpu_lock] own_winograd(D/winograd_f2x3): acquired after 62.5s (bench)
+[seed] score=0.2527 (geomean over 4 shapes: 8x256x64x128=0.2505x  2x256x64x64=0.2549x  4x256x256x256=0.2103x  1x256x131x131=0.3035x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json
+[Seed] Drawing candidate 3/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+⚠️  Exception occurred (attempt 1/3). Retrying in 1.0s...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=99652, Out=104893, Total=204545
+[92mFinish reason: end_turn[0m
+[extract] recovered kernel across a mid-stream continuation fence (221 -> 388 lines)
+[seed] score=0.2461 (geomean over 4 shapes: 8x256x64x128=0.2431x  2x256x64x64=0.2360x  4x256x256x256=0.2258x  1x256x131x131=0.2833x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0002.json
+[Seed] candidate 1/3: 0.2060
+[Seed] candidate 2/3: 0.2527  <-- selected
+[Seed] candidate 3/3: 0.2461
+[base] Setting initial base_kernel: 0.2527
+[best] Updating best_kernel: 0.2527 vs -inf [stored-score (no paired verdict available)]
+[vae_block_002.py] Round 1
+Optimizing start
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['wtrans_kernel', '__launch_bounds__', 'gnstats_kernel', 'gnsilu_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_102.py (parent_kernel: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_144533.py)
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_102.py
+[ncu] Multiple kernels detected (4), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/4: wtrans_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_102_kernel0_metrics.csv --kernel-name=::regex:\bwtrans_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_102.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_102.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully
+[ncu] [metrics] Completed for kernel 1/4: wtrans_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_102_kernel0_section.csv --kernel-name=::regex:\bwtrans_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_102.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_102.py --repeat 100
+[ncu] [section[kernel0]] completed successfully
+[ncu] [section] Completed for kernel 1/4: wtrans_kernel
+[ncu] Profiling kernel 2/4: __launch_bounds__
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_102_kernel1_metrics.csv --kernel-name=::regex:\b__launch_bounds__\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_102.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_102.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully
+[ncu] [metrics] Completed for kernel 2/4: __launch_bounds__
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_102_kernel1_section.csv --kernel-name=::regex:\b__launch_bounds__\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_102.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_102.py --repeat 100
+[ncu] [section[kernel1]] completed successfully
+[ncu] [section] Completed for kernel 2/4: __launch_bounds__
+[ncu] Profiling kernel 3/4: gnstats_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_102_kernel2_metrics.csv --kernel-name=::regex:\bgnstats_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_102.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_102.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully
+[ncu] [metrics] Completed for kernel 3/4: gnstats_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_102_kernel2_section.csv --kernel-name=::regex:\bgnstats_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_102.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_102.py --repeat 100
+[ncu] [section[kernel2]] completed successfully
+[ncu] [section] Completed for kernel 3/4: gnstats_kernel
+[ncu] Profiling kernel 4/4: gnsilu_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_102_kernel3_metrics.csv --kernel-name=::regex:\bgnsilu_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_102.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_102.py --repeat 100
+
+[stop] Signal 15 received. Finishing the current round, then writing artifacts and a resumable checkpoint. Signal again to abort now.
+[ncu] [metrics[kernel3]] completed successfully
+[ncu] [metrics] Completed for kernel 4/4: gnsilu_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_102_kernel3_section.csv --kernel-name=::regex:\bgnsilu_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_102.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_102.py --repeat 100

@@ -1,0 +1,9 @@
+==PROF== Connected to process 29632 (/home/elek/miniforge3/envs/kernelmem311/bin/python3.11)
+==PROF== Disconnected from process 29632
+==WARNING== No kernels were profiled.
+Available Kernels:
+1. gnsilu_kernel(const float *, const float *, const float *, const float *, const float *, const float *, float *, int, long, int)
+2. gnstats_kernel(const double *, float *, float *, int, double, double)
+3. void at::native::vectorized_elementwise_kernel<(int)2, at::native::FillFunctor<double>, std::array<char *, (unsigned long)1>>(int, T2, T3)
+4. winograd_gnstat_kernel(const float *, const float *, float *, double *, int, int, int, int, int, int, int)
+5. wtrans_kernel(const float *, float *, int, int)

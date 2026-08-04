@@ -1,0 +1,9 @@
+==PROF== Connected to process 29698 (/home/elek/miniforge3/envs/kernelmem311/bin/python3.11)
+==PROF== Disconnected from process 29698
+==WARNING== No kernels were profiled.
+Available Kernels:
+1. gnsilu_kernel
+2. gnstats_kernel
+3. vectorized_elementwise_kernel
+4. winograd_gnstat_kernel
+5. wtrans_kernel

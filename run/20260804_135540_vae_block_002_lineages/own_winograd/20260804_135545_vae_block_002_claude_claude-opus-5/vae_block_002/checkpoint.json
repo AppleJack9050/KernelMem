@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "task": "tasks/vae_block_002.py",
+  "next_round": 1,
+  "total_rounds": 10,
+  "base": {
+    "code_path": "/home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_144533.py",
+    "eval_path": "/home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json",
+    "score": 0.2526512673828114
+  },
+  "best": {
+    "code_path": "/home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_144533.py",
+    "eval_path": "/home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json",
+    "score": 0.2526512673828114
+  },
+  "current": {
+    "code_path": "/home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_144533.py",
+    "eval_path": "/home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json",
+    "score": 0.2526512673828114
+  },
+  "repair_chain": null,
+  "base_score": 0.2526512673828114,
+  "best_score": 0.2526512673828114,
+  "optimization_tree": {
+    "kernel_20260804_144533": {
+      "parent": null,
+      "kernel_name": "kernel_20260804_144533",
+      "kernel_path": "/home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/own_winograd/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_144533.py",
+      "speedup": 0.2526512673828114,
+      "runnable": true,
+      "ncu_passed": false,
+      "phase": "seed",
+      "round": 0,
+      "strategy": null,
+      "method_matched": false,
+      "timestamp": "2026-08-04T15:38:43.931227"
+    }
+  },
+  "scores": [
+    0.2526512673828114
+  ],
+  "err_flags": [
+    false
+  ],
+  "last_score_for_curve": 0.2526512673828114,
+  "rounds_since_improvement": 0,
+  "stop_reason": null,
+  "opt_history_files": {},
+  "next_individual_id": 3,
+  "timestamp": "2026-08-04T15:38:43.931711"
+}

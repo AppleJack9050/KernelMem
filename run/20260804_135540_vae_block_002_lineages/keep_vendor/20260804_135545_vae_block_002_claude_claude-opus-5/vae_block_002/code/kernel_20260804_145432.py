@@ -1,0 +1,569 @@
+# ==========================================================================
+# ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
+#            + CUDA_Graph_Capture_Replay_StaticBuffers
+#
+# 1) GRANULARITY: (C) whole residual block driven from ONE C++ entry point
+#    (`fused_block_ptr`) built with load_inline: 2 weight-layout kernels,
+#    1 activation layout kernel, 2 vendor conv calls, 3 custom kernels per
+#    GroupNorm stage.  The entire entry point is captured once per shape into
+#    a CUDA graph; steady state is a 56-byte H2D pointer write + one replay.
+#
+# 2) OPS REPLACED (nothing of the reference forward runs in torch eager):
+#      NCHW->NHWC of x      -> `nchw_to_nhwc_tiled` shared-memory tile transpose
+#      weight ->ChannelsLast-> `w_nchw_to_nhwc` (replaces aten .contiguous(CL),
+#                              so no host pointer is baked into the graph)
+#      F.conv2d #1/#2       -> at::conv2d INSIDE the extension, NHWC TF32
+#      F.group_norm #1/#2   -> gn_stats_partial + gn_finalize (deterministic)
+#      F.silu #1/#2         -> folded into the GroupNorm apply kernels
+#      out + residual       -> folded into the 2nd apply kernel
+#      final NHWC->NCHW     -> folded into the 2nd apply kernel
+#
+# 3) POINTER TABLE (device, int64[7]) — dereferenced at kernel runtime so the
+#    graph never captures data addresses:
+#      [0]=x  [1]=conv1_w  [2]=norm1_w  [3]=norm1_b
+#      [4]=conv2_w  [5]=norm2_w  [6]=norm2_b
+# ==========================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+cuda_src = r"""
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+
+#define CH   256
+#define NG   32
+#define CPG  8
+#define C4   64          // float4 per NHWC row (256 channels)
+
+__device__ __forceinline__ float silu_f(float v) {
+    return v / (1.0f + expf(-v));
+}
+
+__device__ __forceinline__ const float* pget(const long* __restrict__ ptrs, int slot) {
+    return (const float*)(size_t)ptrs[slot];
+}
+
+// ---------------------------------------------------------------------------
+// kW: weight NCHW (O,C,3,3) -> NHWC/ChannelsLast (O,3,3,C) layout.
+//     grid = (O=256), block = 256 (one thread per input channel).
+//     Replaces conv_weight.contiguous(ChannelsLast) so the weight source
+//     pointer is read from the table instead of baked into the graph.
+// ---------------------------------------------------------------------------
+__global__ void w_nchw_to_nhwc(const long* __restrict__ ptrs,
+                               int slot,
+                               float* __restrict__ dst) {
+    const float* __restrict__ src = pget(ptrs, slot);
+    const int o = blockIdx.x;
+    const int t = threadIdx.x;                      // channel index (0..255)
+
+    const float* __restrict__ s = src + ((size_t)o * CH + (size_t)t) * 9;
+    float* __restrict__ d = dst + (size_t)o * 9 * CH + t;
+
+#pragma unroll
+    for (int kh = 0; kh < 3; ++kh) {
+#pragma unroll
+        for (int kw = 0; kw < 3; ++kw) {
+            d[(size_t)(kh * 3 + kw) * CH] = s[kh * 3 + kw];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// k0: NCHW -> NHWC shared-memory tiled transpose (exact permutation).
+//     grid = ((HW+127)/128, CH/32, N), block = 256.
+//     tile = 32 channels x 128 pixels, padded row stride 133 floats.
+//     Body identical to base; only the input pointer source changed.
+// ---------------------------------------------------------------------------
+#define TT_C      32
+#define TT_P      128
+#define TT_STRIDE 133
+
+__global__ void nchw_to_nhwc_tiled(const long* __restrict__ ptrs,
+                                   float* __restrict__ out,
+                                   int HW) {
+    const float* __restrict__ in = pget(ptrs, 0);
+
+    const int n  = blockIdx.z;
+    const int c0 = blockIdx.y * TT_C;
+    const int p0 = blockIdx.x * TT_P;
+
+    const float* __restrict__ src = in + ((size_t)n * CH + (size_t)c0) * (size_t)HW;
+    float* __restrict__ dst = out + (size_t)n * (size_t)HW * CH;
+
+    int prows = HW - p0;
+    if (prows > TT_P) prows = TT_P;
+
+    __shared__ float sm[TT_C * TT_STRIDE];
+
+    // ---- phase A: coalesced NCHW read ----
+    const int cl = threadIdx.x >> 7;         // 0..1
+    const int pl = threadIdx.x & 127;        // 0..127
+#pragma unroll 4
+    for (int cc = cl; cc < TT_C; cc += 2) {
+        float v = (pl < prows) ? __ldg(&src[(size_t)cc * (size_t)HW + p0 + pl]) : 0.f;
+        sm[cc * TT_STRIDE + pl] = v;
+    }
+
+    __syncthreads();
+
+    // ---- phase B: coalesced NHWC write ----
+    const int lane = threadIdx.x & 31;       // channel within tile
+    const int pw   = threadIdx.x >> 5;       // 0..7
+#pragma unroll 4
+    for (int p = pw; p < TT_P; p += 8) {
+        if (p < prows) {
+            dst[(size_t)(p0 + p) * CH + c0 + lane] = sm[lane * TT_STRIDE + p];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// k1: per-tile, per-group partial (sum, sumsq) over an NHWC plane.  UNCHANGED.
+// ---------------------------------------------------------------------------
+__global__ void gn_stats_partial(const float* __restrict__ y,
+                                 float2* __restrict__ partial,
+                                 int HW, int rowsPerTile, int numTiles) {
+    const int n    = blockIdx.y;
+    const int tile = blockIdx.x;
+    const int row0 = tile * rowsPerTile;
+    int row1 = row0 + rowsPerTile;
+    if (row1 > HW) row1 = HW;
+
+    const int tid   = threadIdx.x;
+    const int c4    = tid & (C4 - 1);
+    const int rslot = tid >> 6;              // 0..3
+
+    const float4* base =
+        reinterpret_cast<const float4*>(y + (size_t)n * (size_t)HW * CH);
+
+    float s = 0.f, q = 0.f;
+    for (int r = row0 + rslot; r < row1; r += 4) {
+        float4 v = base[(size_t)r * C4 + c4];
+        s += v.x + v.y + v.z + v.w;
+        q += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+
+    __shared__ float ss[256];
+    __shared__ float sq[256];
+    ss[tid] = s;
+    sq[tid] = q;
+    __syncthreads();
+
+    if (tid < NG) {
+        float ts = 0.f, tq = 0.f;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            int i0 = r * C4 + tid * 2;       // group g <-> c4 in {2g, 2g+1}
+            ts += ss[i0] + ss[i0 + 1];
+            tq += sq[i0] + sq[i0 + 1];
+        }
+        partial[(size_t)(n * numTiles + tile) * NG + tid] = make_float2(ts, tq);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// k2: reduce partials -> mean/rstd -> per-(n,c) scale/shift.
+//     gamma/beta now come from the pointer table (slots 2/3 or 5/6).
+// ---------------------------------------------------------------------------
+__global__ void gn_finalize(const float2* __restrict__ partial,
+                            const long* __restrict__ ptrs,
+                            int gSlot, int bSlot,
+                            float* __restrict__ scale,
+                            float* __restrict__ shift,
+                            int numTiles, float eps, float invCount) {
+    const float* __restrict__ gamma = pget(ptrs, gSlot);
+    const float* __restrict__ beta  = pget(ptrs, bSlot);
+
+    const int n = blockIdx.x;
+    const int t = threadIdx.x;
+    const int g = t >> 3;
+    const int j = t & 7;
+
+    float s = 0.f, q = 0.f;
+    for (int tl = j; tl < numTiles; tl += 8) {
+        float2 p = partial[(size_t)(n * numTiles + tl) * NG + g];
+        s += p.x;
+        q += p.y;
+    }
+
+    __shared__ float ss[256];
+    __shared__ float sq[256];
+    __shared__ float smean[NG];
+    __shared__ float srstd[NG];
+    ss[t] = s;
+    sq[t] = q;
+    __syncthreads();
+
+    if (t < NG) {
+        float a = 0.f, b = 0.f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            a += ss[t * 8 + k];
+            b += sq[t * 8 + k];
+        }
+        float m   = a * invCount;
+        float var = b * invCount - m * m;
+        if (var < 0.f) var = 0.f;
+        smean[t] = m;
+        srstd[t] = rsqrtf(var + eps);
+    }
+    __syncthreads();
+
+    const int c  = t;                       // 256 channels, 256 threads
+    const int gg = c >> 3;
+    float sc = srstd[gg] * gamma[c];
+    scale[n * CH + c] = sc;
+    shift[n * CH + c] = beta[c] - smean[gg] * sc;
+}
+
+// ---------------------------------------------------------------------------
+// k3: in-place NHWC  y = silu(y*scale + shift).  UNCHANGED.
+// ---------------------------------------------------------------------------
+__global__ void gn_apply_silu(float* __restrict__ y,
+                              const float* __restrict__ scale,
+                              const float* __restrict__ shift,
+                              int HW) {
+    const int n   = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    __shared__ float4 ssc[C4];
+    __shared__ float4 ssh[C4];
+    if (tid < C4) {
+        ssc[tid] = reinterpret_cast<const float4*>(scale + n * CH)[tid];
+        ssh[tid] = reinterpret_cast<const float4*>(shift + n * CH)[tid];
+    }
+    __syncthreads();
+
+    float4* p = reinterpret_cast<float4*>(y + (size_t)n * (size_t)HW * CH);
+    const int total4 = HW * C4;
+    const int stride = gridDim.x * blockDim.x;
+
+    for (int idx = blockIdx.x * blockDim.x + tid; idx < total4; idx += stride) {
+        const int c4 = idx & (C4 - 1);
+        float4 v  = p[idx];
+        float4 sc = ssc[c4];
+        float4 sh = ssh[c4];
+        v.x = silu_f(v.x * sc.x + sh.x);
+        v.y = silu_f(v.y * sc.y + sh.y);
+        v.z = silu_f(v.z * sc.z + sh.z);
+        v.w = silu_f(v.w * sc.w + sh.w);
+        p[idx] = v;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// k3': NHWC in -> (norm, affine, SiLU, +residual, transpose) -> NCHW out.
+//      residual pointer now comes from slot 0 (same buffer as the transpose).
+// ---------------------------------------------------------------------------
+#define TR   32
+#define SPAD 260                 // 32 rows * 260 floats, 16B aligned rows
+
+__global__ void gn_apply_silu_res_t(const float* __restrict__ y,
+                                    const float* __restrict__ scale,
+                                    const float* __restrict__ shift,
+                                    const long*  __restrict__ ptrs,
+                                    float* __restrict__ out,
+                                    int HW) {
+    const float* __restrict__ res = pget(ptrs, 0);
+
+    const int n    = blockIdx.y;
+    const int row0 = blockIdx.x * TR;
+    const int tid  = threadIdx.x;
+
+    __shared__ __align__(16) float sm[TR * SPAD];
+    __shared__ float4 ssc[C4];
+    __shared__ float4 ssh[C4];
+
+    if (tid < C4) {
+        ssc[tid] = reinterpret_cast<const float4*>(scale + n * CH)[tid];
+        ssh[tid] = reinterpret_cast<const float4*>(shift + n * CH)[tid];
+    }
+    __syncthreads();
+
+    const int c4    = tid & (C4 - 1);
+    const int rslot = tid >> 6;              // 0..3
+    const float4* yb =
+        reinterpret_cast<const float4*>(y + (size_t)n * (size_t)HW * CH);
+
+    int rows = HW - row0;
+    if (rows > TR) rows = TR;
+
+    // phase 1: coalesced NHWC read, epilogue math, staged in shared memory
+    for (int rr = rslot; rr < TR; rr += 4) {
+        if (rr < rows) {
+            float4 v  = yb[(size_t)(row0 + rr) * C4 + c4];
+            float4 sc = ssc[c4];
+            float4 sh = ssh[c4];
+            v.x = silu_f(v.x * sc.x + sh.x);
+            v.y = silu_f(v.y * sc.y + sh.y);
+            v.z = silu_f(v.z * sc.z + sh.z);
+            v.w = silu_f(v.w * sc.w + sh.w);
+            *reinterpret_cast<float4*>(&sm[rr * SPAD + 4 * c4]) = v;
+        }
+    }
+    __syncthreads();
+
+    // phase 2: coalesced NCHW write with residual add
+    const int cl  = tid >> 5;                // 0..7
+    const int row = tid & 31;                // 0..31
+    const size_t planeBase = (size_t)n * CH * (size_t)HW;
+    if (row < rows) {
+        const size_t off = (size_t)(row0 + row);
+        for (int cb = 0; cb < CH; cb += 8) {
+            const int c = cb + cl;
+            const size_t gi = planeBase + (size_t)c * (size_t)HW + off;
+            out[gi] = sm[row * SPAD + c] + res[gi];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// host driver: the whole residual block, pointer-table driven (graph safe)
+// ---------------------------------------------------------------------------
+static void gn_tiling(int N, int HW, int& rowsPerTile, int& numTiles) {
+    rowsPerTile = 64;
+    numTiles = (HW + rowsPerTile - 1) / rowsPerTile;
+    while ((long long)N * numTiles > 4096 && rowsPerTile < HW) {
+        rowsPerTile *= 2;
+        numTiles = (HW + rowsPerTile - 1) / rowsPerTile;
+    }
+    while ((long long)N * numTiles < 132 && rowsPerTile > 8) {
+        rowsPerTile /= 2;
+        numTiles = (HW + rowsPerTile - 1) / rowsPerTile;
+    }
+    if (numTiles < 1) numTiles = 1;
+}
+
+static void run_group_norm_stats(const at::Tensor& y, const long* ptrs,
+                                 int gSlot, int bSlot,
+                                 at::Tensor& scale, at::Tensor& shift,
+                                 int N, int HW, double eps,
+                                 cudaStream_t stream) {
+    int rowsPerTile, numTiles;
+    gn_tiling(N, HW, rowsPerTile, numTiles);
+
+    auto partial = at::empty({(long)N * numTiles * NG * 2}, y.options());
+
+    dim3 g1(numTiles, N), b1(256);
+    gn_stats_partial<<<g1, b1, 0, stream>>>(
+        y.data_ptr<float>(),
+        reinterpret_cast<float2*>(partial.data_ptr<float>()),
+        HW, rowsPerTile, numTiles);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const float invCount = (float)(1.0 / ((double)HW * (double)CPG));
+    dim3 g2(N), b2(256);
+    gn_finalize<<<g2, b2, 0, stream>>>(
+        reinterpret_cast<const float2*>(partial.data_ptr<float>()),
+        ptrs, gSlot, bSlot,
+        scale.data_ptr<float>(), shift.data_ptr<float>(),
+        numTiles, (float)eps, invCount);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fused_block_ptr(torch::Tensor ptrs_dev,
+                              int64_t N_, int64_t H_, int64_t W_,
+                              double eps) {
+    TORCH_CHECK(ptrs_dev.is_cuda(), "ptr table must be CUDA");
+    TORCH_CHECK(ptrs_dev.scalar_type() == at::kLong, "ptr table must be int64");
+    TORCH_CHECK(ptrs_dev.numel() >= 7, "ptr table needs 7 slots");
+
+    const int N  = (int)N_;
+    const int H  = (int)H_;
+    const int W  = (int)W_;
+    const int HW = H * W;
+
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(ptrs_dev.device());
+    const long* ptrs = (const long*)ptrs_dev.data_ptr<int64_t>();
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // ---- graph-private channels-last conv weights (custom kernel, no aten) ----
+    auto w1_cl = at::empty({CH, CH, 3, 3},
+                           opts.memory_format(at::MemoryFormat::ChannelsLast));
+    auto w2_cl = at::empty({CH, CH, 3, 3},
+                           opts.memory_format(at::MemoryFormat::ChannelsLast));
+    {
+        dim3 grid(CH), block(256);
+        w_nchw_to_nhwc<<<grid, block, 0, stream>>>(ptrs, 1, w1_cl.data_ptr<float>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        w_nchw_to_nhwc<<<grid, block, 0, stream>>>(ptrs, 4, w2_cl.data_ptr<float>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // ---- custom NCHW -> NHWC transpose (input read through slot 0) ----
+    auto x_cl = at::empty({N, CH, H, W},
+                          opts.memory_format(at::MemoryFormat::ChannelsLast));
+    {
+        dim3 grid((HW + TT_P - 1) / TT_P, CH / TT_C, N);
+        dim3 block(256);
+        nchw_to_nhwc_tiled<<<grid, block, 0, stream>>>(
+            ptrs, x_cl.data_ptr<float>(), HW);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // ---- conv1 (NHWC TF32, cuDNN) ----
+    auto y1 = at::conv2d(x_cl, w1_cl, at::Tensor(), {1, 1}, {1, 1}, {1, 1}, 1);
+    if (!y1.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y1 = y1.contiguous(at::MemoryFormat::ChannelsLast);
+
+    auto scale = at::empty({N, CH}, opts);
+    auto shift = at::empty({N, CH}, opts);
+    run_group_norm_stats(y1, ptrs, 2, 3, scale, shift, N, HW, eps, stream);
+
+    {
+        int total4 = HW * C4;
+        int gx = (total4 + 255) / 256;
+        if (gx > 2048) gx = 2048;
+        if (gx < 1) gx = 1;
+        dim3 g(gx, N), b(256);
+        gn_apply_silu<<<g, b, 0, stream>>>(
+            y1.data_ptr<float>(), scale.data_ptr<float>(),
+            shift.data_ptr<float>(), HW);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // ---- conv2 (NHWC TF32, cuDNN) ----
+    auto y2 = at::conv2d(y1, w2_cl, at::Tensor(), {1, 1}, {1, 1}, {1, 1}, 1);
+    if (!y2.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y2 = y2.contiguous(at::MemoryFormat::ChannelsLast);
+
+    run_group_norm_stats(y2, ptrs, 5, 6, scale, shift, N, HW, eps, stream);
+
+    auto out = at::empty({N, CH, H, W}, opts);
+    {
+        int gx = (HW + TR - 1) / TR;
+        dim3 g(gx, N), b(256);
+        gn_apply_silu_res_t<<<g, b, 0, stream>>>(
+            y2.data_ptr<float>(), scale.data_ptr<float>(),
+            shift.data_ptr<float>(), ptrs,
+            out.data_ptr<float>(), HW);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return out;
+}
+"""
+
+cpp_src = r"""
+torch::Tensor fused_block_ptr(torch::Tensor ptrs_dev,
+                              int64_t N_, int64_t H_, int64_t W_,
+                              double eps);
+"""
+
+_ext = load_inline(
+    name="vae_resblock_fused_graph_c",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["fused_block_ptr"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_90,code=sm_90",
+    ],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """See file header for granularity (C) / fusion map / pointer-table graph."""
+
+    def __init__(self):
+        super().__init__()
+        try:
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+        self.ext = _ext
+        # 7-slot pointer table: pinned host staging + device mirror (56 bytes).
+        try:
+            self._ph = torch.empty(7, dtype=torch.int64, pin_memory=True)
+        except Exception:
+            self._ph = torch.empty(7, dtype=torch.int64)
+        self._phn = self._ph.numpy()
+        self._pd = None
+        self._graphs = {}
+        self._ws = None
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _supported(x, w1, w2):
+        return (x.is_cuda and x.dtype == torch.float32 and x.dim() == 4
+                and x.size(1) == 256 and x.is_contiguous()
+                and w1.is_cuda and w2.is_cuda
+                and w1.dtype == torch.float32 and w2.dtype == torch.float32
+                and tuple(w1.shape) == (256, 256, 3, 3)
+                and tuple(w2.shape) == (256, 256, 3, 3)
+                and w1.is_contiguous() and w2.is_contiguous())
+
+    def _capture(self, N, H, W, eps):
+        if self._ws is None:
+            self._ws = torch.cuda.Stream()
+        cur = torch.cuda.current_stream()
+        self._ws.wait_stream(cur)
+        with torch.cuda.stream(self._ws):
+            for _ in range(3):
+                _ = self.ext.fused_block_ptr(self._pd, N, H, W, eps)
+        cur.wait_stream(self._ws)
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = self.ext.fused_block_ptr(self._pd, N, H, W, eps)
+        return (g, out)
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        if self._supported(x, conv1_weight, conv2_weight):
+            if self._pd is None or self._pd.device != x.device:
+                self._pd = torch.empty(7, dtype=torch.int64, device=x.device)
+                self._graphs = {}
+                self._ws = None
+
+            phn = self._phn
+            phn[0] = x.data_ptr()
+            phn[1] = conv1_weight.data_ptr()
+            phn[2] = norm1_weight.data_ptr()
+            phn[3] = norm1_bias.data_ptr()
+            phn[4] = conv2_weight.data_ptr()
+            phn[5] = norm2_weight.data_ptr()
+            phn[6] = norm2_bias.data_ptr()
+            self._pd.copy_(self._ph, non_blocking=True)
+
+            N, _, H, W = x.shape
+            key = (int(N), int(H), int(W), float(eps), x.device.index)
+            entry = self._graphs.get(key, "MISS")
+
+            if entry == "MISS":
+                try:
+                    entry = self._capture(int(N), int(H), int(W), float(eps))
+                except Exception:
+                    entry = None
+                self._graphs[key] = entry
+
+            if entry is None:
+                return self.ext.fused_block_ptr(self._pd, int(N), int(H),
+                                                int(W), float(eps))
+            g, out = entry
+            g.replay()
+            return out
+
+        # generic fallback (kept only for unsupported shapes/dtypes)
+        out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, 32, weight=norm1_weight, bias=norm1_bias, eps=eps)
+        out = F.silu(out)
+        out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, 32, weight=norm2_weight, bias=norm2_bias, eps=eps)
+        out = F.silu(out)
+        return out + x

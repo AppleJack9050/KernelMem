@@ -147,6 +147,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "-- multi-stream ones run ~5x noisier -- where a +0.6%% reading with 0.4%% "
                         "standard error clears a 0.5%% margin at only 1.5 sigma. Set 0 to decide on "
                         "the margin alone.")
+    p.add_argument("--structural_grace", type=int, default=0,
+                   help="Rounds a DECLARED structural rewrite may hold the base while it is "
+                        "still slower than the kernel it displaced (0 = off, the ratchet-only "
+                        "behaviour). The ratchet adopts a candidate only if it beats the base "
+                        "immediately, which is right for tuning and fatal for restructuring: "
+                        "changing MMA primitive, tile geometry or memory pipeline is slower "
+                        "until it is finished, so the first version is always rejected and the "
+                        "rewrite can never be reached in steps. Measured on vae_block_002: the "
+                        "loop produced 10 straight wmma/FMA kernels and never once reached "
+                        "wgmma, whose work-per-instruction is 128x higher. The judge declares "
+                        "the intent (\"structural_rewrite\": true) and pays for it: if the "
+                        "rewrite has not beaten the displaced kernel within this many rounds, "
+                        "the old base is restored. best_kernel is never affected, so a run can "
+                        "only report a kernel that genuinely measured best. Try 3.")
     p.add_argument("--patience", type=int, default=4,
                    help="Stop after this many consecutive rounds that fail to improve best_score "
                         "by more than --base_margin (0 disables). Late rounds are where a run "
@@ -1012,6 +1026,18 @@ def _save_checkpoint(task_root: Path, eval_dir: Path, *, task_path: Path,
         # spanned a restart, so a counter kept only in memory would reset on
         # --resume and the stop would fire late or never.
         "rounds_since_improvement": int(state.get("rounds_since_improvement") or 0),
+        # Structural-rewrite debt outlives a session too. Dropping it on resume
+        # would silently forgive the debt: the rewrite would keep the base it
+        # took on credit and the kernel it displaced would never come back.
+        "structural_debt": (
+            {
+                "kernel": _ckpt_entry(state["structural_debt"].get("kernel"), eval_dir),
+                "score": float(state["structural_debt"]["score"]),
+                "rounds_left": int(state["structural_debt"]["rounds_left"]),
+                "declared_round": int(state["structural_debt"].get("declared_round") or -1),
+            }
+            if state.get("structural_debt") else None
+        ),
         "stop_reason": state.get("stop_reason"),
         "opt_history_files": {str(k): str(v) for k, v in (state.get("opt_history_files") or {}).items()},
         # Ids name the eval_XXXX.json files; rewinding this would overwrite
@@ -1261,6 +1287,9 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     err_flags: List[bool] = []
     last_score_for_curve = 0.0  # default baseline for plotting on early failures
     rounds_since_improvement = 0  # consecutive rounds not beating best_score by --base_margin
+    # Outstanding structural-rewrite debt, or None. Holds the kernel the rewrite
+    # displaced so it can be restored if the rewrite never pays off.
+    structural_debt: Optional[Dict[str, Any]] = None
 
     # ---- resume: rebuild the loop's state from the last completed round ----
     start_round = 0
@@ -1283,6 +1312,17 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             scores = list(ckpt.get("scores") or [])
             err_flags = list(ckpt.get("err_flags") or [])
             last_score_for_curve = float(ckpt.get("last_score_for_curve") or 0.0)
+            _sd = ckpt.get("structural_debt")
+            if _sd:
+                structural_debt = {
+                    "kernel": _restore_individual(_sd.get("kernel"), _cache),
+                    "score": float(_sd.get("score") or 0.0),
+                    "rounds_left": int(_sd.get("rounds_left") or 0),
+                    "declared_round": int(_sd.get("declared_round") or -1),
+                }
+                print(f"[resume] Carrying a structural-rewrite debt forward: base owes "
+                      f"{structural_debt['score']:.4f}, {structural_debt['rounds_left']} "
+                      f"round(s) of grace left.", flush=True)
             rounds_since_improvement = int(ckpt.get("rounds_since_improvement") or 0)
             opt_history_files = {int(k): Path(v) for k, v in (ckpt.get("opt_history_files") or {}).items()}
             # Restoring individuals bumps the id counter, so set it afterwards;
@@ -1311,6 +1351,9 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                   f"{args.round} rounds; resume with --resume {batch_dir}", flush=True)
             break
         print(f"[{task_path.name}] Round {round_idx}")
+        # Reset every round: only a round whose judge JSON asks for it may take
+        # structural grace, and a stale True would hand it to an unrelated round.
+        _structural_declared = False
         # Snapshot for the plateau test. best_score is updated from several
         # places (opt accept, repair accept, statistics-only bump), so comparing
         # the round's start against its end catches every path -- including the
@@ -2246,6 +2289,19 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                   f"Raw reply kept at {reply_file}", flush=True)
                             continue  # `round_idx` advances via the enclosing for-loop
 
+                        # Does this round's plan ask for structural grace? Only
+                        # an explicit true counts; a missing field means no.
+                        if isinstance(strategy_json, dict):
+                            _sr = strategy_json.get("structural_rewrite")
+                            _structural_declared = (
+                                _sr is True
+                                or (isinstance(_sr, str) and _sr.strip().lower() == "true")
+                            )
+                            if _structural_declared and args.structural_grace <= 0:
+                                print("[base] Judge declared a structural rewrite but "
+                                      "--structural_grace is 0; the ratchet applies as usual.",
+                                      flush=True)
+
                         # Check if method was matched based on machine_check_result
                         # Read machine_check_result JSON file to determine if method was matched
                         method_matched = False
@@ -2546,11 +2602,59 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 base_kernel = ind
                 with open(test_kernel, "w") as f:
                     f.write(base_kernel.code)
+            elif (args.structural_grace > 0 and structural_debt is None
+                  and _structural_declared and base_score > 0 and this_score > 0):
+                # Declared structural rewrite, rejected by the ratchet. Adopt it
+                # anyway and remember what it displaced: a rewrite is slower
+                # until it is finished, so judging it on its first version is
+                # judging it on the one round where it cannot win. The debt is
+                # settled below -- either the rewrite overtakes what it replaced
+                # within --structural_grace rounds, or the old base comes back.
+                structural_debt = {
+                    "kernel": base_kernel,
+                    "score": base_score,
+                    "rounds_left": int(args.structural_grace),
+                    "declared_round": round_idx,
+                }
+                delta = (this_score / base_score - 1.0) * 100.0
+                print(f"[base] Structural rewrite declared: adopting {this_score:.4f} over "
+                      f"{base_score:.4f} ({delta:+.2f}%, below the "
+                      f"{args.base_margin * 100:.1f}% margin) for {args.structural_grace} "
+                      f"rounds. It must beat {base_score:.4f} within that window or the "
+                      f"displaced kernel is restored.", flush=True)
+                base_score = this_score
+                base_kernel = ind
+                with open(test_kernel, "w") as f:
+                    f.write(base_kernel.code)
             elif base_score not in (float("-inf"), 0):
                 delta = (this_score / base_score - 1.0) * 100.0 if base_score > 0 else float("nan")
                 _how = _paired_note or f"stored-score {delta:+.2f}%"
                 print(f"[base] Keeping base_kernel {base_score:.4f} ({this_score:.4f}: "
                       f"{_how}, below the {args.base_margin * 100:.1f}% margin)", flush=True)
+
+            # ---- settle any outstanding structural-rewrite debt -------------
+            if structural_debt is not None:
+                _owed = float(structural_debt["score"])
+                if base_score >= _owed * (1.0 + args.base_margin):
+                    print(f"[base] Structural rewrite paid off: {base_score:.4f} now beats the "
+                          f"{_owed:.4f} it displaced; grace cleared.", flush=True)
+                    structural_debt = None
+                else:
+                    structural_debt["rounds_left"] -= 1
+                    if structural_debt["rounds_left"] > 0:
+                        print(f"[base] Structural rewrite on grace: {base_score:.4f} vs the "
+                              f"{_owed:.4f} it owes, {structural_debt['rounds_left']} round(s) "
+                              f"left.", flush=True)
+                    else:
+                        print(f"[base] Structural rewrite failed to reach {_owed:.4f} in "
+                              f"{args.structural_grace} rounds (best it managed: "
+                              f"{base_score:.4f}); restoring the displaced kernel.", flush=True)
+                        base_kernel = structural_debt["kernel"]
+                        base_score = _owed
+                        if base_kernel is not None:
+                            with open(test_kernel, "w") as f:
+                                f.write(base_kernel.code)
+                        structural_debt = None
 
             # best_kernel decides what the run REPORTS, so it needs the same
             # evidence the base ratchet demands -- it used to take any higher
@@ -2648,6 +2752,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 "err_flags": err_flags,
                 "last_score_for_curve": last_score_for_curve,
                 "rounds_since_improvement": rounds_since_improvement,
+                "structural_debt": structural_debt,
                 "stop_reason": "plateau" if _plateau_stop else None,
                 "opt_history_files": opt_history_files,
             },

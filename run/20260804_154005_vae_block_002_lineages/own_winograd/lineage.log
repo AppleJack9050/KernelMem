@@ -1,0 +1,35 @@
+[BATCH] Output folder: /home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/own_winograd/20260804_154010_vae_block_002_claude_claude-opus-5
+[vae_block_002.py] Round 0
+[Seed] Generating the initial kernel ...
+[ref_profile] Profiling reference model to inform granularity choice ...
+[ref_profile] REFERENCE PROFILE (measured on this GPU, not estimated)
+[ref_profile] The unmodified reference takes 1479.7 us of GPU time per forward.
+[ref_profile] Where that time actually goes:
+[Seed] Drawing candidate 1/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=84527, Out=72952, Total=157479
+[92mFinish reason: end_turn[0m
+[extract] recovered kernel across a mid-stream continuation fence (65 -> 487 lines)
+[gpu_lock] own_winograd(D/winograd_f2x3): waiting for the GPU to free up (bench) ...
+[gpu_lock] own_winograd(D/winograd_f2x3): acquired after 41.3s (bench)
+[seed] score=0.2386 (geomean over 4 shapes: 8x256x64x128=0.2339x  2x256x64x64=0.2271x  4x256x256x256=0.2130x  1x256x131x131=0.2862x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/own_winograd/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json
+[Seed] Drawing candidate 2/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+⚠️  Exception occurred (attempt 1/3). Retrying in 1.0s...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=102163, Out=98479, Total=200642
+[92mFinish reason: end_turn[0m
+[extract] recovered kernel across a mid-stream continuation fence (439 -> 556 lines)
+[seed] score=0.1795 (geomean over 4 shapes: 8x256x64x128=0.1657x  2x256x64x64=0.1708x  4x256x256x256=0.1588x  1x256x131x131=0.2312x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/own_winograd/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json
+[Seed] Drawing candidate 3/3 ...
+Skipping non-text content block of type 'ThinkingBlock'

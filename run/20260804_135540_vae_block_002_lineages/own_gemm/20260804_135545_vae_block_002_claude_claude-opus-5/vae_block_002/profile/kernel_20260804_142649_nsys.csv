@@ -1,0 +1,8 @@
+Kernel Name,kernel_launch_count
+conv_gemm_kernel,24
+final_epilogue,12
+gstats_partial,24
+nchw2nhwc,12
+norm_silu,12
+wt_kernel,24
+gstats_final,24

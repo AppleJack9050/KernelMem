@@ -1009,10 +1009,10 @@ llm_assist:
         conv 3x3 stride 1, compute-bound, arithmetic intensity well above the
         machine balance (FLOP/byte >> peak_FLOPS/peak_bandwidth). Check this
         first: after a 2.25x FLOP cut the kernel must STILL be compute-bound or
-        the saving is absorbed by memory. On vae_block_002 / RTX 5090 the direct
-        conv is 577 FLOP/byte against a machine balance of 58.5, so it stays
-        compute-bound by 4.4x after the cut and the reduction does convert to
-        wall-clock.
+        the saving is absorbed by memory. A 256-channel 3x3 conv block measured
+        577 FLOP/byte against a machine balance of 58.5, so it stayed
+        compute-bound by 4.4x after the cut and the reduction did convert to
+        wall-clock. Recompute both numbers for the workload in front of you.
       mechanism_requirements:
         - transforms_fused_in_registers_or_shared
         - f_2x2_3x3_only
@@ -1027,9 +1027,9 @@ llm_assist:
           implementation that materializes the transformed tensors to global
           memory. The transform domain is 4x the tensor (16 values per 2x2
           tile), so materializing costs ~4x tensor traffic and erases the entire
-          2.25x. This is not hypothetical: on vae_block_002 the NONFUSED vendor
-          algorithm measured 1.1581 against 1.2039 for the implicit-GEMM path it
-          replaced -- it LOST. The fused variant is the only one worth writing.
+          2.25x. This is not hypothetical: on a 3x3 stride-1 conv block the
+          NONFUSED vendor algorithm measured slower than the implicit-GEMM path
+          it replaced -- it LOST. The fused variant is the only one worth writing.
         - >
           F(4x4,3x3) or larger tiles. F(2,3) transform entries are 0, +/-1,
           +/-1/2 -- all exactly representable in binary floating point, so the
@@ -1057,13 +1057,13 @@ llm_assist:
         - >
           adopting this without first computing what it can pay. If your own
           operator merely MATCHES the vendor's throughput, the entire gain is
-          the deleted traffic -- which may be small. On vae_block_002 that
-          ceiling was +8% (1.31x vs the 1.2039 incumbent), because the existing
-          kernel had already fused everything except one unavoidable pass.
+          the deleted traffic -- which may be small. On a conv block whose
+          incumbent had already fused everything except one unavoidable pass,
+          that ceiling worked out to +8% over the incumbent.
           Compute the ceiling before spending rounds on it.
         - >
-          assuming a hand-written GEMM will reach vendor throughput. Three
-          independent seed attempts on vae_block_002 landed at ~45% of cuDNN.
+          assuming a hand-written GEMM will reach vendor throughput. Independent
+          seed attempts on a 3x3 conv have landed at ~45% of cuDNN or worse.
           Pair this method with Algorithmic_Substitution_Winograd when the goal
           is to BEAT the vendor rather than merely to fuse around it.
 

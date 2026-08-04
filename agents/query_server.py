@@ -8,6 +8,8 @@ credit — never a pay-per-token API key.
 import asyncio
 import datetime
 import os
+import shutil
+import tempfile
 import time
 from typing import Any, Callable, Optional
 
@@ -23,6 +25,51 @@ from claude_agent_sdk import (
 
 DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_EFFORT = "high"
+
+# ---------------------------------------------------------------------------
+# Tool-enabled generation.
+#
+# Kernel authoring was one-shot and blind: tools=[], max_turns=1, so the model
+# wrote a whole CUDA extension with no way to compile it and no feedback until
+# the NEXT round's profile, a full round later. That is survivable for an
+# elementwise kernel and close to hopeless for Hopper warpgroup MMA, where
+# shared-memory descriptors, swizzle layouts and fence/commit/wait ordering are
+# fixed by iterating, not by reasoning. Letting the writing calls compile and
+# fix in place is the difference between "cannot express" and "can express".
+#
+# Only the calls that WRITE CUDA get tools. The judge and problem-identify calls
+# analyse text and would gain nothing but latency and a wider blast radius.
+# ---------------------------------------------------------------------------
+_TOOL_CALL_TYPES = {"seed", "optimization", "repair"}
+_AGENT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+_TOOL_MAX_TURNS = int(os.environ.get("KERNELMEM_AGENT_MAX_TURNS", "30"))
+
+_TOOL_MODE_INSTRUCTION = """
+
+TOOLS ARE AVAILABLE THIS CALL. You have Bash, Read, Write, Edit, Glob and Grep,
+and a private scratch directory as your working directory. Use them: write the
+extension to a file, compile it, and fix what does not build BEFORE answering.
+A kernel that fails to compile scores zero, and you can now find that out
+yourself instead of spending a round on it.
+- `python -c "import torch"` works; torch, nvcc and ninja are on PATH.
+- torch.utils.cpp_extension.load_inline is the same mechanism the harness uses,
+  so a successful load_inline in your scratch dir means it will build there too.
+- Do NOT benchmark against the reference to tune here; correctness and
+  compilation are what tools are for. The harness measures performance.
+- Work only inside your working directory. Do not modify anything outside it.
+
+OUTPUT CONTRACT (unchanged, and now strict): your FINAL message must contain
+exactly ONE fenced code block holding the complete Python file, and nothing
+else of substance. Intermediate messages may say whatever you like -- only the
+last one is read.
+"""
+
+
+def _tools_enabled(call_type: str) -> bool:
+    """Whether this call gets tools. Set KERNELMEM_AGENT_TOOLS=0 to disable."""
+    if os.environ.get("KERNELMEM_AGENT_TOOLS", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return call_type in _TOOL_CALL_TYPES
 
 # The Agent SDK builds the child env as {**os.environ, **options.env} at spawn
 # time, so omitting a key does NOT remove it — an inherited ANTHROPIC_API_KEY
@@ -162,11 +209,23 @@ def _write_usage_row(
         print(f"Warning: Failed to write usage log to {log_path}: {e}")
 
 
-async def _run_query(prompt_text: str, options: ClaudeAgentOptions) -> tuple[list[str], Optional[ResultMessage]]:
+async def _run_query(prompt_text: str, options: ClaudeAgentOptions,
+                     final_only: bool = False) -> tuple[list[str], Optional[ResultMessage]]:
+    """Collect assistant text. *final_only* keeps ONLY the last message's text.
+
+    Single-turn calls must join everything, as before. But a tool-using call
+    narrates while it works ("let me compile this...", a scratch test script,
+    a diff), and `extract_code_block` returns the FIRST fenced block in the
+    joined text -- which would be that scratch script rather than the kernel.
+    Keeping only the final message makes the contract "your last message is the
+    answer", which is also what the tool-mode system prompt asks for.
+    """
     texts: list[str] = []
     result: Optional[ResultMessage] = None
     async for message in query(prompt=prompt_text, options=options):
         if isinstance(message, AssistantMessage):
+            if final_only:
+                texts = []          # keep only the most recent assistant message
             for block in message.content:
                 if isinstance(block, TextBlock):
                     texts.append(block.text)
@@ -202,21 +261,44 @@ def query_server(
     model = _resolve_model(model_name)
     effort = os.environ.get("KERNELMEM_CLAUDE_EFFORT", DEFAULT_EFFORT)
 
-    options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
-        model=model,
-        effort=effort,
-        tools=[],
-        max_turns=1,
-        env=dict(_SUBSCRIPTION_ENV),
-    )
+    use_tools = _tools_enabled(call_type)
+    workdir: Optional[str] = None
+    if use_tools:
+        # A private scratch cwd, so the agent's files land nowhere near the repo
+        # or the run artifacts even though it holds a real Bash.
+        workdir = tempfile.mkdtemp(prefix=f"kernelmem_agent_{call_type}_")
+        options = ClaudeAgentOptions(
+            system_prompt=(system_prompt or "") + _TOOL_MODE_INSTRUCTION,
+            model=model,
+            effort=effort,
+            tools=_AGENT_TOOLS,
+            allowed_tools=_AGENT_TOOLS,
+            permission_mode="bypassPermissions",  # headless: nothing can approve a prompt
+            cwd=workdir,
+            max_turns=_TOOL_MAX_TURNS,
+            env=dict(_SUBSCRIPTION_ENV),
+        )
+    else:
+        options = ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            model=model,
+            effort=effort,
+            tools=[],
+            max_turns=1,
+            env=dict(_SUBSCRIPTION_ENV),
+        )
     prompt_text = _flatten_prompt(prompt)
 
-    texts, result = retry_with_backoff(
-        lambda: asyncio.run(_run_query(prompt_text, options)),
-        max_retries=3,
-        retry_if=_is_transient_cli_result_error,
-    )
+    try:
+        texts, result = retry_with_backoff(
+            lambda: asyncio.run(_run_query(prompt_text, options, final_only=use_tools)),
+            max_retries=3,
+            retry_if=_is_transient_cli_result_error,
+        )
+    finally:
+        if workdir and os.environ.get("KERNELMEM_AGENT_KEEP_WORKDIR", "").strip().lower() \
+                not in {"1", "true", "yes", "on"}:
+            shutil.rmtree(workdir, ignore_errors=True)
 
     if result is not None and result.is_error:
         raise RuntimeError(f"Claude Agent SDK call failed ({result.subtype}): {result.result}")

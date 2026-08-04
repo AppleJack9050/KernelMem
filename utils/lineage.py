@@ -137,9 +137,16 @@ def trajectory_verdict(scores: List[float], target: float, rounds_left: int,
     that optimistic line cannot reach *target*, further rounds are spending
     budget on an outcome the lineage's own evidence has already ruled out.
     """
+    # scores[0] is the SEED, not an optimization round: a lineage that has run
+    # r rounds has r+1 entries here. Gating on len(scores) therefore spent one
+    # of the grace rounds on the seed draw, and --grace 5 bought only four
+    # rounds of tuning -- 20% less room than asked for, on the one mechanism
+    # whose entire purpose is to give a structural change room before judging
+    # it. The printed "(n/grace rounds)" was off by the same one.
     n = len(scores)
-    if n < max(2, grace):
-        return True, f"within grace ({n}/{grace} rounds)"
+    opt_rounds = max(0, n - 1)
+    if opt_rounds < max(1, grace):
+        return True, f"within grace ({opt_rounds}/{grace} rounds)"
     if rounds_left <= 0:
         return False, "no rounds left"
 
@@ -187,6 +194,24 @@ def read_lineage_progress(batch_dir: Path, task_stem: str) -> tuple[List[float],
         return [], 0
     scores = [float(s) for s in (d.get("scores") or []) if isinstance(s, (int, float))]
     return scores, int(d.get("next_round") or 0)
+
+
+def read_stop_reason(batch_dir: Path, task_stem: str) -> Optional[str]:
+    """Why the child stopped, as the child itself recorded it.
+
+    A child that stops on its own plateau rule exits 0, exactly like one that
+    ran every round -- so the coordinator cannot tell "gave up at round 5" from
+    "completed 10" by exit status, and the summary reports both as
+    ``exited rc=0``. That distinction is the whole point of comparing lineages
+    afterward, so read the reason the child already wrote down.
+    """
+    ck = batch_dir / task_stem / "checkpoint.json"
+    if not ck.exists():
+        return None
+    try:
+        return json.loads(ck.read_text(encoding="utf-8")).get("stop_reason")
+    except Exception:
+        return None
 
 
 def vendor_split(profile: Dict[str, Any]) -> tuple[float, float]:

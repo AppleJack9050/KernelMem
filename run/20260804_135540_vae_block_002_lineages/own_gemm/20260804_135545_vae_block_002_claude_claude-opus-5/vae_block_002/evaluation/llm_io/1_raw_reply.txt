@@ -1,0 +1,588 @@
+**Section A – Checklist evidence (plan-to-code mapping)**
+
+Plan item 1: Keep all CUDA kernel code, launch shapes and block sizes unchanged; all edits in Python `ModelNew`.
+Implemented in code: `_CUDA_SRC` / `_CPP_SRC` / `load_inline` copied verbatim from base; only `ModelNew` body changed.
+
+Plan item 2: `self._graphs = {}` in `__init__`, module stays parameter-free.
+Implemented in code: `ModelNew.__init__` (`self._ext = _ext`, `self._graphs = {}`).
+
+Plan item 3: Capture key `(shape, dtype, device.index, w1 shape, eps)`; never re-capture an existing key.
+Implemented in code: `_make_key()` helper + `key in self._graphs` hit-branch in `forward`.
+
+Plan item 4: Fallback guard (training / non-CUDA / currently capturing) → direct extension call.
+Implemented in code: first `if` block at top of `ModelNew.forward` calling `self._ext.fused_block(...)`.
+
+Plan item 5: Static buffers via `torch.empty_like` for x and all six weight/bias tensors, filled with `.copy_()` before warmup.
+Implemented in code: `_alloc_static()` (miss-branch of `forward`) — `sx`, `sw1, sg1, sb1, sw2, sg2, sb2` + `copy_` loop.
+
+Plan item 6: Warmup: 3 calls on a side stream, `wait_stream` both directions, `torch.cuda.synchronize()`.
+Implemented in code: `s = torch.cuda.Stream(); with torch.cuda.stream(s): for _ in range(3): ...` block in the miss-branch.
+
+Plan item 7: Capture with `torch.cuda.graph(g)` around one `fused_block` call, no explicit `pool=`.
+Implemented in code: `g = torch.cuda.CUDAGraph(); with torch.cuda.graph(g): static_out = self._ext.fused_block(...)`.
+
+Plan item 8: Store `(g, sx, [weights], out)` in the dict.
+Implemented in code: `self._graphs[key] = (g, sx, statics, static_out)`.
+
+Plan item 9: Replay path — `.copy_()` inputs into static buffers, then `g.replay()`.
+Implemented in code: hit-branch of `forward`: `sx.copy_(xc)`, loop `sbuf.copy_(t)`, `g.replay()`.
+
+Plan item 10: Return `out.clone()`.
+Implemented in code: `return static_out.clone()` on both capture and replay paths.
+
+Plan item 11: No `.cuda()/.cpu()/.to(...)`; buffers from `torch.empty_like`.
+Implemented in code: only `empty_like` / `contiguous` / `copy_` used in `forward`.
+
+Plan item 12: `.contiguous()` on x and each weight before `.copy_()`.
+Implemented in code: `_contig_args()` helper used on both miss and hit paths.
+
+Plan item 13: Cap graph count at 8 → direct call instead of capturing.
+Implemented in code: `if len(self._graphs) >= 8: return self._ext.fused_block(...)` in the miss-branch.
+
+=== KERNEL CODE STARTS BELOW ===
+
+```python
+# =============================================================================
+# ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# Round change: CUDA_Graph_Capture_Replay_StaticBuffers.
+#   The CUDA source (11 kernels: wt_kernel x2, nchw2nhwc, conv_gemm x2,
+#   gstats_partial/final x2, norm_silu, final_epilogue) is byte-for-byte the
+#   same as the previous round — same block sizes, grids, registers and smem.
+#   The only change is that the whole launch sequence is captured once per
+#   input-shape key into a torch.cuda.CUDAGraph over static buffers, so the
+#   steady-state forward costs one graph replay instead of 11 CPU launches
+#   plus 12 caching-allocator scratch allocations.
+#
+# 1) GRANULARITY: (D) fully rewrite forward.
+#    The whole reference forward (2x [Conv3x3 -> GroupNorm -> SiLU] + residual)
+#    runs in kernels built by one load_inline extension. The vendor conv
+#    (sm90_xmma_fprop_implicit_gemm...) is OWNED here: re-implemented as a
+#    tiled implicit GEMM in NHWC with TF32 wmma fragments and fp32 accumulate.
+#    No cuDNN / at::conv2d / at::cudnn_convolution anywhere.
+#
+# 2) OPS REPLACED (all of them):
+#      F.conv2d x2, F.group_norm x2, F.silu x2, residual add, plus the
+#      NCHW<->NHWC conversions cuDNN was doing internally.
+#
+# 3) WHAT REMAINS IN PYTORCH: only scratch allocation (torch::empty) on the C++
+#    side — no ATen math op implements any replaced operator. Under capture
+#    those torch::empty calls are routed to the graph-private memory pool and
+#    their addresses are frozen, so the replay path allocates nothing.
+#
+# PRECISION: fp32 storage everywhere, fp32 wmma accumulate, TF32 tensor cores
+# for the GEMM only (matches cudnn.allow_tf32 default); moments accumulate in
+# fp32 through a two-level tree reduction.
+# =============================================================================
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+
+using namespace nvcuda;
+
+#define BM 128
+#define BN 64
+#define BK 32
+#define LDA 36
+#define LDB 68
+#define NTHREADS 256
+
+// ---------------------------------------------------------------- weights ---
+__global__ void wt_kernel(const float* __restrict__ w, float* __restrict__ wt,
+                          int C, int N, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int n  = idx % N;
+    int k  = idx / N;
+    int c  = k % C;
+    int rs = k / C;
+    wt[idx] = w[((long)n * C + c) * 9 + rs];
+}
+
+// -------------------------------------------------------------- transpose ---
+__global__ void nchw2nhwc(const float* __restrict__ src, float* __restrict__ dst,
+                          int C, int HW) {
+    __shared__ float tile[32][33];
+    int p0 = blockIdx.x * 32;
+    int c0 = blockIdx.y * 32;
+    int b  = blockIdx.z;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int c = c0 + threadIdx.y + i * 8;
+        int p = p0 + threadIdx.x;
+        float v = 0.f;
+        if (c < C && p < HW) v = src[((long)b * C + c) * HW + p];
+        tile[threadIdx.y + i * 8][threadIdx.x] = v;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int p = p0 + threadIdx.y + i * 8;
+        int c = c0 + threadIdx.x;
+        if (c < C && p < HW)
+            dst[((long)b * HW + p) * C + c] = tile[threadIdx.x][threadIdx.y + i * 8];
+    }
+}
+
+// ------------------------------------------------------- groupnorm moments ---
+__global__ void gstats_partial(const float* __restrict__ y,
+                               float* __restrict__ psum, float* __restrict__ psq,
+                               int HW, int C, int G, int cpg, int nchunk) {
+    __shared__ float shm[64];
+    int chunk = blockIdx.x, g = blockIdx.y, b = blockIdx.z;
+    int per   = (HW + nchunk - 1) / nchunk;
+    int start = chunk * per;
+    int end   = start + per; if (end > HW) end = HW;
+
+    float s = 0.f, sq = 0.f;
+    int vpp = cpg >> 2;
+    int nv  = (end > start) ? (end - start) * vpp : 0;
+    for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+        int pi = i / vpp;
+        int j  = (i - pi * vpp) * 4;
+        const float4 v = *(const float4*)(y + ((long)(b * HW + start + pi)) * C + g * cpg + j);
+        s  += v.x + v.y + v.z + v.w;
+        sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s  += __shfl_down_sync(0xffffffffu, s, off);
+        sq += __shfl_down_sync(0xffffffffu, sq, off);
+    }
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int nw   = blockDim.x >> 5;
+    if (lane == 0) { shm[warp] = s; shm[32 + warp] = sq; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float a = 0.f, c2 = 0.f;
+        for (int i = 0; i < nw; ++i) { a += shm[i]; c2 += shm[32 + i]; }
+        long o = (long)(b * G + g) * nchunk + chunk;
+        psum[o] = a; psq[o] = c2;      // always written, even for empty chunks
+    }
+}
+
+__global__ void gstats_final(const float* __restrict__ psum, const float* __restrict__ psq,
+                             float* __restrict__ mean, float* __restrict__ rstd,
+                             int nchunk, float count, float eps) {
+    int idx = blockIdx.x;
+    float s = 0.f, sq = 0.f;
+    for (int i = threadIdx.x; i < nchunk; i += 32) {
+        s  += psum[(long)idx * nchunk + i];
+        sq += psq[(long)idx * nchunk + i];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s  += __shfl_down_sync(0xffffffffu, s, off);
+        sq += __shfl_down_sync(0xffffffffu, sq, off);
+    }
+    if (threadIdx.x == 0) {
+        float m = s / count;
+        float var = sq / count - m * m;
+        if (!(var > 0.f)) var = 0.f;
+        mean[idx] = m;
+        rstd[idx] = rsqrtf(var + eps);
+    }
+}
+
+// ------------------------------------------- groupnorm affine + SiLU (NHWC) ---
+__global__ void norm_silu(float* __restrict__ y,
+                          const float* __restrict__ gamma, const float* __restrict__ beta,
+                          const float* __restrict__ mean, const float* __restrict__ rstd,
+                          int HW, int C, int G, int cpg, long nvec4) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nvec4) return;
+    long e   = idx * 4;
+    int  ch  = (int)(e % C);
+    long row = e / C;
+    int  b   = (int)(row / HW);
+    int  g   = ch / cpg;
+    float m = mean[b * G + g], rs = rstd[b * G + g];
+    float4 v = *(float4*)(y + e);
+    float t[4] = {v.x, v.y, v.z, v.w};
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float z = (t[i] - m) * rs * gamma[ch + i] + beta[ch + i];
+        t[i] = z / (1.f + expf(-z));
+    }
+    *(float4*)(y + e) = make_float4(t[0], t[1], t[2], t[3]);
+}
+
+// ------------------- groupnorm + SiLU + residual + NHWC->NCHW (fused write) ---
+__global__ void final_epilogue(const float* __restrict__ y, const float* __restrict__ xres,
+                               const float* __restrict__ gamma, const float* __restrict__ beta,
+                               const float* __restrict__ mean, const float* __restrict__ rstd,
+                               float* __restrict__ out, int C, int HW, int G, int cpg) {
+    __shared__ float tile[32][33];
+    int p0 = blockIdx.x * 32;
+    int c0 = blockIdx.y * 32;
+    int b  = blockIdx.z;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int p = p0 + threadIdx.y + i * 8;
+        int c = c0 + threadIdx.x;
+        float v = 0.f;
+        if (p < HW && c < C) {
+            v = y[((long)b * HW + p) * C + c];
+            int g = c / cpg;
+            float z = (v - mean[b * G + g]) * rstd[b * G + g] * gamma[c] + beta[c];
+            v = z / (1.f + expf(-z));
+        }
+        tile[threadIdx.y + i * 8][threadIdx.x] = v;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int c = c0 + threadIdx.y + i * 8;
+        int p = p0 + threadIdx.x;
+        if (p < HW && c < C) {
+            long o = ((long)b * C + c) * HW + p;
+            out[o] = tile[threadIdx.x][threadIdx.y + i * 8] + xres[o];
+        }
+    }
+}
+
+// ------------------------------------------- implicit GEMM conv3x3 (NHWC) ---
+// M = B*H*W (rows), N = out channels, K = C*9 with k = ((r*3+s)*C + c).
+__global__ __launch_bounds__(NTHREADS) void conv_gemm_kernel(
+        const float* __restrict__ A, const float* __restrict__ WT,
+        float* __restrict__ Y, int M, int H, int W, int C, int N) {
+    __shared__ __align__(16) float smem[BM * LDA + BK * LDB];
+    __shared__ int sh_b[BM], sh_oh[BM], sh_ow[BM];
+    float* As = smem;
+    float* Bs = smem + BM * LDA;
+
+    const int tid = threadIdx.x;
+    const int m0  = blockIdx.x * BM;
+    const int n0  = blockIdx.y * BN;
+    const int HW  = H * W;
+
+    for (int i = tid; i < BM; i += NTHREADS) {
+        int p = m0 + i;
+        if (p < M) {
+            int b   = p / HW;
+            int rem = p - b * HW;
+            int oh  = rem / W;
+            sh_b[i] = b; sh_oh[i] = oh; sh_ow[i] = rem - oh * W;
+        } else {
+            sh_b[i] = -1; sh_oh[i] = 0; sh_ow[i] = 0;
+        }
+    }
+
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.f);
+
+    const int warp = tid >> 5;
+    const int wm   = warp >> 1;
+    const int wn   = warp & 1;
+    const int arow = tid >> 3, avec = tid & 7;
+    const int brow = tid >> 4, bvec = tid & 15;
+
+    __syncthreads();
+
+    const int numK = C * 9;
+    for (int kt = 0; kt < numK; kt += BK) {
+        int rs = kt / C;
+        int c0 = kt - rs * C;
+        int r  = rs / 3;
+        int s  = rs - r * 3;
+
+        #pragma unroll
+        for (int pass = 0; pass < BM / 32; ++pass) {
+            int rowl = arow + pass * 32;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            int bb = sh_b[rowl];
+            if (bb >= 0) {
+                int ih = sh_oh[rowl] + r - 1;
+                int iw = sh_ow[rowl] + s - 1;
+                if ((unsigned)ih < (unsigned)H && (unsigned)iw < (unsigned)W) {
+                    const float* src = A + ((long)(bb * HW + ih * W + iw)) * C + c0 + avec * 4;
+                    v = *(const float4*)src;
+                }
+            }
+            *(float4*)&As[rowl * LDA + avec * 4] = v;
+        }
+        #pragma unroll
+        for (int pass = 0; pass < BK / 16; ++pass) {
+            int kl = brow + pass * 16;
+            float4 w = *(const float4*)(WT + (long)(kt + kl) * N + n0 + bvec * 4);
+            *(float4*)&Bs[kl * LDB + bvec * 4] = w;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < BK / 8; ++kk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> af[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                wmma::load_matrix_sync(af[i], As + (wm * 32 + i * 16) * LDA + kk * 8, LDA);
+                #pragma unroll
+                for (int t = 0; t < af[i].num_elements; ++t)
+                    af[i].x[t] = wmma::__float_to_tf32(af[i].x[t]);
+            }
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                wmma::load_matrix_sync(bf[j], Bs + (kk * 8) * LDB + wn * 32 + j * 16, LDB);
+                #pragma unroll
+                for (int t = 0; t < bf[j].num_elements; ++t)
+                    bf[j].x[t] = wmma::__float_to_tf32(bf[j].x[t]);
+            }
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j)
+                    wmma::mma_sync(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    // Y has ceil(M/BM)*BM rows, so full 16-row fragment stores are always legal.
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            int row = m0 + wm * 32 + i * 16;
+            int col = n0 + wn * 32 + j * 16;
+            wmma::store_matrix_sync(Y + (long)row * N + col, acc[i][j], N, wmma::mem_row_major);
+        }
+    }
+}
+
+// ------------------------------------------------------------ orchestrator ---
+static void run_stats(const float* y, float* psum, float* psq, float* mean, float* rstd,
+                      int B, int C, int HW, int G, int cpg, int nchunk, float eps,
+                      cudaStream_t stream) {
+    dim3 gp(nchunk, G, B);
+    gstats_partial<<<gp, 128, 0, stream>>>(y, psum, psq, HW, C, G, cpg, nchunk);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    gstats_final<<<B * G, 32, 0, stream>>>(psum, psq, mean, rstd, nchunk,
+                                           (float)((long)HW * cpg), eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor conv1_weight, torch::Tensor norm1_weight, torch::Tensor norm1_bias,
+                          torch::Tensor conv2_weight, torch::Tensor norm2_weight, torch::Tensor norm2_bias,
+                          double eps) {
+    TORCH_CHECK(x.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "float32 only");
+    TORCH_CHECK(x.dim() == 4, "NCHW expected");
+    TORCH_CHECK(conv1_weight.size(2) == 3 && conv1_weight.size(3) == 3, "3x3 conv only");
+
+    auto xc = x.is_contiguous()  ? x : x.contiguous();
+    auto w1 = conv1_weight.is_contiguous() ? conv1_weight : conv1_weight.contiguous();
+    auto w2 = conv2_weight.is_contiguous() ? conv2_weight : conv2_weight.contiguous();
+    auto g1 = norm1_weight.is_contiguous() ? norm1_weight : norm1_weight.contiguous();
+    auto b1 = norm1_bias.is_contiguous()   ? norm1_bias   : norm1_bias.contiguous();
+    auto g2 = norm2_weight.is_contiguous() ? norm2_weight : norm2_weight.contiguous();
+    auto b2 = norm2_bias.is_contiguous()   ? norm2_bias   : norm2_bias.contiguous();
+
+    const int B = (int)xc.size(0), C = (int)xc.size(1);
+    const int H = (int)xc.size(2), W = (int)xc.size(3);
+    const int HW = H * W;
+    const int G = 32;
+    const int cpg = C / G;
+    TORCH_CHECK(C % BN == 0 && C % BK == 0 && cpg % 4 == 0, "unsupported channel count");
+    const long Ml = (long)B * HW;
+    TORCH_CHECK(Ml < (1L << 30), "problem too large");
+    const int M = (int)Ml;
+    const int gridm = (M + BM - 1) / BM;
+    const long Mpad = (long)gridm * BM;
+
+    auto opts = xc.options();
+    auto xn  = torch::empty({Ml, (long)C}, opts);
+    auto y1  = torch::empty({Mpad, (long)C}, opts);
+    auto y2  = torch::empty({Mpad, (long)C}, opts);
+    auto wt1 = torch::empty({(long)C * 9, (long)C}, opts);
+    auto wt2 = torch::empty({(long)C * 9, (long)C}, opts);
+    auto out = torch::empty_like(xc);
+
+    int nchunk = HW / 2048; if (nchunk < 1) nchunk = 1; if (nchunk > 64) nchunk = 64;
+    auto psum  = torch::empty({(long)B * G * nchunk}, opts);
+    auto psq   = torch::empty({(long)B * G * nchunk}, opts);
+    auto mean1 = torch::empty({(long)B * G}, opts);
+    auto rstd1 = torch::empty({(long)B * G}, opts);
+    auto mean2 = torch::empty({(long)B * G}, opts);
+    auto rstd2 = torch::empty({(long)B * G}, opts);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int wtot = C * 9 * C;
+    wt_kernel<<<(wtot + 255) / 256, 256, 0, stream>>>(w1.data_ptr<float>(), wt1.data_ptr<float>(), C, C, wtot);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    wt_kernel<<<(wtot + 255) / 256, 256, 0, stream>>>(w2.data_ptr<float>(), wt2.data_ptr<float>(), C, C, wtot);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    dim3 tb(32, 8);
+    dim3 tg((HW + 31) / 32, (C + 31) / 32, B);
+    nchw2nhwc<<<tg, tb, 0, stream>>>(xc.data_ptr<float>(), xn.data_ptr<float>(), C, HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    dim3 cg(gridm, C / BN);
+    conv_gemm_kernel<<<cg, NTHREADS, 0, stream>>>(xn.data_ptr<float>(), wt1.data_ptr<float>(),
+                                                  y1.data_ptr<float>(), M, H, W, C, C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    run_stats(y1.data_ptr<float>(), psum.data_ptr<float>(), psq.data_ptr<float>(),
+              mean1.data_ptr<float>(), rstd1.data_ptr<float>(), B, C, HW, G, cpg, nchunk,
+              (float)eps, stream);
+
+    const long nvec4 = Ml * (long)C / 4;
+    norm_silu<<<(int)((nvec4 + 255) / 256), 256, 0, stream>>>(
+        y1.data_ptr<float>(), g1.data_ptr<float>(), b1.data_ptr<float>(),
+        mean1.data_ptr<float>(), rstd1.data_ptr<float>(), HW, C, G, cpg, nvec4);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    conv_gemm_kernel<<<cg, NTHREADS, 0, stream>>>(y1.data_ptr<float>(), wt2.data_ptr<float>(),
+                                                  y2.data_ptr<float>(), M, H, W, C, C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    run_stats(y2.data_ptr<float>(), psum.data_ptr<float>(), psq.data_ptr<float>(),
+              mean2.data_ptr<float>(), rstd2.data_ptr<float>(), B, C, HW, G, cpg, nchunk,
+              (float)eps, stream);
+
+    final_epilogue<<<tg, tb, 0, stream>>>(
+        y2.data_ptr<float>(), xc.data_ptr<float>(),
+        g2.data_ptr<float>(), b2.data_ptr<float>(),
+        mean2.data_ptr<float>(), rstd2.data_ptr<float>(),
+        out.data_ptr<float>(), C, HW, G, cpg);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+"""
+
+_CPP_SRC = r"""
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor conv1_weight, torch::Tensor norm1_weight, torch::Tensor norm1_bias,
+                          torch::Tensor conv2_weight, torch::Tensor norm2_weight, torch::Tensor norm2_bias,
+                          double eps);
+"""
+
+_ext = load_inline(
+    name="vae_resblock_implicit_gemm_d",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["fused_block"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_90,code=sm_90",
+    ],
+)
+
+_MAX_GRAPHS = 8
+_WARMUP_ITERS = 3
+
+
+class ModelNew(nn.Module):
+    """Full forward-level replacement of the SOL 002 residual block, with the
+    entire 11-kernel launch sequence captured into a CUDA graph per shape.
+
+    Stateless module (the reference has no parameters), so parameter parity is
+    trivially preserved: all weights arrive as forward arguments and are used
+    verbatim by the extension / copied into static capture buffers.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._ext = _ext
+        self._graphs = {}          # capture key -> (graph, static_x, [static_w], static_out)
+
+    # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _contig(t):
+        return t if t.is_contiguous() else t.contiguous()
+
+    @staticmethod
+    def _make_key(x, conv1_weight, eps):
+        dev = x.device.index if x.device.index is not None else -1
+        return (tuple(x.shape), x.dtype, dev, tuple(conv1_weight.shape), float(eps))
+
+    def _direct(self, x, w1, g1, b1, w2, g2, b2, eps):
+        return self._ext.fused_block(x, w1, g1, b1, w2, g2, b2, float(eps))
+
+    # ---------------------------------------------------------------- forward
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+
+        # Plan item 4: fallback guard — no graph path.
+        if (self.training or not x.is_cuda
+                or torch.cuda.is_current_stream_capturing()):
+            return self._direct(x, conv1_weight, norm1_weight, norm1_bias,
+                                conv2_weight, norm2_weight, norm2_bias, eps)
+
+        # Plan item 12: contiguity fixed up before any .copy_() / capture.
+        xc = self._contig(x)
+        args = [self._contig(t) for t in (conv1_weight, norm1_weight, norm1_bias,
+                                          conv2_weight, norm2_weight, norm2_bias)]
+
+        key = self._make_key(xc, args[0], eps)
+        entry = self._graphs.get(key)
+
+        # ------------------------------------------------------- replay path
+        if entry is not None:
+            g, sx, statics, static_out = entry
+            sx.copy_(xc)
+            for sbuf, t in zip(statics, args):
+                sbuf.copy_(t)
+            g.replay()
+            return static_out.clone()          # plan item 10
+
+        # ---------------------------------------------------- capture (miss)
+        # Plan item 13: cap the number of resident graphs.
+        if len(self._graphs) >= _MAX_GRAPHS:
+            return self._direct(xc, *args, eps)
+
+        try:
+            # Plan item 5: static buffers with frozen addresses.
+            sx = torch.empty_like(xc)
+            statics = [torch.empty_like(t) for t in args]
+            sx.copy_(xc)
+            for sbuf, t in zip(statics, args):
+                sbuf.copy_(t)
+
+            # Plan item 6: side-stream warmup (module load + allocator steady state).
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(_WARMUP_ITERS):
+                    _ = self._ext.fused_block(sx, statics[0], statics[1], statics[2],
+                                              statics[3], statics[4], statics[5], float(eps))
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+
+            # Plan item 7: capture; internal torch::empty scratch goes to the
+            # graph-private pool (no explicit shared pool= argument).
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                static_out = self._ext.fused_block(sx, statics[0], statics[1], statics[2],
+                                                   statics[3], statics[4], statics[5], float(eps))
+
+            # Ensure the captured graph has produced valid contents once.
+            g.replay()
+            torch.cuda.synchronize()
+
+            # Plan item 8: memoize.
+            self._graphs[key] = (g, sx, statics, static_out)
+            return static_out.clone()          # plan item 10
+
+        except Exception:
+            # Any capture failure -> permanent direct path for safety.
+            self._graphs.pop(key, None)
+            return self._direct(xc, *args, eps)
+```

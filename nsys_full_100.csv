@@ -1,0 +1,15 @@
+Kernel Name,kernel_launch_count,time_pct,total_time_ns
+sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x128x32_warpgroupsize1x1x…,28,41.9,7950795.0
+sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x64x32_warpgroupsize1x1x1_…,2,4.5,861551.0
+"gn_silu_res_nchw_v4_kernel(const float *, const float *, float *, const float *, const float *, con…",12,8.0,1511320.0
+"gn_stats_kernel(const float *, float *, int, int, int)",24,6.1,1150904.0
+"nchw2nhwc_kernel(const float *, float *, int, int)",12,5.6,1072151.0
+"gn_silu_nhwc_inplace(float *, const float *, const float *, const float *, const float *, int)",12,5.0,947436.0
+sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize128x64x32_warpgroupsize1x1x1…,2,4.2,802414.0
+sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x192x32_warpgroupsize1x1x1…,2,4.1,777068.0
+sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize256x128x32_warpgroupsize2x1x…,2,3.6,678124.0
+sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x128x32_warpgroupsize1x1x1…,2,3.2,599242.0
+sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x256x32_warpgroupsize1x1x1…,2,2.9,555786.0
+"void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…",24,0.9,163328.0
+"gn_finalize_kernel(const float *, float *, float *, int, double, double)",24,0.4,76352.0
+void cask_plugin__5x_cudnn::xmma__5x_cudnn::init_device_workspace_kernel<xmma__5x_cudnn::implicit_g…,6,0.1,14752.0

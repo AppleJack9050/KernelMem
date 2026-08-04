@@ -1,0 +1,701 @@
+```python
+# ==========================================================================
+# ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# HEADER (required):
+#  1) GRANULARITY: (D) fully rewrite forward.
+#  2) OPS REPLACED: everything. Both F.conv2d 3x3 calls are implemented by my
+#     own NHWC implicit-GEMM CUDA kernel using Hopper TF32 tensor cores
+#     (mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32, fp32 accumulate).
+#     No cuDNN / at::conv2d / cublas anywhere. Both F.group_norm, both F.silu
+#     and the residual add are my kernels too.
+#  3) FUSION MAP:
+#       K0 nchw2nhwc_kernel     : layout conversion NCHW->NHWC (replaces the
+#                                 4 cudnn nchwToNhwc/nhwcToNchw kernels; only
+#                                 2 of them survive, at the very ends).
+#       Kw wtrans_kernel        : weights [Co][Ci][3][3] -> implicit-GEMM
+#                                 B-matrix [9*Ci][Co] (done once per forward).
+#       K1 conv_kernel          : conv1 implicit GEMM. EPILOGUE FUSES the
+#                                 GroupNorm sum / sum-of-squares reduction over
+#                                 each (image, group) directly from the
+#                                 accumulator registers -> deletes an entire
+#                                 read pass of the conv output (the reference's
+#                                 RowwiseMomentsCUDAKernel).
+#       K2 gn_stats_kernel      : deterministic tree-reduce of the per-block
+#                                 partials -> per-(n,c) scale/shift.
+#       K3 norm_silu_kernel     : applies norm1+SiLU in place on the NHWC temp.
+#                                 Kept as its own pass on purpose: folding it
+#                                 into conv2's A-prologue would re-evaluate
+#                                 exp() 18x per element (9 taps x 2 channel
+#                                 tiles) and is SFU-bound, strictly worse.
+#       K1 conv_kernel (again)  : conv2 implicit GEMM + fused moment epilogue.
+#       K4 final_kernel         : norm2 + SiLU + residual add + NHWC->NCHW
+#                                 transpose, all in ONE pass (fuses 3 reference
+#                                 elementwise kernels + 1 layout kernel).
+#  4) WHAT REMAINS IN PYTORCH: only tensor allocation. No ATen math op is on
+#     the critical path; forward is 9 kernel launches from my extension.
+#
+#  Precision: fp32 storage everywhere, TF32 tensor cores for the two convs
+#  (the reference runs cudnn with allow_tf32=True, so this matches baseline),
+#  fp32 MMA accumulation, fp64 for the final GroupNorm moment reduction.
+#  Tiling: BM=64 pixels x BN=128 out-channels x BK=32 channels, 4 warps,
+#  warp tile 32x64 = 2x8 mma.m16n8k8 fragments.
+# ==========================================================================
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_src = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+
+#define BM 64
+#define BN 128
+#define BK 32
+#define THREADS 128
+
+__device__ __forceinline__ float tf32_round(float x) {
+    unsigned r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+    return __uint_as_float(r);
+}
+
+#define MMA_M16N8K8(d0,d1,d2,d3,a0,a1,a2,a3,b0,b1)                              \
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "          \
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"      \
+                 : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)                       \
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
+
+// ---------------------------------------------------------------- layout ---
+__global__ void nchw2nhwc_kernel(const float* __restrict__ x,
+                                 float* __restrict__ y,
+                                 int C, int P) {
+    __shared__ float s[32][33];
+    const int p0 = blockIdx.x * 32;
+    const int c0 = blockIdx.y * 32;
+    const int n  = blockIdx.z;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    #pragma unroll
+    for (int i = 0; i < 32; i += 8) {
+        int cc = i + ty;
+        int p  = p0 + tx;
+        float v = 0.f;
+        if (p < P) v = x[((size_t)n * C + (c0 + cc)) * P + p];
+        s[cc][tx] = v;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < 32; i += 8) {
+        int pp = i + ty;
+        int p  = p0 + pp;
+        if (p < P) y[((size_t)n * P + p) * C + c0 + tx] = s[tx][pp];
+    }
+}
+
+// ------------------------------------------------------- weight -> B mat ---
+__global__ void wtrans_kernel(const float* __restrict__ w,
+                              float* __restrict__ B, int C) {
+    const int ci = blockIdx.x;
+    const int co = threadIdx.x;
+    const float* src = w + ((size_t)co * C + ci) * 9;
+    #pragma unroll
+    for (int rs = 0; rs < 9; ++rs)
+        B[((size_t)rs * C + ci) * C + co] = src[rs];
+}
+
+// ------------------------------------- implicit GEMM conv + moment epilogue -
+__global__ __launch_bounds__(THREADS, 4)
+void conv_kernel(const float* __restrict__ A,      // NHWC  [N][P][C]
+                 const float* __restrict__ Bmat,   // [9*C][C]
+                 float* __restrict__ out,          // NHWC  [N][P][C]
+                 float* __restrict__ psum,         // [N][32][nPtile]
+                 float* __restrict__ psq,
+                 int H, int W, int P, int C, int nPtile) {
+    const int ptile = blockIdx.x;
+    const int ntile = blockIdx.y;
+    const int n     = blockIdx.z;
+    const int nc0   = ntile * BN;
+
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid  = tid >> 5;
+    const int warp_m = wid & 1;
+    const int warp_n = wid >> 1;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+
+    __shared__ float As[BM][BK + 4];
+    __shared__ float Bs[BK][BN + 8];
+    __shared__ float sS[2][16];
+    __shared__ float sQ[2][16];
+
+    float acc[2][8][4];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) acc[i][j][k] = 0.f;
+
+    const int arow0 = tid >> 3;          // 0..15
+    const int acol4 = (tid & 7) * 4;     // 0,4,...,28
+    int ph[4], pw[4];
+    bool pv[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int p = ptile * BM + arow0 + i * 16;
+        pv[i] = (p < P);
+        int pp = pv[i] ? p : 0;
+        ph[i] = pp / W;
+        pw[i] = pp - ph[i] * W;
+    }
+    const int brow0 = tid >> 5;          // 0..3
+    const int bcol4 = (tid & 31) * 4;    // 0..124
+
+    const float* Aim = A + (size_t)n * P * C;
+
+    for (int kc = 0; kc < C / BK; ++kc) {
+        for (int rs = 0; rs < 9; ++rs) {
+            const int r = rs / 3;
+            const int s = rs - r * 3;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int ih = ph[i] + r - 1;
+                int iw = pw[i] + s - 1;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (pv[i] && ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                    v = *reinterpret_cast<const float4*>(
+                        Aim + ((size_t)ih * W + iw) * C + kc * BK + acol4);
+                }
+                int row = arow0 + i * 16;
+                As[row][acol4 + 0] = tf32_round(v.x);
+                As[row][acol4 + 1] = tf32_round(v.y);
+                As[row][acol4 + 2] = tf32_round(v.z);
+                As[row][acol4 + 3] = tf32_round(v.w);
+            }
+            const int k0 = rs * C + kc * BK;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int row = brow0 + i * 4;
+                float4 v = *reinterpret_cast<const float4*>(
+                    Bmat + (size_t)(k0 + row) * C + nc0 + bcol4);
+                Bs[row][bcol4 + 0] = tf32_round(v.x);
+                Bs[row][bcol4 + 1] = tf32_round(v.y);
+                Bs[row][bcol4 + 2] = tf32_round(v.z);
+                Bs[row][bcol4 + 3] = tf32_round(v.w);
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                unsigned af[2][4], bf[8][2];
+                #pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    int mrow = warp_m * 32 + mt * 16 + g;
+                    af[mt][0] = __float_as_uint(As[mrow    ][kk * 8 + t    ]);
+                    af[mt][1] = __float_as_uint(As[mrow + 8][kk * 8 + t    ]);
+                    af[mt][2] = __float_as_uint(As[mrow    ][kk * 8 + t + 4]);
+                    af[mt][3] = __float_as_uint(As[mrow + 8][kk * 8 + t + 4]);
+                }
+                #pragma unroll
+                for (int nt = 0; nt < 8; ++nt) {
+                    int ncol = warp_n * 64 + nt * 8 + g;
+                    bf[nt][0] = __float_as_uint(Bs[kk * 8 + t    ][ncol]);
+                    bf[nt][1] = __float_as_uint(Bs[kk * 8 + t + 4][ncol]);
+                }
+                #pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    #pragma unroll
+                    for (int nt = 0; nt < 8; ++nt) {
+                        MMA_M16N8K8(acc[mt][nt][0], acc[mt][nt][1],
+                                    acc[mt][nt][2], acc[mt][nt][3],
+                                    af[mt][0], af[mt][1], af[mt][2], af[mt][3],
+                                    bf[nt][0], bf[nt][1]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // ---- epilogue: store NHWC + fused GroupNorm moments -------------------
+    float gs[8], gq[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) { gs[i] = 0.f; gq[i] = 0.f; }
+
+    const int mbase = ptile * BM + warp_m * 32;
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        int mA = mbase + mt * 16 + g;
+        int mB = mA + 8;
+        bool okA = (mA < P), okB = (mB < P);
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            int ch = nc0 + warp_n * 64 + nt * 8 + 2 * t;
+            if (okA) {
+                float2 v;
+                v.x = ac
+```python
+# ==========================================================================
+# ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# 1) GRANULARITY: (D) fully rewrite forward.
+# 2) OPS REPLACED: everything. Both F.conv2d 3x3 are my own NHWC implicit-GEMM
+#    CUDA kernel on Hopper TF32 tensor cores (mma.sync.m16n8k8.tf32, fp32 acc).
+#    No cuDNN / at::conv2d / cuBLAS. Both group_norm, both SiLU, the residual
+#    add and all layout changes are my kernels.
+# 3) FUSION MAP:
+#      nchw2nhwc_kernel : NCHW->NHWC once (kills 4 cudnn transpose kernels, 2 left)
+#      wtrans_kernel    : W[Co][Ci][3][3] -> B[9*Ci][Co] implicit-GEMM operand
+#      conv_kernel      : implicit GEMM; EPILOGUE fuses the GroupNorm
+#                         sum / sum-of-squares straight out of the accumulator
+#                         registers -> deletes a whole read pass of the conv
+#                         output (reference RowwiseMomentsCUDAKernel)
+#      gn_stats_kernel  : deterministic tree reduce of per-block partials (fp64)
+#                         -> per-(n,c) scale/shift
+#      norm_silu_kernel : norm1+SiLU in place on the NHWC temp. Deliberately its
+#                         own pass: folding into conv2's A-prologue would
+#                         re-evaluate exp() 18x per element (9 taps x 2 n-tiles).
+#      final_kernel     : norm2 + SiLU + residual + NHWC->NCHW in ONE pass
+#                         (fuses 3 elementwise kernels + 1 layout kernel)
+# 4) LEFT IN PYTORCH: only buffer allocation; no ATen math on the critical path.
+#    fp32 storage/accumulate throughout; TF32 tensor cores for the convs (the
+#    reference cudnn path runs TF32 too); fp64 only for moment reduction.
+#    Tiles: BM=64 px x BN=128 ch x BK=32, 4 warps, warp tile 32x64 = 2x8 mma.
+# ==========================================================================
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_src = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+
+#define BM 64
+#define BN 128
+#define BK 32
+#define THREADS 128
+
+__device__ __forceinline__ float tf32_round(float x) {
+    unsigned r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+    return __uint_as_float(r);
+}
+
+#define MMA(d0,d1,d2,d3,a0,a1,a2,a3,b0,b1)                                 \
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "     \
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
+                 : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)                  \
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
+
+__global__ void nchw2nhwc_kernel(const float* __restrict__ x,
+                                 float* __restrict__ y, int C, int P) {
+    __shared__ float s[32][33];
+    const int p0 = blockIdx.x * 32, c0 = blockIdx.y * 32, n = blockIdx.z;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    #pragma unroll
+    for (int i = 0; i < 32; i += 8) {
+        int cc = i + ty, p = p0 + tx;
+        float v = 0.f;
+        if (p < P) v = x[((size_t)n * C + (c0 + cc)) * P + p];
+        s[cc][tx] = v;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < 32; i += 8) {
+        int pp = i + ty, p = p0 + pp;
+        if (p < P) y[((size_t)n * P + p) * C + c0 + tx] = s[tx][pp];
+    }
+}
+
+__global__ void wtrans_kernel(const float* __restrict__ w,
+                              float* __restrict__ B, int C) {
+    const int ci = blockIdx.x, co = threadIdx.x;
+    const float* src = w + ((size_t)co * C + ci) * 9;
+    #pragma unroll
+    for (int rs = 0; rs < 9; ++rs)
+        B[((size_t)rs * C + ci) * C + co] = src[rs];
+}
+
+__global__ __launch_bounds__(THREADS, 4)
+void conv_kernel(const float* __restrict__ A, const float* __restrict__ Bmat,
+                 float* __restrict__ out, float* __restrict__ psum,
+                 float* __restrict__ psq,
+                 int H, int W, int P, int C, int nPtile) {
+    const int ptile = blockIdx.x, ntile = blockIdx.y, n = blockIdx.z;
+    const int nc0 = ntile * BN;
+    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    const int warp_m = wid & 1, warp_n = wid >> 1;
+    const int g = lane >> 2, t = lane & 3;
+
+    __shared__ float As[BM][BK + 4];
+    __shared__ float Bs[BK][BN + 8];
+    __shared__ float sS[2][16];
+    __shared__ float sQ[2][16];
+
+    float acc[2][8][4];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) acc[i][j][k] = 0.f;
+
+    const int arow0 = tid >> 3;
+    const int acol4 = (tid & 7) * 4;
+    int ph[4], pw[4];
+    bool pv[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int p = ptile * BM + arow0 + i * 16;
+        pv[i] = (p < P);
+        int pp = pv[i] ? p : 0;
+        ph[i] = pp / W;
+        pw[i] = pp - ph[i] * W;
+    }
+    const int brow0 = tid >> 5;
+    const int bcol4 = (tid & 31) * 4;
+    const float* Aim = A + (size_t)n * P * C;
+
+    for (int kc = 0; kc < C / BK; ++kc) {
+        for (int rs = 0; rs < 9; ++rs) {
+            const int r = rs / 3, s = rs - r * 3;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int ih = ph[i] + r - 1, iw = pw[i] + s - 1;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (pv[i] && ih >= 0 && ih < H && iw >= 0 && iw < W)
+                    v = *reinterpret_cast<const float4*>(
+                        Aim + ((size_t)ih * W + iw) * C + kc * BK + acol4);
+                int row = arow0 + i * 16;
+                As[row][acol4 + 0] = tf32_round(v.x);
+                As[row][acol4 + 1] = tf32_round(v.y);
+                As[row][acol4 + 2] = tf32_round(v.z);
+                As[row][acol4 + 3] = tf32_round(v.w);
+            }
+            const int k0 = rs * C + kc * BK;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int row = brow0 + i * 4;
+                float4 v = *reinterpret_cast<const float4*>(
+                    Bmat + (size_t)(k0 + row) * C + nc0 + bcol4);
+                Bs[row][bcol4 + 0] = tf32_round(v.x);
+                Bs[row][bcol4 + 1] = tf32_round(v.y);
+                Bs[row][bcol4 + 2] = tf32_round(v.z);
+                Bs[row][bcol4 + 3] = tf32_round(v.w);
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                unsigned af[2][4], bf[8][2];
+                #pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    int mr = warp_m * 32 + mt * 16 + g;
+                    af[mt][0] = __float_as_uint(As[mr    ][kk * 8 + t]);
+                    af[mt][1] = __float_as_uint(As[mr + 8][kk * 8 + t]);
+                    af[mt][2] = __float_as_uint(As[mr    ][kk * 8 + t + 4]);
+                    af[mt][3] = __float_as_uint(As[mr + 8][kk * 8 + t + 4]);
+                }
+                #pragma unroll
+                for (int nt = 0; nt < 8; ++nt) {
+                    int nco = warp_n * 64 + nt * 8 + g;
+                    bf[nt][0] = __float_as_uint(Bs[kk * 8 + t    ][nco]);
+                    bf[nt][1] = __float_as_uint(Bs[kk * 8 + t + 4][nco]);
+                }
+                #pragma unroll
+                for (int mt = 0; mt < 2; ++mt)
+                    #pragma unroll
+                    for (int nt = 0; nt < 8; ++nt)
+                        MMA(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2],
+                            acc[mt][nt][3], af[mt][0], af[mt][1], af[mt][2],
+                            af[mt][3], bf[nt][0], bf[nt][1]);
+            }
+            __syncthreads();
+        }
+    }
+
+    float gs[8], gq[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) { gs[i] = 0.f; gq[i] = 0.f; }
+
+    const int mbase = ptile * BM + warp_m * 32;
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        int mA = mbase + mt * 16 + g;
+        int mB = mA + 8;
+        bool okA = (mA < P), okB = (mB < P);
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            int ch = nc0 + warp_n * 64 + nt * 8 + 2 * t;
+            if (okA) {
+                float2 v;
+                v.x = acc[mt][nt][0];
+                v.y = acc[mt][nt][1];
+                *reinterpret_cast<float2*>(out + ((size_t)n * P + mA) * C + ch) = v;
+                gs[nt] += v.x + v.y;
+                gq[nt] += v.x * v.x + v.y * v.y;
+            }
+            if (okB) {
+                float2 v;
+                v.x = acc[mt][nt][2];
+                v.y = acc[mt][nt][3];
+                *reinterpret_cast<float2*>(out + ((size_t)n * P + mB) * C + ch) = v;
+                gs[nt] += v.x + v.y;
+                gq[nt] += v.x * v.x + v.y * v.y;
+            }
+        }
+    }
+    #pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        float a = gs[nt], b = gq[nt];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a += __shfl_down_sync(0xffffffffu, a, off);
+            b += __shfl_down_sync(0xffffffffu, b, off);
+        }
+        if (lane == 0) {
+            sS[warp_m][warp_n * 8 + nt] = a;
+            sQ[warp_m][warp_n * 8 + nt] = b;
+        }
+    }
+    __syncthreads();
+    if (tid < 16) {
+        int gg = ntile * 16 + tid;
+        size_t o = ((size_t)n * 32 + gg) * nPtile + ptile;
+        psum[o] = sS[0][tid] + sS[1][tid];
+        psq[o]  = sQ[0][tid] + sQ[1][tid];
+    }
+}
+
+__global__ void gn_stats_kernel(const float* __restrict__ psum,
+                                const float* __restrict__ psq,
+                                const float* __restrict__ gamma,
+                                const float* __restrict__ beta,
+                                float* __restrict__ scale,
+                                float* __restrict__ shift,
+                                int nPtile, double cnt, double eps, int C) {
+    __shared__ double ss[256], sq[256];
+    const int idx = blockIdx.x;
+    const int n = idx >> 5, gg = idx & 31;
+    double a = 0.0, b = 0.0;
+    for (int i = threadIdx.x; i < nPtile; i += blockDim.x) {
+        a += (double)psum[(size_t)idx * nPtile + i];
+        b += (double)psq[(size_t)idx * nPtile + i];
+    }
+    ss[threadIdx.x] = a;
+    sq[threadIdx.x] = b;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) {
+            ss[threadIdx.x] += ss[threadIdx.x + s];
+            sq[threadIdx.x] += sq[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x < 8) {
+        double mean = ss[0] / cnt;
+        double var  = sq[0] / cnt - mean * mean;
+        if (var < 0.0) var = 0.0;
+        double rstd = 1.0 / sqrt(var + eps);
+        int ch = gg * 8 + threadIdx.x;
+        double gm = (double)gamma[ch], bt = (double)beta[ch];
+        scale[n * C + ch] = (float)(rstd * gm);
+        shift[n * C + ch] = (float)(bt - mean * rstd * gm);
+    }
+}
+
+__global__ void norm_silu_kernel(float* __restrict__ o,
+                                 const float* __restrict__ sc,
+                                 const float* __restrict__ sh,
+                                 int C, size_t PC4) {
+    const int n = blockIdx.y;
+    float* base = o + (size_t)n * PC4 * 4;
+    const float* scn = sc + (size_t)n * C;
+    const float* shn = sh + (size_t)n * C;
+    const int cmask = C - 1;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < PC4;
+         i += (size_t)gridDim.x * blockDim.x) {
+        float4 v = reinterpret_cast<float4*>(base)[i];
+        int c0 = (int)((i * 4) & (size_t)cmask);
+        float4 a = *reinterpret_cast<const float4*>(scn + c0);
+        float4 b = *reinterpret_cast<const float4*>(shn + c0);
+        float x0 = v.x * a.x + b.x, x1 = v.y * a.y + b.y;
+        float x2 = v.z * a.z + b.z, x3 = v.w * a.w + b.w;
+        v.x = x0 / (1.f + expf(-x0));
+        v.y = x1 / (1.f + expf(-x1));
+        v.z = x2 / (1.f + expf(-x2));
+        v.w = x3 / (1.f + expf(-x3));
+        reinterpret_cast<float4*>(base)[i] = v;
+    }
+}
+
+__global__ void final_kernel(const float* __restrict__ o2,
+                             const float* __restrict__ sc,
+                             const float* __restrict__ sh,
+                             const float* __restrict__ resid,
+                             float* __restrict__ y, int C, int P) {
+    __shared__ float s[32][33];
+    const int p0 = blockIdx.x * 32, c0 = blockIdx.y * 32, n = blockIdx.z;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int ch = c0 + tx;
+    const float a = sc[n * C + ch], b = sh[n * C + ch];
+    #pragma unroll
+    for (int i = 0; i < 32; i += 8) {
+        int pp = i + ty, p = p0 + pp;
+        float v = 0.f;
+        if (p < P) {
+            float u = o2[((size_t)n * P + p) * C + ch] * a + b;
+            v = u / (1.f + expf(-u));
+        }
+        s[pp][tx] = v;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < 32; i += 8) {
+        int cc = i + ty, p = p0 + tx;
+        if (p < P) {
+            size_t o = ((size_t)n * C + (c0 + cc)) * P + p;
+            y[o] = s[tx][cc] + resid[o];
+        }
+    }
+}
+
+static void launch_conv(const float* A, const float* B, float* out, float* ps,
+                        float* pq, int N, int H, int W, int P, int C,
+                        int nPtile, cudaStream_t st) {
+    dim3 grid(nPtile, C / BN, N);
+    conv_kernel<<<grid, THREADS, 0, st>>>(A, B, out, ps, pq, H, W, P, C, nPtile);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fused_block(torch::Tensor x, torch::Tensor w1, torch::Tensor g1,
+                          torch::Tensor b1, torch::Tensor w2, torch::Tensor g2,
+                          torch::Tensor b2, double eps) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat, "fp32 cuda only");
+    TORCH_CHECK(x.dim() == 4, "NCHW expected");
+    auto xc = x.is_contiguous() ? x : x.contiguous();
+    auto w1c = w1.is_contiguous() ? w1 : w1.contiguous();
+    auto w2c = w2.is_contiguous() ? w2 : w2.contiguous();
+    auto g1c = g1.is_contiguous() ? g1 : g1.contiguous();
+    auto b1c = b1.is_contiguous() ? b1 : b1.contiguous();
+    auto g2c = g2.is_contiguous() ? g2 : g2.contiguous();
+    auto b2c = b2.is_contiguous() ? b2 : b2.contiguous();
+
+    const int N = (int)xc.size(0), C = (int)xc.size(1);
+    const int H = (int)xc.size(2), W = (int)xc.size(3);
+    const int P = H * W;
+    TORCH_CHECK(C == 256, "kernel specialised for C=256 (32 groups of 8)");
+
+    auto opts = xc.options();
+    auto stream = at::cuda::getDefaultCUDAStream();
+
+    auto xn  = torch::empty({N, P, C}, opts);
+    auto t1  = torch::empty({N, P, C}, opts);
+    auto t2  = torch::empty({N, P, C}, opts);
+    auto Bm1 = torch::empty({9 * C, C}, opts);
+    auto Bm2 = torch::empty({9 * C, C}, opts);
+
+    const int nPtile = (P + BM - 1) / BM;
+    auto ps = torch::empty({N, 32, nPtile}, opts);
+    auto pq = torch::empty({N, 32, nPtile}, opts);
+    auto sc1 = torch::empty({N, C}, opts);
+    auto sh1 = torch::empty({N, C}, opts);
+    auto sc2 = torch::empty({N, C}, opts);
+    auto sh2 = torch::empty({N, C}, opts);
+    auto y = torch::empty({N, C, H, W}, opts);
+
+    wtrans_kernel<<<C, C, 0, stream>>>(w1c.data_ptr<float>(),
+                                       Bm1.data_ptr<float>(), C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    wtrans_kernel<<<C, C, 0, stream>>>(w2c.data_ptr<float>(),
+                                       Bm2.data_ptr<float>(), C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    dim3 tgrid((P + 31) / 32, C / 32, N);
+    dim3 tblk(32, 8);
+    nchw2nhwc_kernel<<<tgrid, tblk, 0, stream>>>(xc.data_ptr<float>(),
+                                                 xn.data_ptr<float>(), C, P);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const double cnt = (double)8.0 * (double)P;
+
+    launch_conv(xn.data_ptr<float>(), Bm1.data_ptr<float>(),
+                t1.data_ptr<float>(), ps.data_ptr<float>(),
+                pq.data_ptr<float>(), N, H, W, P, C, nPtile, stream);
+    gn_stats_kernel<<<N * 32, 256, 0, stream>>>(
+        ps.data_ptr<float>(), pq.data_ptr<float>(), g1c.data_ptr<float>(),
+        b1c.data_ptr<float>(), sc1.data_ptr<float>(), sh1.data_ptr<float>(),
+        nPtile, cnt, eps, C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const size_t PC4 = (size_t)P * (size_t)C / 4;
+    int nblk = (int)((PC4 + 255) / 256);
+    if (nblk > 4096) nblk = 4096;
+    dim3 ngrid(nblk, N);
+    norm_silu_kernel<<<ngrid, 256, 0, stream>>>(
+        t1.data_ptr<float>(), sc1.data_ptr<float>(), sh1.data_ptr<float>(),
+        C, PC4);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    launch_conv(t1.data_ptr<float>(), Bm2.data_ptr<float>(),
+                t2.data_ptr<float>(), ps.data_ptr<float>(),
+                pq.data_ptr<float>(), N, H, W, P, C, nPtile, stream);
+    gn_stats_kernel<<<N * 32, 256, 0, stream>>>(
+        ps.data_ptr<float>(), pq.data_ptr<float>(), g2c.data_ptr<float>(),
+        b2c.data_ptr<float>(), sc2.data_ptr<float>(), sh2.data_ptr<float>(),
+        nPtile, cnt, eps, C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    final_kernel<<<tgrid, tblk, 0, stream>>>(
+        t2.data_ptr<float>(), sc2.data_ptr<float>(), sh2.data_ptr<float>(),
+        xc.data_ptr<float>(), y.data_ptr<float>(), C, P);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return y;
+}
+'''
+
+cpp_src = (
+    "torch::Tensor fused_block(torch::Tensor x, torch::Tensor w1, "
+    "torch::Tensor g1, torch::Tensor b1, torch::Tensor w2, torch::Tensor g2, "
+    "torch::Tensor b2, double eps);"
+)
+
+_ext = load_inline(
+    name="vae_resblock_tf32_implicit_gemm",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["fused_block"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_ldflags=[""],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_90,code=sm_90",
+    ],
+)
+
+
+class ModelNew(nn.Module):
+    """Stateless SOL reference replacement (granularity D, see header)."""
+
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+
+    @torch.no_grad()
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        return self.ext.fused_block(x, conv1_weight, norm1_weight, norm1_bias,
+                                    conv2_weight, norm2_weight, norm2_bias,
+                                    float(eps))
+```

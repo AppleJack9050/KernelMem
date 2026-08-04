@@ -19,10 +19,12 @@ python -m prompts.build_prompt KernelBench/level1/19_ReLU.py \
 
 import argparse
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from string import Template
 from textwrap import dedent
+from typing import List
 
 ROOT = Path(__file__).resolve().parents[1]  # project root
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"  # GPU spec table
@@ -157,7 +159,7 @@ Always include:
 - "--expt-relaxed-constexpr"
 - "-lineinfo"
 - "$gencode_flag" (this is the target architecture of the GPU you are compiling for; do not substitute another one)
-
+$cutlass_block
 Here are examples to show you the syntax of inline embedding custom CUDA operators in torch:
 $few_shot_examples
 
@@ -189,6 +191,63 @@ output the code within:
 # ---------------------------------------------------------------------------
 # GPU spec loader
 # ---------------------------------------------------------------------------
+
+
+def _cutlass_include_dir() -> str | None:
+    """Path to CUTLASS/CuTe C++ headers, or None when they are not installed.
+
+    Located rather than hardcoded so the block below disappears on a machine
+    without CUTLASS instead of telling the model to add an -I flag that makes
+    every kernel fail to compile. Override with CUTLASS_INCLUDE_DIR.
+    """
+    import importlib.util
+    cands: List[Path] = []
+    env = os.environ.get("CUTLASS_INCLUDE_DIR")
+    if env:
+        cands.append(Path(env))
+    try:                                    # pip install nvidia-cutlass
+        spec = importlib.util.find_spec("cutlass_library")
+        if spec and spec.origin:
+            cands.append(Path(spec.origin).parent / "source" / "include")
+    except Exception:
+        pass
+    try:                                    # flashinfer vendors a copy
+        spec = importlib.util.find_spec("flashinfer")
+        if spec and spec.origin:
+            cands.append(Path(spec.origin).parent / "data" / "cutlass" / "include")
+    except Exception:
+        pass
+    cands.append(Path("/usr/local/cuda/include"))
+    for c in cands:
+        try:
+            if (c / "cutlass" / "cutlass.h").is_file() and (c / "cute" / "tensor.hpp").is_file():
+                return str(c)
+        except OSError:
+            continue
+    return None
+
+
+def _cutlass_block() -> str:
+    """Guidance emitted only when CUTLASS headers are actually present."""
+    inc = _cutlass_include_dir()
+    if not inc:
+        return ""
+    return "\n".join([
+        "",
+        "CUTLASS / CuTe IS AVAILABLE (headers verified to compile in this environment)",
+        f'- Add "-I{inc}" to extra_cuda_cflags and you may #include <cutlass/...>',
+        "  and <cute/tensor.hpp>. Verified with -std=c++20 and the gencode flag above.",
+        "- PREFER IT OVER HAND-WRITTEN wgmma PTX when you own a GEMM/conv. Hopper",
+        "  warpgroup MMA needs shared-memory descriptors with specific swizzle layouts and",
+        "  correct wgmma.fence / commit_group / wait_group ordering; those are what",
+        "  hand-written warpgroup code gets wrong, and CUTLASS already encodes them.",
+        "  cute::tiled_mma / the SM90 collective builders reach the same instructions the",
+        "  vendor kernels use.",
+        "- COST: a CUTLASS include adds roughly 50s to the build. Worth it when you are",
+        "  replacing a vendor GEMM/conv; not worth it for an elementwise or reduction",
+        "  kernel, where plain CUDA compiles in a few seconds and is just as fast.",
+        "",
+    ])
 
 
 def _detect_gencode_flag() -> str:  # noqa: D401
@@ -296,6 +355,7 @@ def build_seed_prompt(
         arch_src=arch_src,
         kernel_src=kernel_src,
         gencode_flag=gencode_flag,
+        cutlass_block=_cutlass_block(),
         reference_profile=profile_block,
         granularity_mandate=_granularity_mandate(force_granularity, force_algorithm),
     )
@@ -324,8 +384,8 @@ _ALGORITHM_MANDATE = {
         "  shared memory and never write them to global memory. The transform domain is",
         "  4x the size of the tensor (16 values per 2x2 output tile), so materializing it",
         "  costs roughly 4x tensor traffic and gives back the whole 2.25x. This is",
-        "  measured, not theoretical: cuDNN's WINOGRAD_NONFUSED algorithm scored 1.1581",
-        "  on this task against 1.2039 for the implicit-GEMM path it replaced -- it LOST,",
+        "  measured, not theoretical: on a 3x3 stride-1 fp32 conv block, cuDNN's",
+        "  WINOGRAD_NONFUSED algorithm lost to the implicit-GEMM path it replaced,",
         "  and it lost precisely because it materializes the transforms.",
         "- Use F(2x2,3x3) ONLY. Its transform entries are 0, +/-1, +/-1/2, all exactly",
         "  representable in binary floating point, so the transforms add no representation",
@@ -365,8 +425,21 @@ def _granularity_mandate(level: str | None, algorithm: str | None = None) -> str
             "- Correctness still governs: the reference uses TF32 tensor cores with fp32 accumulate.",
             "  Reduced-precision accumulation that breaks the tolerance is a failed kernel, not a",
             "  fast one.",
+            "- INSTRUCTION CHOICE MATTERS AS MUCH AS THE ALGORITHM. On sm_90 the vendor",
+            "  kernels issue Hopper warpgroup MMA (wgmma, e.g. m64n128k8 = 65,536 MACs per",
+            "  instruction, one warpgroup of 4 warps per tile). wmma m16n16k8 compiles to",
+            "  mma.m16n8k4 = 512 MACs per instruction -- 128x less work issued per slot. A",
+            "  kernel built on wmma therefore has to issue ~14x MORE tensor instructions than",
+            "  the vendor even when its algorithm does 2.25x LESS arithmetic, and it becomes",
+            "  issue-bound long before it becomes memory-bound. Such a kernel has been",
+            "  measured idling DRAM at ~1.5% while running 11x slower than the vendor, at",
+            "  HIGHER occupancy than the vendor (24.7% vs 18.2%) -- so occupancy is not the",
+            "  lever. If you intend to beat a vendor GEMM/conv rather than merely fuse",
+            "  around it, size the MMA tile first: raising occupancy or cutting redundant loads",
+            "  cannot recover a 128x deficit in work-per-instruction.",
             "- SCOPE OF THIS SEED: a correct, sound structure beats a fast one here. ONE",
-            "  straightforward tiled implicit-GEMM (shared-memory tiling, mma/wmma or plain FMA)",
+            "  straightforward tiled implicit-GEMM (shared-memory tiling; wgmma if you own a",
+            "  GEMM/conv you mean to beat, otherwise mma/wmma or plain FMA)",
             "  with the surrounding work fused into its epilogue is the right size of first draft.",
             "  Do NOT write a multi-stage software-pipelined CUTLASS-class kernel in the seed:",
             "  later rounds exist to tune it, and an over-long first reply is the most common way",

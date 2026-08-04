@@ -1,0 +1,475 @@
+[BATCH] Output folder: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5
+[vae_block_002.py] Round 0
+[Seed] Generating the initial kernel ...
+[ref_profile] Profiling reference model to inform granularity choice ...
+[gpu_lock] keep_vendor(C/implicit_gemm): waiting for the GPU to free up (ref_profile) ...
+[gpu_lock] keep_vendor(C/implicit_gemm): acquired after 3.5s (ref_profile)
+[ref_profile] REFERENCE PROFILE (measured on this GPU, not estimated)
+[ref_profile] The unmodified reference takes 1479.1 us of GPU time per forward.
+[ref_profile] Where that time actually goes:
+[Seed] Drawing candidate 1/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=15617, Out=25940, Total=41557
+[92mFinish reason: end_turn[0m
+[seed] score=1.3780 (geomean over 4 shapes: 8x256x64x128=1.2652x  2x256x64x64=1.2448x  4x256x256x256=1.3208x  1x256x131x131=1.7334x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json
+[Seed] Drawing candidate 2/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=15617, Out=22600, Total=38217
+[92mFinish reason: end_turn[0m
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[seed] score=1.5249 (geomean over 4 shapes: 8x256x64x128=1.4179x  2x256x64x64=1.3557x  4x256x256x256=1.4740x  1x256x131x131=1.9085x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json
+[Seed] Drawing candidate 3/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=15617, Out=23782, Total=39399
+[92mFinish reason: end_turn[0m
+[gpu_lock] keep_vendor(C/implicit_gemm): waiting for the GPU to free up (bench) ...
+[gpu_lock] keep_vendor(C/implicit_gemm): acquired after 22.8s (bench)
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[seed] score=1.5252 (geomean over 4 shapes: 8x256x64x128=1.4013x  2x256x64x64=1.3775x  4x256x256x256=1.4393x  1x256x131x131=1.9479x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0002.json
+[Seed] candidate 1/3: 1.3780
+[Seed] candidate 2/3: 1.5249
+[Seed] candidate 3/3: 1.5252  <-- selected
+[base] Setting initial base_kernel: 1.5252
+[best] Updating best_kernel: 1.5252 vs -inf [stored-score (no paired verdict available)]
+[vae_block_002.py] Round 1
+Optimizing start
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_stats_partial', 'gn_finalize', 'gn_apply_silu', 'gn_apply_silu_res_t'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_100.py (parent_kernel: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_141141.py)
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_100.py
+[ncu] Multiple kernels detected (4), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/4: gn_stats_partial
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel0_metrics.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully
+[ncu] [metrics] Completed for kernel 1/4: gn_stats_partial
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel0_section.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel0]] completed successfully
+[ncu] [section] Completed for kernel 1/4: gn_stats_partial
+[ncu] Profiling kernel 2/4: gn_finalize
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel1_metrics.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully
+[ncu] [metrics] Completed for kernel 2/4: gn_finalize
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel1_section.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel1]] completed successfully
+[ncu] [section] Completed for kernel 2/4: gn_finalize
+[ncu] Profiling kernel 3/4: gn_apply_silu
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel2_metrics.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully
+[ncu] [metrics] Completed for kernel 3/4: gn_apply_silu
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel2_section.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel2]] completed successfully
+[ncu] [section] Completed for kernel 3/4: gn_apply_silu
+[ncu] Profiling kernel 4/4: gn_apply_silu_res_t
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel3_metrics.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully
+[ncu] [metrics] Completed for kernel 4/4: gn_apply_silu_res_t
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel3_section.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel3]] completed successfully
+[ncu] [section] Completed for kernel 4/4: gn_apply_silu_res_t
+[ok] Merged 4 kernel profiles into: /home/elek/KernelMem/ncu_temp_100.csv
+[ncu] Saved profiling results to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_141141_ncu.csv
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/elek/KernelMem/nsys_temp_100 /home/elek/miniforge3/envs/kernelmem311/bin/python3 bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py
+[nsys] Profile completed: /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 3 kernel(s)
+[nsys] Saved launch counts to: nsys_temp_100.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 13 kernel(s)
+[nsys] Saved launch counts to: nsys_full_100.csv
+[nsys] Added full launch table (13 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_141141_nsys.nsys-rep
+[nsys] Saved .csv to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_141141_nsys.csv
+[machine_check] Using kernel_launch_count from nsys: 72
+[judge_gate] Saved prompt to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_judge_gate_prompt.txt
+Usage: In=24769, Out=267, Total=25036
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_code_features.json
+[machine_check] Saved machine_check_result to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=48956, Out=17507, Total=66463
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_141141/opt_round_001.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=18368, Out=10190, Total=28558
+[92mFinish reason: end_turn[0m
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[opt] score=1.4091 (geomean over 4 shapes: 8x256x64x128=1.3113x  2x256x64x64=1.2711x  4x256x256x256=1.3449x  1x256x131x131=1.7588x)
+[opt] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0003.json
+[opt] Optimization history updated: speedup=1.4091
+[base] Re-measuring base and candidate side by side (3-8 interleaved reps)...
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[base] Keeping base_kernel 1.5252 (1.4091: paired -7.90% +/-0.18% (-43.6 sigma, t=-43.6, 3 reps, resolved; 0.7721 -> 0.8383 ms), below the 0.5% margin)
+[vae_block_002.py] Round 2
+Optimizing start
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_stats_partial', 'gn_finalize', 'gn_apply_silu', 'gn_apply_silu_res_t'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_100.py (parent_kernel: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_141141.py)
+[ncu] cache hit (9b9ea9ed): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_141141_ncu.csv
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260804_141947 (1.4091 vs base 1.5252) to explain why it lost
+[ncu] Profiling kernel from file: /home/elek/KernelMem/rejected_kernel_100.py
+[ncu] Multiple kernels detected (5), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/5: nchw_to_nhwc_tiled
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel0_metrics.csv --kernel-name=::regex:\bnchw_to_nhwc_tiled\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully
+[ncu] [metrics] Completed for kernel 1/5: nchw_to_nhwc_tiled
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel0_section.csv --kernel-name=::regex:\bnchw_to_nhwc_tiled\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel0]] completed successfully
+[ncu] [section] Completed for kernel 1/5: nchw_to_nhwc_tiled
+[ncu] Profiling kernel 2/5: gn_stats_partial
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel1_metrics.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully
+[ncu] [metrics] Completed for kernel 2/5: gn_stats_partial
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel1_section.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel1]] completed successfully
+[ncu] [section] Completed for kernel 2/5: gn_stats_partial
+[ncu] Profiling kernel 3/5: gn_finalize
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel2_metrics.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully
+[ncu] [metrics] Completed for kernel 3/5: gn_finalize
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel2_section.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel2]] completed successfully
+[ncu] [section] Completed for kernel 3/5: gn_finalize
+[ncu] Profiling kernel 4/5: gn_apply_silu
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel3_metrics.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully
+[ncu] [metrics] Completed for kernel 4/5: gn_apply_silu
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel3_section.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel3]] completed successfully
+[ncu] [section] Completed for kernel 4/5: gn_apply_silu
+[ncu] Profiling kernel 5/5: gn_apply_silu_res_t
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel4_metrics.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully
+[ncu] [metrics] Completed for kernel 5/5: gn_apply_silu_res_t
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel4_section.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel4]] completed successfully
+[ncu] [section] Completed for kernel 5/5: gn_apply_silu_res_t
+[ok] Merged 5 kernel profiles into: /home/elek/KernelMem/ncu_rejected_100.csv
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/elek/KernelMem/nsys_temp_100 /home/elek/miniforge3/envs/kernelmem311/bin/python3 bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py
+[nsys] Profile completed: /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 3 kernel(s)
+[nsys] Saved launch counts to: nsys_temp_100.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 13 kernel(s)
+[nsys] Saved launch counts to: nsys_full_100.csv
+[nsys] Added full launch table (13 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_141141_nsys.nsys-rep
+[nsys] Saved .csv to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_141141_nsys.csv
+[opt] Loaded 1 previous optimization attempts from /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_141141
+[machine_check] Using kernel_launch_count from nsys: 72
+[judge_gate] Saved prompt to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_judge_gate_prompt.txt
+Usage: In=26146, Out=267, Total=26413
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_code_features.json
+[machine_check] Saved machine_check_result to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=85276, Out=20920, Total=106196
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_141141/opt_round_002.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=17389, Out=13062, Total=30451
+[92mFinish reason: end_turn[0m
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[opt] score=1.5178 (geomean over 4 shapes: 8x256x64x128=1.4450x  2x256x64x64=1.3635x  4x256x256x256=1.4135x  1x256x131x131=1.9056x)
+[opt] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0004.json
+[opt] Optimization history updated: speedup=1.5178
+[base] Re-measuring base and candidate side by side (3-8 interleaved reps)...
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[base] Keeping base_kernel 1.5252 (1.5178: paired -1.30% +/-0.42% (-3.1 sigma, t=-3.1, 3 reps, resolved; 0.7817 -> 0.7920 ms), below the 0.5% margin)
+[vae_block_002.py] Round 3
+Optimizing start
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_stats_partial', 'gn_finalize', 'gn_apply_silu', 'gn_apply_silu_res_t'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_100.py (parent_kernel: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_141141.py)
+[ncu] cache hit (9b9ea9ed): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_141141_ncu.csv
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260804_142922 (1.5178 vs base 1.5252) to explain why it lost
+[ncu] Profiling kernel from file: /home/elek/KernelMem/rejected_kernel_100.py
+[ncu] Multiple kernels detected (4), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/4: gn_stats_partial
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel0_metrics.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully
+[ncu] [metrics] Completed for kernel 1/4: gn_stats_partial
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel0_section.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel0]] completed successfully
+[ncu] [section] Completed for kernel 1/4: gn_stats_partial
+[ncu] Profiling kernel 2/4: gn_finalize
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel1_metrics.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully
+[ncu] [metrics] Completed for kernel 2/4: gn_finalize
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel1_section.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel1]] completed successfully
+[ncu] [section] Completed for kernel 2/4: gn_finalize
+[ncu] Profiling kernel 3/4: gn_apply_silu
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel2_metrics.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully
+[ncu] [metrics] Completed for kernel 3/4: gn_apply_silu
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel2_section.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel2]] completed successfully
+[ncu] [section] Completed for kernel 3/4: gn_apply_silu
+[ncu] Profiling kernel 4/4: gn_apply_silu_res_t
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel3_metrics.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully
+[ncu] [metrics] Completed for kernel 4/4: gn_apply_silu_res_t
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel3_section.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel3]] completed successfully
+[ncu] [section] Completed for kernel 4/4: gn_apply_silu_res_t
+[ok] Merged 4 kernel profiles into: /home/elek/KernelMem/ncu_rejected_100.csv
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/elek/KernelMem/nsys_temp_100 /home/elek/miniforge3/envs/kernelmem311/bin/python3 bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py
+[nsys] Profile completed: /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 3 kernel(s)
+[nsys] Saved launch counts to: nsys_temp_100.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 13 kernel(s)
+[nsys] Saved launch counts to: nsys_full_100.csv
+[nsys] Added full launch table (13 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_141141_nsys.nsys-rep
+[nsys] Saved .csv to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_141141_nsys.csv
+[opt] Loaded 2 previous optimization attempts from /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_141141
+[machine_check] Using kernel_launch_count from nsys: 72
+[judge_gate] Saved prompt to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round003_judge_gate_prompt.txt
+Usage: In=26146, Out=267, Total=26413
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round003_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round003_code_features.json
+[machine_check] Saved machine_check_result to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round003_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=82539, Out=11219, Total=93758
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_141141/opt_round_003.json
+Usage: In=18633, Out=9875, Total=28508
+[92mFinish reason: end_turn[0m
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[opt] score=1.6216 (geomean over 4 shapes: 8x256x64x128=1.5254x  2x256x64x64=1.4504x  4x256x256x256=1.5502x  1x256x131x131=2.0158x)
+[opt] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0005.json
+[opt] Optimization history updated: speedup=1.6216
+[base] Re-measuring base and candidate side by side (3-8 interleaved reps)...
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[base] Ratchet: base_kernel 1.5252 -> 1.6216 [paired +6.34% +/-0.23% (27.7 sigma, t=+27.7, 3 reps, resolved; 0.7791 -> 0.7327 ms), margin 0.5%]; later rounds now optimize from this kernel
+[best] Updating best_kernel: 1.6216 vs 1.5252 [paired +6.34% +/-0.23% (27.7 sigma, t=+27.7, 3 reps, resolved; 0.7791 -> 0.7327 ms)]
+[vae_block_002.py] Round 4
+Optimizing start
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['nchw_to_nhwc_tiled', 'gn_stats_partial', 'gn_finalize', 'gn_apply_silu', 'gn_apply_silu_res_t'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_100.py (parent_kernel: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_143548.py)
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_100.py
+[ncu] Multiple kernels detected (5), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/5: nchw_to_nhwc_tiled
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel0_metrics.csv --kernel-name=::regex:\bnchw_to_nhwc_tiled\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully
+[ncu] [metrics] Completed for kernel 1/5: nchw_to_nhwc_tiled
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel0_section.csv --kernel-name=::regex:\bnchw_to_nhwc_tiled\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel0]] completed successfully
+[ncu] [section] Completed for kernel 1/5: nchw_to_nhwc_tiled
+[ncu] Profiling kernel 2/5: gn_stats_partial
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel1_metrics.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully
+[ncu] [metrics] Completed for kernel 2/5: gn_stats_partial
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel1_section.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel1]] completed successfully
+[ncu] [section] Completed for kernel 2/5: gn_stats_partial
+[ncu] Profiling kernel 3/5: gn_finalize
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel2_metrics.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully
+[ncu] [metrics] Completed for kernel 3/5: gn_finalize
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel2_section.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel2]] completed successfully
+[ncu] [section] Completed for kernel 3/5: gn_finalize
+[ncu] Profiling kernel 4/5: gn_apply_silu
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel3_metrics.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully
+[ncu] [metrics] Completed for kernel 4/5: gn_apply_silu
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel3_section.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel3]] completed successfully
+[ncu] [section] Completed for kernel 4/5: gn_apply_silu
+[ncu] Profiling kernel 5/5: gn_apply_silu_res_t
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel4_metrics.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully
+[ncu] [metrics] Completed for kernel 5/5: gn_apply_silu_res_t
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_100_kernel4_section.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel4]] completed successfully
+[ncu] [section] Completed for kernel 5/5: gn_apply_silu_res_t
+[ok] Merged 5 kernel profiles into: /home/elek/KernelMem/ncu_temp_100.csv
+[ncu] Saved profiling results to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_143548_ncu.csv
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/elek/KernelMem/nsys_temp_100 /home/elek/miniforge3/envs/kernelmem311/bin/python3 bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py
+[nsys] Profile completed: /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 4 kernel(s)
+[nsys] Saved launch counts to: nsys_temp_100.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 14 kernel(s)
+[nsys] Saved launch counts to: nsys_full_100.csv
+[nsys] Added full launch table (14 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_143548_nsys.nsys-rep
+[nsys] Saved .csv to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_143548_nsys.csv
+[opt] Base carries coalesced_tile_transpose (+6.32%)
+[machine_check] Using kernel_launch_count from nsys: 84
+[judge_gate] Saved prompt to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round004_judge_gate_prompt.txt
+Usage: In=27346, Out=267, Total=27613
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round004_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round004_code_features.json
+[machine_check] Saved machine_check_result to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round004_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=63295, Out=8487, Total=71782
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_143548/opt_round_004.json
+Usage: In=19586, Out=11408, Total=30994
+[92mFinish reason: end_turn[0m
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[opt] score=1.5441 (geomean over 4 shapes: 8x256x64x128=1.4489x  2x256x64x64=1.3835x  4x256x256x256=1.4736x  1x256x131x131=1.9242x)
+[opt] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0006.json
+[opt] Optimization history updated: speedup=1.5441
+[base] Re-measuring base and candidate side by side (3-8 interleaved reps)...
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[base] Keeping base_kernel 1.6216 (1.5441: paired -5.87% +/-0.27% (-21.5 sigma, t=-21.5, 3 reps, resolved; 0.7280 -> 0.7734 ms), below the 0.5% margin)
+[vae_block_002.py] Round 5
+Optimizing start
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['nchw_to_nhwc_tiled', 'gn_stats_partial', 'gn_finalize', 'gn_apply_silu', 'gn_apply_silu_res_t'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_100.py (parent_kernel: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_143548.py)
+[ncu] cache hit (3861c3f6): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_143548_ncu.csv
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260804_144739 (1.5441 vs base 1.6216) to explain why it lost
+[ncu] Profiling kernel from file: /home/elek/KernelMem/rejected_kernel_100.py
+[ncu] Multiple kernels detected (5), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/5: nchw_to_nhwc_tiled
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel0_metrics.csv --kernel-name=::regex:\bnchw_to_nhwc_tiled\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully
+[ncu] [metrics] Completed for kernel 1/5: nchw_to_nhwc_tiled
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel0_section.csv --kernel-name=::regex:\bnchw_to_nhwc_tiled\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel0]] completed successfully
+[ncu] [section] Completed for kernel 1/5: nchw_to_nhwc_tiled
+[ncu] Profiling kernel 2/5: gn_stats_partial
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel1_metrics.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully
+[ncu] [metrics] Completed for kernel 2/5: gn_stats_partial
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel1_section.csv --kernel-name=::regex:\bgn_stats_partial\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel1]] completed successfully
+[ncu] [section] Completed for kernel 2/5: gn_stats_partial
+[ncu] Profiling kernel 3/5: gn_finalize
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel2_metrics.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+
+[stop] Signal 15 received. Finishing the current round, then writing artifacts and a resumable checkpoint. Signal again to abort now.
+[ncu] [metrics[kernel2]] completed successfully
+[ncu] [metrics] Completed for kernel 3/5: gn_finalize
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel2_section.csv --kernel-name=::regex:\bgn_finalize\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel2]] completed successfully
+[ncu] [section] Completed for kernel 3/5: gn_finalize
+[ncu] Profiling kernel 4/5: gn_apply_silu
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel3_metrics.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully
+[ncu] [metrics] Completed for kernel 4/5: gn_apply_silu
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel3_section.csv --kernel-name=::regex:\bgn_apply_silu\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel3]] completed successfully
+[ncu] [section] Completed for kernel 4/5: gn_apply_silu
+[ncu] Profiling kernel 5/5: gn_apply_silu_res_t
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel4_metrics.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully
+[ncu] [metrics] Completed for kernel 5/5: gn_apply_silu_res_t
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_rejected_100_kernel4_section.csv --kernel-name=::regex:\bgn_apply_silu_res_t\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel4]] completed successfully
+[ncu] [section] Completed for kernel 5/5: gn_apply_silu_res_t
+[ok] Merged 5 kernel profiles into: /home/elek/KernelMem/ncu_rejected_100.csv
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/elek/KernelMem/nsys_temp_100 /home/elek/miniforge3/envs/kernelmem311/bin/python3 bench_ref_inputs_100.py --device-idx 3 --test /home/elek/KernelMem/test_kernel_100.py
+[nsys] Profile completed: /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 4 kernel(s)
+[nsys] Saved launch counts to: nsys_temp_100.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 14 kernel(s)
+[nsys] Saved launch counts to: nsys_full_100.csv
+[nsys] Added full launch table (14 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_143548_nsys.nsys-rep
+[nsys] Saved .csv to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_143548_nsys.csv
+[opt] Loaded 1 previous optimization attempts from /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_143548
+[opt] Base carries coalesced_tile_transpose (+6.32%)
+[machine_check] Using kernel_launch_count from nsys: 84
+[judge_gate] Saved prompt to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round005_judge_gate_prompt.txt
+Usage: In=27346, Out=267, Total=27613
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round005_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round005_code_features.json
+[machine_check] Saved machine_check_result to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round005_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=99645, Out=11239, Total=110884
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_143548/opt_round_005.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=19961, Out=14749, Total=34710
+[92mFinish reason: end_turn[0m
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[opt] score=1.7098 (geomean over 4 shapes: 8x256x64x128=1.5733x  2x256x64x64=1.6170x  4x256x256x256=1.5779x  1x256x131x131=2.1291x)
+[opt] metrics saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0007.json
+[opt] Optimization history updated: speedup=1.7098
+[base] Re-measuring base and candidate side by side (3-8 interleaved reps)...
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[device_state] candidate leaked: cudnn.benchmark: False -> True
+[base] Ratchet: base_kernel 1.6216 -> 1.7098 [paired +4.58% +/-0.14% (33.5 sigma, t=+33.5, 3 reps, resolved; 0.7277 -> 0.6958 ms), margin 0.5%]; later rounds now optimize from this kernel
+[best] Updating best_kernel: 1.7098 vs 1.6216 [paired +4.58% +/-0.14% (33.5 sigma, t=+33.5, 3 reps, resolved; 0.7277 -> 0.6958 ms)]
+[stop] Stopping before round 6. Completed 6 of 10 rounds; resume with --resume /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5
+[vae_block_002.py] Figure saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png
+[vae_block_002.py] Optimization tree saved to: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/optimization_tree.json
+[SUMMARY] {'task': 'tasks/vae_block_002.py', 'best_score': 1.7098092498723412, 'best_runnable': True, 'task_dir': '/home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002', 'figure': '/home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png', 'input_tokens_sum': 520499, 'output_tokens_sum': 200978, 'total_tokens_sum': 721477, 'method_matched_stats': {'total_opt_rounds': 5, 'matched_count': 5, 'unmatched_count': 0}}
+[GLOBAL] Avg speedup=1.7098, Accuracy=1.0000
+[GLOBAL] Saved: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/summary.json
+[GLOBAL] Saved: /home/elek/KernelMem/run/20260804_135540_vae_block_002_lineages/keep_vendor/20260804_135545_vae_block_002_claude_claude-opus-5/summary.csv

@@ -45,18 +45,58 @@ GPU_SPEC_INFO = {
         "Maximum shared memory per thread block": "99 KB",
     },
     
+    # "H100" describes the card actually installed in this machine: H100 PCIe
+    # 80GB (114 SMs). The previous entry here held H100 *SXM* figures quoted
+    # *with sparsity* -- 3.35 TB/s and 989 TF32 TFLOPS -- neither of which any
+    # dense kernel can reach on any H100. The error is not cosmetic: it is the
+    # denominator of every "% of peak" the seed and judge reason with. A vendor
+    # GEMM/conv measured here at ~244 TFLOP/s reads as 25% of roofline against
+    # 989 -- 4x headroom apparently left on the table -- and as 64% against the
+    # real 378, which is about as good as a convolution gets. The first reading
+    # makes "rewrite the vendor kernel" look attractive when it is not.
+    # Sparsity is listed separately because it requires 2:4 structured-sparse
+    # weights, which none of these kernels have.
+    # Keep per-problem measurements OUT of this table: it is emitted into every
+    # prompt for every task, so a number from one workload becomes a false
+    # statement about the next.
+    # See "H100-SXM" below for the datasheet SXM part.
     "H100": {
         "GPU Architecture": "Hopper",
-        "GPU Memory": "80GB",
+        "Board": "H100 PCIe 80GB (NOT SXM -- lower clocks, HBM2e, 114 SMs)",
+        "GPU Memory": "80GB HBM2e",
+        "Memory Bandwidth": "2.0 TB/s peak, 1.84 TB/s measured (1 GiB d2d copy, 92% of peak)",
+        "Streaming Multiprocessors": "114",
+        "FP64 TFLOPS": "26",
+        "FP64 Tensor Core TFLOPS": "51",
+        "FP32 TFLOPS": "51 peak, 36.5 measured (SGEMM)",
+        "TF32 Tensor Core TFLOPS": "378 dense (756 with 2:4 sparsity); 223 measured on a 8192^3 GEMM",
+        "BFLOAT16 Tensore Core TFLOPS": "756 dense (1513 with 2:4 sparsity)",
+        "FP16 Tensor Core TFLOPS": "756 dense (1513 with 2:4 sparsity)",
+        "FP8 Tensor Core TFLOPS": "1513 dense (3026 with 2:4 sparsity)",
+        "INT8 Tensor Core TOPS": "1513 dense (3026 with 2:4 sparsity)",
+        "Register File Size": "64K 32-bit registers per SM",
+        "Maximum number of registers per thread": "255",
+        "Maximum number of thread blocks per SM": "32",
+        "Shared memory capacity per SM": "228 KB",
+        "Maximum shared memory per thread block": "227 KB",
+    },
+
+    # The datasheet SXM part, for runs on a different machine. Dense figures;
+    # the sparsity numbers are double these and apply only to 2:4 sparse weights.
+    "H100-SXM": {
+        "GPU Architecture": "Hopper",
+        "Board": "H100 SXM5 80GB (132 SMs)",
+        "GPU Memory": "80GB HBM3",
         "Memory Bandwidth": "3.35 TB/s",
+        "Streaming Multiprocessors": "132",
         "FP64 TFLOPS": "34",
         "FP64 Tensor Core TFLOPS": "67",
         "FP32 TFLOPS": "67",
-        "TF32 Tensor Core TFLOPS": "989 with sparsity",
-        "BFLOAT16 Tensore Core TFLOPS": "1979 with sparsity",
-        "FP16 Tensor Core TFLOPS": "1979 with sparsity",
-        "FP8 Tensor Core TFLOPS": "3958 with sparsity",
-        "INT8 Tensor Core TOPS": "3958 with sparsity",
+        "TF32 Tensor Core TFLOPS": "495 dense (989 with 2:4 sparsity)",
+        "BFLOAT16 Tensore Core TFLOPS": "989 dense (1979 with 2:4 sparsity)",
+        "FP16 Tensor Core TFLOPS": "989 dense (1979 with 2:4 sparsity)",
+        "FP8 Tensor Core TFLOPS": "1979 dense (3958 with 2:4 sparsity)",
+        "INT8 Tensor Core TOPS": "1979 dense (3958 with 2:4 sparsity)",
         "Register File Size": "64K 32-bit registers per SM",
         "Maximum number of registers per thread": "255",
         "Maximum number of thread blocks per SM": "32",

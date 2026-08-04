@@ -1,0 +1,423 @@
+# ==========================================================================
+# ModelNew — SOL-ExecBench 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# SEED GRANULARITY: (C) fuse many ops into one/few kernels.
+#
+# 1) Granularity: (C). The whole residual block is executed as a short chain of
+#    fused custom CUDA kernels + two vendor cuDNN convolutions, all in NHWC.
+#
+# 2) Ops replaced (all of them, except the two conv3x3 GEMMs themselves):
+#      - the 6 implicit cudnn layout conversions (nchwToNhwc x4, nhwcToNchw x2)
+#        -> replaced by ONE custom tiled NCHW->NHWC transpose at the entry and
+#           a transposed epilogue at the exit (net 1 extra pass instead of 6).
+#      - RowwiseMomentsCUDAKernel + ComputeFusedParams + elementwise (GroupNorm)
+#        -> custom two-stage reduction (gn_stats / gn_reduce) producing per
+#           (batch, channel) affine (scale, bias) pairs.
+#      - vectorized_elementwise (SiLU) and the final residual add
+#        -> folded into the GroupNorm apply kernels.
+#
+# 3) Fusion map:
+#      K0 nchw_to_nhwc         : layout conversion of x (one pass, tiled/shared)
+#      cuDNN conv2d #1 (NHWC, TF32, no bias)     <- vendor GEMM, kept
+#      K1 gn_stats + K2 gn_reduce                : GN1 moments -> (scale,bias)
+#      K3 gn_apply1            : y*scale+bias fused with SiLU, NHWC->NHWC, float4
+#      cuDNN conv2d #2 (NHWC, TF32, no bias)     <- vendor GEMM, kept
+#      K1 gn_stats + K2 gn_reduce                : GN2 moments -> (scale,bias)
+#      K4 gn_apply2            : (y*scale+bias) -> SiLU -> + residual, and the
+#                                NHWC->NCHW transpose, all in ONE shared-mem
+#                                tiled kernel (zero extra global traffic).
+#
+# 4) What stays in PyTorch / vendor libs and why:
+#      - conv3x3 (at::conv2d, called from inside the extension): it is 40.6% of
+#        the runtime and is a tuned tensor-core (TF32) NHWC implicit-GEMM; a
+#        hand-written fp32 3x3x256x256 conv would not beat it. Feeding it
+#        already-channels-last tensors removes its 6 internal layout kernels,
+#        which is where the win from "owning" it actually comes from here.
+#      - nothing else: every remaining reference op is inside a custom kernel.
+#
+# Precision: everything is fp32 storage/arith; reductions accumulate in fp32 and
+# finalize the mean/variance in fp64. TF32 is used only in conv, exactly as the
+# reference (cudnn.allow_tf32 default True) does.
+# ==========================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r'''
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+
+#define TILE 32
+
+__device__ __forceinline__ float silu_f(float t) {
+    return t / (1.0f + expf(-t));
+}
+
+// ---------------------------------------------------------------- K0
+// NCHW -> NHWC tiled transpose (32 pixels x 32 channels per block)
+__global__ void nchw_to_nhwc_kernel(const float* __restrict__ src,
+                                    float* __restrict__ dst,
+                                    int npix, int C) {
+    __shared__ float tile[TILE][TILE + 1];
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int P0 = blockIdx.x * TILE;
+    const int C0 = blockIdx.y * TILE;
+    const int n  = blockIdx.z;
+
+    const float* s = src + (size_t)n * (size_t)C * (size_t)npix;
+    float*       d = dst + (size_t)n * (size_t)npix * (size_t)C;
+
+    const int pp = P0 + tx;
+    for (int j = ty; j < TILE; j += blockDim.y) {
+        const int cc = C0 + j;
+        float v = 0.0f;
+        if (pp < npix) v = s[(size_t)cc * (size_t)npix + pp];
+        tile[tx][j] = v;   // tile[pixel][channel]
+    }
+    __syncthreads();
+
+    const int c = C0 + tx;
+    for (int j = ty; j < TILE; j += blockDim.y) {
+        const int p = P0 + j;
+        if (p < npix) d[(size_t)p * (size_t)C + c] = tile[j][tx];
+    }
+}
+
+// ---------------------------------------------------------------- K1
+// GroupNorm partial moments over NHWC, blockDim.x == C (one channel/thread).
+__global__ void gn_stats_kernel(const float* __restrict__ y,
+                                float* __restrict__ partial,
+                                int npix, int C, int G, int cpg, int nblk) {
+    extern __shared__ float sm[];
+    float* ssum = sm;
+    float* ssq  = sm + C;
+
+    const int c   = threadIdx.x;
+    const int n   = blockIdx.y;
+    const int blk = blockIdx.x;
+
+    const float* base = y + (size_t)n * (size_t)npix * (size_t)C + c;
+
+    float s = 0.0f, q = 0.0f;
+    for (int p = blk; p < npix; p += nblk) {
+        float v = base[(size_t)p * (size_t)C];
+        s += v;
+        q = fmaf(v, v, q);
+    }
+    ssum[c] = s;
+    ssq[c]  = q;
+    __syncthreads();
+
+    if (c < G) {
+        float ts = 0.0f, tq = 0.0f;
+        const int b0 = c * cpg;
+        for (int k = 0; k < cpg; ++k) {
+            ts += ssum[b0 + k];
+            tq += ssq[b0 + k];
+        }
+        size_t o = ((size_t)((size_t)n * nblk + blk) * G + c) * 2;
+        partial[o]     = ts;
+        partial[o + 1] = tq;
+    }
+}
+
+// ---------------------------------------------------------------- K2
+// Reduce partials -> per (batch, channel) affine (scale, bias).
+__global__ void gn_reduce_kernel(const float* __restrict__ partial,
+                                 const float* __restrict__ gamma,
+                                 const float* __restrict__ beta,
+                                 float* __restrict__ scale,
+                                 float* __restrict__ bias,
+                                 int nblk, int G, int cpg, int C,
+                                 int npix, float eps) {
+    __shared__ float rs[64];
+    __shared__ float rq[64];
+    __shared__ float s_mean;
+    __shared__ float s_inv;
+
+    const int idx = blockIdx.x;
+    const int n   = idx / G;
+    const int g   = idx - n * G;
+    const int t   = threadIdx.x;
+
+    float s = 0.0f, q = 0.0f;
+    for (int b = t; b < nblk; b += blockDim.x) {
+        size_t o = ((size_t)((size_t)n * nblk + b) * G + g) * 2;
+        s += partial[o];
+        q += partial[o + 1];
+    }
+    rs[t] = s;
+    rq[t] = q;
+    __syncthreads();
+
+    for (int st = blockDim.x >> 1; st > 0; st >>= 1) {
+        if (t < st) { rs[t] += rs[t + st]; rq[t] += rq[t + st]; }
+        __syncthreads();
+    }
+
+    if (t == 0) {
+        double cnt  = (double)npix * (double)cpg;
+        double mean = (double)rs[0] / cnt;
+        double var  = (double)rq[0] / cnt - mean * mean;
+        if (var < 0.0) var = 0.0;
+        s_mean = (float)mean;
+        s_inv  = (float)(1.0 / sqrt(var + (double)eps));
+    }
+    __syncthreads();
+
+    if (t < cpg) {
+        const int c  = g * cpg + t;
+        const float gm = gamma[c];
+        const float sc = gm * s_inv;
+        scale[n * C + c] = sc;
+        bias[n * C + c]  = beta[c] - s_mean * sc;
+    }
+}
+
+// ---------------------------------------------------------------- K3
+// NHWC -> NHWC : affine + SiLU, float4 vectorized.
+__global__ void gn_apply1_kernel(const float* __restrict__ y,
+                                 const float* __restrict__ scale,
+                                 const float* __restrict__ bias,
+                                 float* __restrict__ out,
+                                 int nvec_img, int C4, int C) {
+    const int n = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nvec_img) return;
+
+    const int c4 = i % C4;
+    const float4* y4 = reinterpret_cast<const float4*>(y) + (size_t)n * nvec_img;
+    float4*       o4 = reinterpret_cast<float4*>(out)     + (size_t)n * nvec_img;
+
+    float4 v = y4[i];
+    float4 s = reinterpret_cast<const float4*>(scale + (size_t)n * C)[c4];
+    float4 b = reinterpret_cast<const float4*>(bias  + (size_t)n * C)[c4];
+
+    float4 r;
+    r.x = silu_f(fmaf(v.x, s.x, b.x));
+    r.y = silu_f(fmaf(v.y, s.y, b.y));
+    r.z = silu_f(fmaf(v.z, s.z, b.z));
+    r.w = silu_f(fmaf(v.w, s.w, b.w));
+    o4[i] = r;
+}
+
+// ---------------------------------------------------------------- K4
+// NHWC in -> affine + SiLU + residual(NCHW) -> NCHW out, tiled transpose.
+__global__ void gn_apply2_kernel(const float* __restrict__ y,
+                                 const float* __restrict__ res,
+                                 const float* __restrict__ scale,
+                                 const float* __restrict__ bias,
+                                 float* __restrict__ out,
+                                 int npix, int C) {
+    __shared__ float tile[TILE][TILE + 1];
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int P0 = blockIdx.x * TILE;
+    const int C0 = blockIdx.y * TILE;
+    const int n  = blockIdx.z;
+
+    const int c = C0 + tx;
+    const float sc = scale[(size_t)n * C + c];
+    const float bi = bias[(size_t)n * C + c];
+
+    const float* ybase = y + (size_t)n * (size_t)npix * (size_t)C;
+
+    for (int j = ty; j < TILE; j += blockDim.y) {
+        const int p = P0 + j;
+        float v = 0.0f;
+        if (p < npix) v = ybase[(size_t)p * (size_t)C + c];
+        tile[j][tx] = silu_f(fmaf(v, sc, bi));   // tile[pixel][channel]
+    }
+    __syncthreads();
+
+    const int pp = P0 + tx;
+    if (pp < npix) {
+        for (int j = ty; j < TILE; j += blockDim.y) {
+            const int cc = C0 + j;
+            size_t o = ((size_t)n * C + cc) * (size_t)npix + pp;
+            out[o] = tile[tx][j] + res[o];
+        }
+    }
+}
+
+// ---------------------------------------------------------------- driver
+static void launch_gn(const at::Tensor& y_nhwc,
+                      const at::Tensor& gamma,
+                      const at::Tensor& beta,
+                      at::Tensor& scale,
+                      at::Tensor& bias_t,
+                      int B, int C, int npix, int G, float eps,
+                      cudaStream_t stream) {
+    const int cpg = C / G;
+
+    int nblk = (npix + 63) / 64;
+    int cap  = (512 + B - 1) / B;
+    if (nblk > cap) nblk = cap;
+    if (nblk < 1) nblk = 1;
+
+    auto partial = at::empty({(long)B, (long)nblk, (long)G, 2}, y_nhwc.options());
+
+    dim3 grid_s(nblk, B);
+    gn_stats_kernel<<<grid_s, C, 2 * C * sizeof(float), stream>>>(
+        y_nhwc.data_ptr<float>(), partial.data_ptr<float>(),
+        npix, C, G, cpg, nblk);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    gn_reduce_kernel<<<B * G, 64, 0, stream>>>(
+        partial.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(),
+        scale.data_ptr<float>(), bias_t.data_ptr<float>(),
+        nblk, G, cpg, C, npix, eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor vae_block_forward(torch::Tensor x,
+                                torch::Tensor conv1_weight,
+                                torch::Tensor norm1_weight,
+                                torch::Tensor norm1_bias,
+                                torch::Tensor conv2_weight,
+                                torch::Tensor norm2_weight,
+                                torch::Tensor norm2_bias,
+                                double eps_d) {
+    at::NoGradGuard no_grad;
+
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "fp32 only");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D");
+
+    const int B = (int)x.size(0);
+    const int C = (int)x.size(1);
+    const int H = (int)x.size(2);
+    const int W = (int)x.size(3);
+    const int npix = H * W;
+    const int G = 32;
+    TORCH_CHECK(C % G == 0 && C % 32 == 0 && C % 4 == 0 && C <= 1024,
+                "unsupported channel count");
+
+    const float eps = (float)eps_d;
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto x_c = x.is_contiguous() ? x : x.contiguous();
+
+    // ---- K0 : NCHW -> NHWC
+    auto xl = at::empty({B, C, H, W},
+                        x_c.options().memory_format(at::MemoryFormat::ChannelsLast));
+    {
+        dim3 blk(32, 8);
+        dim3 grd((npix + TILE - 1) / TILE, C / TILE, B);
+        nchw_to_nhwc_kernel<<<grd, blk, 0, stream>>>(
+            x_c.data_ptr<float>(), xl.data_ptr<float>(), npix, C);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    auto w1 = conv1_weight.contiguous(at::MemoryFormat::ChannelsLast);
+    auto w2 = conv2_weight.contiguous(at::MemoryFormat::ChannelsLast);
+    auto g1 = norm1_weight.is_contiguous() ? norm1_weight : norm1_weight.contiguous();
+    auto b1 = norm1_bias.is_contiguous()   ? norm1_bias   : norm1_bias.contiguous();
+    auto g2 = norm2_weight.is_contiguous() ? norm2_weight : norm2_weight.contiguous();
+    auto b2 = norm2_bias.is_contiguous()   ? norm2_bias   : norm2_bias.contiguous();
+
+    auto scale = at::empty({B, C}, x_c.options());
+    auto bias_t = at::empty({B, C}, x_c.options());
+
+    // ---- conv #1 (vendor, NHWC/TF32)
+    auto y1 = at::conv2d(xl, w1, {}, {1, 1}, {1, 1}, {1, 1}, 1);
+    if (!y1.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y1 = y1.contiguous(at::MemoryFormat::ChannelsLast);
+
+    // ---- GN1 + SiLU
+    launch_gn(y1, g1, b1, scale, bias_t, B, C, npix, G, eps, stream);
+    auto z = at::empty({B, C, H, W},
+                       x_c.options().memory_format(at::MemoryFormat::ChannelsLast));
+    {
+        const int C4 = C / 4;
+        const int nvec_img = npix * C4;
+        const int threads = 256;
+        dim3 grd((nvec_img + threads - 1) / threads, B);
+        gn_apply1_kernel<<<grd, threads, 0, stream>>>(
+            y1.data_ptr<float>(), scale.data_ptr<float>(), bias_t.data_ptr<float>(),
+            z.data_ptr<float>(), nvec_img, C4, C);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // ---- conv #2 (vendor, NHWC/TF32)
+    auto y2 = at::conv2d(z, w2, {}, {1, 1}, {1, 1}, {1, 1}, 1);
+    if (!y2.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y2 = y2.contiguous(at::MemoryFormat::ChannelsLast);
+
+    // ---- GN2 + SiLU + residual + NHWC->NCHW
+    launch_gn(y2, g2, b2, scale, bias_t, B, C, npix, G, eps, stream);
+    auto out = at::empty({B, C, H, W}, x_c.options());
+    {
+        dim3 blk(32, 8);
+        dim3 grd((npix + TILE - 1) / TILE, C / TILE, B);
+        gn_apply2_kernel<<<grd, blk, 0, stream>>>(
+            y2.data_ptr<float>(), x_c.data_ptr<float>(),
+            scale.data_ptr<float>(), bias_t.data_ptr<float>(),
+            out.data_ptr<float>(), npix, C);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    return out;
+}
+'''
+
+_CPP_SRC = r"""
+torch::Tensor vae_block_forward(torch::Tensor x,
+                                torch::Tensor conv1_weight,
+                                torch::Tensor norm1_weight,
+                                torch::Tensor norm1_bias,
+                                torch::Tensor conv2_weight,
+                                torch::Tensor norm2_weight,
+                                torch::Tensor norm2_bias,
+                                double eps_d);
+"""
+
+_ext = load_inline(
+    name="vae_res_block_fused_nhwc",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["vae_block_forward"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_90,code=sm_90",
+    ],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    # See file header for the granularity (C) fusion plan.
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+        # cuDNN NHWC algo selection for the fixed shapes used by the harness.
+        torch.backends.cudnn.benchmark = True
+
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        eps_f = float(eps.item()) if torch.is_tensor(eps) else float(eps)
+
+        if (not x.is_cuda) or x.dtype != torch.float32:
+            # Reference-equivalent fallback (non-CUDA / non-fp32 inputs).
+            out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)
+            out = F.group_norm(out, 32, weight=norm1_weight, bias=norm1_bias, eps=eps_f)
+            out = F.silu(out)
+            out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)
+            out = F.group_norm(out, 32, weight=norm2_weight, bias=norm2_bias, eps=eps_f)
+            out = F.silu(out)
+            return out + x
+
+        return self.ext.vae_block_forward(
+            x, conv1_weight, norm1_weight, norm1_bias,
+            conv2_weight, norm2_weight, norm2_bias, eps_f,
+        )

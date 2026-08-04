@@ -1,0 +1,701 @@
+# Section A – Checklist evidence (plan-to-code mapping)
+
+**Plan item 1:** Host chunk planner (bps/total, ≤24 MB ⇒ nchunks=1; else ns from 20 MB budget, gb∈{32,16,8,4}).
+**Implemented in code:** `plan_chunks()` helper called at the top of `fused_block` (produces `ns`, `gb`, `n4`, `log2n4`).
+
+**Plan item 2:** Replace `run_group_stats`+apply with a per-chunk stats→finalize→apply loop for BOTH GroupNorms.
+**Implemented in code:** `run_gn1_chunked()` and `run_gn2_chunked()` in the host section; K_A and both `at::conv2d` calls untouched.
+
+**Plan item 3:** `gn_stats_kernel` gains `(n_off, g0, log2n4)`, `n4=2*gb`, `pp=64/n4`, thread map `sub_p/c4/lg`, shared store at `[ty][sub_p*gb+lg]`, final threads `lin<gb`.
+**Implemented in code:** rewritten `gn_stats_kernel` (reduces bit-identically to the original when `gb==32`).
+
+**Plan item 4:** `gn_finalize_kernel` launches `ns*gb` blocks, idx→(n_off+n_local, g0+g_local), per-chunk partial base, double accumulation verbatim.
+**Implemented in code:** `gn_finalize_kernel` with new `n_off,g0,gb` args and stride `2*gb`.
+
+**Plan item 5:** `gn_silu_nhwc_inplace` gains `(n_off, g0, n4, log2n4)`, index `p*64+2*g0+q`, float4 path kept, `gridDim.y = ns`.
+**Implemented in code:** `gn_silu_nhwc_inplace` body + its launch inside `run_gn1_chunked`.
+
+**Plan item 6:** v4 and scalar tail kernels gain `c_tile_off = g0/4` and `n_off`; grid `(full_tiles, gb/4, ns)`; all float4 streams and HW%4/HW%32 fallbacks unchanged.
+**Implemented in code:** `gn_silu_res_nchw_v4_kernel` / `gn_silu_res_nchw_kernel` signatures (`c_tile_off`, `n_off`) + launches in `run_gn2_chunked`.
+
+**Plan item 7:** One partial buffer sized for the largest chunk per GroupNorm, reused across chunks.
+**Implemented in code:** single `at::empty({ns*tiles*gb*2})` allocation before each chunk loop.
+
+**Plan item 8:** `pick_tiling` called per chunk with `(ns, HW)`, ppb clamp as today.
+**Implemented in code:** `pick_tiling(ns, HW, target, pp, tiles, ppb)` (target `114*16` for the unchunked path, `114*4` when chunked; ppb rounded to a multiple of `4*pp`).
+
+**Plan item 9:** Validation of `gb*8%32==0`, `n4` power of two, exact tiling of (B×32) groups.
+**Implemented in code:** `TORCH_CHECK` block right after `plan_chunks()` including the `covered == B*32` coverage guard.
+
+**Plan item 10:** Anti-regression: `nchunks==1` keeps the original launch sequence.
+**Implemented in code:** `if (nchunks == 1)` fast path in `fused_block` invoking the chunk helpers with `(n_off=0, ns=B, g0=0, gb=32, target=114*16)`, a parameterization under which all four kernels reduce to bit-identical index math and launch shapes as the base kernel.
+
+=== KERNEL CODE STARTS BELOW ===
+
+```python
+# ==========================================================================
+# ModelNew — SOL 002_vae_conv3x3_groupnorm_silu_residual_fused
+#
+# THIS REVISION: l2_cache_blocking
+#   The GroupNorm stats pass and its affine+SiLU apply pass are scheduled
+#   back-to-back over the SAME <=20 MB slice of the activation tensor,
+#   chunked over (sample, channel-group).  GroupNorm statistics are exactly
+#   per (n, group), so slicing by whole samples and whole groups is
+#   algebraically identical.  The apply pass then hits L2 instead of DRAM.
+#
+# Fusion map (unchanged except for the chunk loop):
+#    K_A  nchw2nhwc_kernel        : 32x32 tiled NCHW->NHWC transpose (entry).
+#    at::conv2d (cuDNN, NHWC)     : conv1 -> y1 (channels_last)
+#    per chunk: K_B gn_stats -> K_C gn_finalize -> K_D gn_silu_nhwc_inplace
+#    at::conv2d (cuDNN, NHWC)     : conv2 -> y2 (channels_last)
+#    per chunk: K_B gn_stats -> K_C gn_finalize -> K_E gn_silu_res_nchw_v4
+#                                   (scalar variant for HW%4!=0 and tails)
+#
+# Precision: float32 storage AND arithmetic end-to-end; reductions accumulate
+# in float per thread and are combined in double.  TF32 only inside cuDNN.
+# When nchunks == 1 (ns == B, gb == 32) every kernel reduces to bit-identical
+# index math and launch geometry as the previous revision.
+# ==========================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+#define GN_GROUPS 32
+#define GN_C 256
+#define GN_CPG 8          // channels per group (256 / 32)
+
+__device__ __forceinline__ float silu_f(float t) {
+    return t / (1.0f + __expf(-t));
+}
+
+// ---------------------------------------------------------------- K_A
+// NCHW -> NHWC, 32(channel) x 32(pixel) shared-memory tiles.  [untouched]
+__global__ void nchw2nhwc_kernel(const float* __restrict__ in,
+                                 float* __restrict__ out,
+                                 int C, int HW) {
+    __shared__ float tile[32][33];
+    const int p0 = blockIdx.x * 32;
+    const int c0 = blockIdx.y * 32;
+    const int n  = blockIdx.z;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const size_t in_base  = (size_t)n * (size_t)C * (size_t)HW;
+    const size_t out_base = (size_t)n * (size_t)HW * (size_t)C;
+
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        const int jj = j + ty;
+        const int c  = c0 + jj;
+        const int p  = p0 + tx;
+        float v = 0.0f;
+        if (p < HW) v = in[in_base + (size_t)c * HW + p];
+        tile[jj][tx] = v;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        const int jj = j + ty;
+        const int p  = p0 + jj;
+        if (p < HW) {
+            out[out_base + (size_t)p * C + c0 + tx] = tile[tx][jj];
+        }
+    }
+}
+
+// ---------------------------------------------------------------- K_B
+// PLAN ITEM 3: partial (sum, sumsq) for a CHUNK = samples [n_off, n_off+ns)
+// x groups [g0, g0+gb).  n4 = 2*gb float4 per pixel inside the chunk,
+// pp = 64/n4 pixel slots per thread-x block.  128-bit loads preserved
+// (gb >= 4  =>  gb*32 >= 128 B contiguous per pixel).
+__global__ void gn_stats_kernel(const float* __restrict__ y,
+                                float* __restrict__ partial,
+                                int HW, int tiles, int ppb,
+                                int n_off, int g0, int log2n4) {
+    const int n4 = 1 << log2n4;      // float4 per pixel in this chunk
+    const int gb = n4 >> 1;          // groups per chunk
+    const int pp = 64 >> log2n4;     // == 32 / gb
+
+    const int tile = blockIdx.x;
+    const int nl   = blockIdx.y;             // local sample inside the chunk
+    const int n    = n_off + nl;
+    const int tx   = threadIdx.x;            // 0..63
+    const int ty   = threadIdx.y;            // 0..3
+
+    const int sub_p = tx >> log2n4;          // 0..pp-1
+    const int c4l   = tx & (n4 - 1);         // 0..n4-1
+    const int lg    = c4l >> 1;              // local group 0..gb-1
+    const int c4    = 2 * g0 + c4l;          // absolute float4 index along C
+
+    const int p_start = tile * ppb;
+    int p_end = p_start + ppb;
+    if (p_end > HW) p_end = HW;
+
+    const float4* base =
+        reinterpret_cast<const float4*>(y + (size_t)n * (size_t)HW * GN_C);
+
+    float s = 0.0f, ss = 0.0f;
+    for (int p = p_start + ty * pp + sub_p; p < p_end; p += 4 * pp) {
+        float4 v = base[(size_t)p * 64 + c4];
+        s  += v.x + v.y + v.z + v.w;
+        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    s  += __shfl_down_sync(0xffffffffu, s, 1);
+    ss += __shfl_down_sync(0xffffffffu, ss, 1);
+
+    __shared__ float sm_s[4][32];
+    __shared__ float sm_ss[4][32];
+    if ((c4l & 1) == 0) {
+        sm_s [ty][sub_p * gb + lg] = s;
+        sm_ss[ty][sub_p * gb + lg] = ss;
+    }
+    __syncthreads();
+
+    const int lin = ty * 64 + tx;
+    if (lin < gb) {
+        float a = 0.0f, b = 0.0f;
+        #pragma unroll
+        for (int t2 = 0; t2 < 4; ++t2) {
+            for (int sp = 0; sp < pp; ++sp) {
+                a += sm_s [t2][sp * gb + lin];
+                b += sm_ss[t2][sp * gb + lin];
+            }
+        }
+        size_t off = ((size_t)nl * tiles + tile) * (size_t)(2 * gb)
+                   + (size_t)lin * 2;
+        partial[off]     = a;
+        partial[off + 1] = b;
+    }
+}
+
+// ---------------------------------------------------------------- K_C
+// PLAN ITEM 4: ns*gb blocks; idx -> (n_off + n_local, g0 + g_local).
+__global__ void gn_finalize_kernel(const float* __restrict__ partial,
+                                   float* __restrict__ mean,
+                                   float* __restrict__ rstd,
+                                   int tiles, double invN, double eps,
+                                   int n_off, int g0, int gb) {
+    const int idx = blockIdx.x;              // n_local * gb + g_local
+    const int nl  = idx / gb;
+    const int gl  = idx - nl * gb;
+
+    const int stride_t = 2 * gb;
+    const float* base = partial + (size_t)nl * tiles * stride_t + (size_t)gl * 2;
+
+    double s = 0.0, ss = 0.0;
+    for (int t = threadIdx.x; t < tiles; t += blockDim.x) {
+        s  += (double)base[(size_t)t * stride_t];
+        ss += (double)base[(size_t)t * stride_t + 1];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s  += __shfl_down_sync(0xffffffffu, s,  off);
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    }
+    __shared__ double sm_s[8];
+    __shared__ double sm_ss[8];
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+    if (lane == 0) { sm_s[wid] = s; sm_ss[wid] = ss; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int nw = blockDim.x >> 5;
+        double S = 0.0, SS = 0.0;
+        for (int i = 0; i < nw; ++i) { S += sm_s[i]; SS += sm_ss[i]; }
+        double m   = S * invN;
+        double var = (SS - S * S * invN) * invN;
+        if (!(var > 0.0)) var = 0.0;
+        const int out_idx = (n_off + nl) * GN_GROUPS + (g0 + gl);
+        mean[out_idx] = (float)m;
+        rstd[out_idx] = (float)(1.0 / sqrt(var + eps));
+    }
+}
+
+// ---------------------------------------------------------------- K_D
+// PLAN ITEM 5: chunked GN affine + SiLU, in-place NHWC.  float4 kept.
+__global__ void gn_silu_nhwc_inplace(float* __restrict__ y,
+                                     const float* __restrict__ mean,
+                                     const float* __restrict__ rstd,
+                                     const float* __restrict__ gamma,
+                                     const float* __restrict__ beta,
+                                     int HW, int n_off, int g0, int log2n4) {
+    const int n4 = 1 << log2n4;
+    const int n  = n_off + blockIdx.y;
+    float4* yn = reinterpret_cast<float4*>(y + (size_t)n * (size_t)HW * GN_C);
+
+    const long long total  = (long long)HW * n4;
+    const long long stride = (long long)gridDim.x * blockDim.x;
+
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += stride) {
+        const int q = (int)(i & (n4 - 1));
+        const long long p = i >> log2n4;
+        const int c4 = 2 * g0 + q;
+        const int g  = g0 + (q >> 1);
+
+        const float m = mean[n * GN_GROUPS + g];
+        const float r = rstd[n * GN_GROUPS + g];
+
+        const int c = c4 * 4;
+        const float a0 = r * gamma[c + 0];
+        const float a1 = r * gamma[c + 1];
+        const float a2 = r * gamma[c + 2];
+        const float a3 = r * gamma[c + 3];
+        const float b0 = beta[c + 0] - m * a0;
+        const float b1 = beta[c + 1] - m * a1;
+        const float b2 = beta[c + 2] - m * a2;
+        const float b3 = beta[c + 3] - m * a3;
+
+        const long long idx = p * 64 + c4;
+        float4 v = yn[idx];
+        float t;
+        t = v.x * a0 + b0; v.x = silu_f(t);
+        t = v.y * a1 + b1; v.y = silu_f(t);
+        t = v.z * a2 + b2; v.z = silu_f(t);
+        t = v.w * a3 + b3; v.w = silu_f(t);
+        yn[idx] = v;
+    }
+}
+
+// ---------------------------------------------------------------- K_E (scalar)
+// PLAN ITEM 6: + c_tile_off / n_off for chunking.  Math unchanged.
+__global__ void gn_silu_res_nchw_kernel(const float* __restrict__ y,
+                                        const float* __restrict__ res,
+                                        float* __restrict__ out,
+                                        const float* __restrict__ mean,
+                                        const float* __restrict__ rstd,
+                                        const float* __restrict__ gamma,
+                                        const float* __restrict__ beta,
+                                        int C, int HW, int p_offset,
+                                        int c_tile_off, int n_off) {
+    __shared__ float tile[32][33];
+    const int p0 = p_offset + blockIdx.x * 32;
+    const int c0 = (c_tile_off + blockIdx.y) * 32;
+    const int n  = n_off + blockIdx.z;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int c = c0 + tx;
+    const int g = c / GN_CPG;
+    const float m = mean[n * GN_GROUPS + g];
+    const float r = rstd[n * GN_GROUPS + g];
+    const float a = r * gamma[c];
+    const float b = beta[c] - m * a;
+
+    const float* yn = y + (size_t)n * (size_t)HW * (size_t)C;
+
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        const int jj = j + ty;
+        const int p  = p0 + jj;
+        float v = 0.0f;
+        if (p < HW) v = yn[(size_t)p * C + c];
+        const float t = v * a + b;
+        tile[jj][tx] = silu_f(t);
+    }
+    __syncthreads();
+
+    const size_t nchw_base = (size_t)n * (size_t)C * (size_t)HW;
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        const int jj = j + ty;
+        const int cc = c0 + jj;
+        const int p  = p0 + tx;
+        if (p < HW) {
+            const size_t off = nchw_base + (size_t)cc * HW + p;
+            out[off] = tile[tx][jj] + res[off];
+        }
+    }
+}
+
+// ---------------------------------------------------------------- K_E (float4)
+// PLAN ITEM 6: mem_vectorize preserved (128-bit on all three streams),
+// plus c_tile_off / n_off for chunking.
+__global__ void gn_silu_res_nchw_v4_kernel(const float* __restrict__ y,
+                                           const float* __restrict__ res,
+                                           float* __restrict__ out,
+                                           const float* __restrict__ mean,
+                                           const float* __restrict__ rstd,
+                                           const float* __restrict__ gamma,
+                                           const float* __restrict__ beta,
+                                           int C, int HW,
+                                           int c_tile_off, int n_off) {
+    __shared__ float tile[32][36];          // [channel-in-tile][pixel-in-tile]
+
+    const int p0  = blockIdx.x * 32;
+    const int c0  = (c_tile_off + blockIdx.y) * 32;
+    const int n   = n_off + blockIdx.z;
+    const int tid = threadIdx.x;            // 0..255
+
+    // ---------------- load phase : float4 along C (NHWC) + fused affine/SiLU
+    const int ch4 = tid & 7;
+    const int pl  = tid >> 3;
+    const int c   = c0 + 4 * ch4;
+    const int g   = c >> 3;                 // == c / GN_CPG, GN_CPG == 8
+
+    const float m = mean[n * GN_GROUPS + g];
+    const float r = rstd[n * GN_GROUPS + g];
+
+    const float4 gm = *reinterpret_cast<const float4*>(gamma + c);
+    const float4 bt = *reinterpret_cast<const float4*>(beta  + c);
+
+    const float a0 = r * gm.x;
+    const float a1 = r * gm.y;
+    const float a2 = r * gm.z;
+    const float a3 = r * gm.w;
+    const float b0 = bt.x - m * a0;
+    const float b1 = bt.y - m * a1;
+    const float b2 = bt.z - m * a2;
+    const float b3 = bt.w - m * a3;
+
+    const float* yn = y + (size_t)n * (size_t)HW * (size_t)C;
+    const float4 v = *reinterpret_cast<const float4*>(
+                         yn + (size_t)(p0 + pl) * (size_t)C + (size_t)c);
+
+    tile[4 * ch4 + 0][pl] = silu_f(fmaf(v.x, a0, b0));
+    tile[4 * ch4 + 1][pl] = silu_f(fmaf(v.y, a1, b1));
+    tile[4 * ch4 + 2][pl] = silu_f(fmaf(v.z, a2, b2));
+    tile[4 * ch4 + 3][pl] = silu_f(fmaf(v.w, a3, b3));
+
+    __syncthreads();
+
+    // ---------------- store phase : float4 along W (NCHW) for res + out
+    const int p4 = tid & 7;
+    const int cr = tid >> 3;
+    const int cc = c0 + cr;
+
+    const size_t off = (size_t)n * (size_t)C * (size_t)HW
+                     + (size_t)cc * (size_t)HW + (size_t)(p0 + 4 * p4);
+
+    const float4 rr = *reinterpret_cast<const float4*>(res + off);
+    const float4 s  = *reinterpret_cast<const float4*>(&tile[cr][4 * p4]);
+
+    float4 o;
+    o.x = s.x + rr.x;
+    o.y = s.y + rr.y;
+    o.z = s.z + rr.z;
+    o.w = s.w + rr.w;
+    *reinterpret_cast<float4*>(out + off) = o;
+}
+
+// ---------------------------------------------------------------- host
+// PLAN ITEM 8: per-chunk tiling; ppb rounded to a multiple of 4*pp so every
+// (ty, sub_p) slot is used.  For gb == 32 (pp == 1) this is the original rule.
+static inline void pick_tiling(int nsamp, int HW, int target, int pp,
+                               int& tiles, int& ppb) {
+    int t = (target + nsamp - 1) / nsamp;
+    if (t < 1)  t = 1;
+    if (t > HW) t = HW;
+    ppb = (HW + t - 1) / t;
+    if (ppb < 8) ppb = 8;
+    const int q = 4 * pp;
+    ppb = ((ppb + q - 1) / q) * q;
+    tiles = (HW + ppb - 1) / ppb;
+}
+
+static inline bool aligned16(const void* p) {
+    return (reinterpret_cast<uintptr_t>(p) & 15u) == 0u;
+}
+
+// PLAN ITEM 1: chunk planner.
+static inline void plan_chunks(int B, int HW, int& ns, int& gb) {
+    const size_t bps   = (size_t)HW * 256u * 4u;          // bytes per sample
+    const size_t total = (size_t)B * bps;
+    const size_t cap   = (size_t)24u * 1024u * 1024u;
+    const size_t budget= (size_t)20u * 1024u * 1024u;
+
+    if (total <= cap) { ns = B; gb = 32; return; }
+
+    long long nn = (long long)(budget / bps);
+    if (nn < 1) nn = 1;
+    if (nn > B) nn = B;
+    ns = (int)nn;
+    gb = 32;
+    if (ns == 1 && bps > budget) {
+        gb = 4;
+        const int cand[3] = {16, 8, 4};
+        for (int i = 0; i < 3; ++i) {
+            if (bps * (size_t)cand[i] / 32u <= budget) { gb = cand[i]; break; }
+        }
+    }
+}
+
+static inline int ilog2_i(int v) { int r = 0; while ((1 << r) < v) ++r; return r; }
+
+// PLAN ITEM 2/7: chunked GN1 (stats -> finalize -> apply, per chunk).
+static void run_gn1_chunked(at::Tensor& y, at::Tensor& mean, at::Tensor& rstd,
+                            const at::Tensor& gamma, const at::Tensor& beta,
+                            int B, int HW, double eps, int ns, int gb,
+                            cudaStream_t stream) {
+    const int n4     = 2 * gb;
+    const int log2n4 = ilog2_i(n4);
+    const int pp     = 32 / gb;
+    const bool full  = (ns == B) && (gb == 32);
+
+    int tiles, ppb;
+    pick_tiling(ns, HW, full ? (114 * 16) : (114 * 4), pp, tiles, ppb);
+
+    auto partial = at::empty({(long)ns * (long)tiles * (long)gb * 2}, y.options());
+    const double invN = 1.0 / ((double)HW * (double)GN_CPG);
+
+    long long total_apply = (long long)HW * n4;
+    int bx = (int)((total_apply + 255) / 256);
+    if (bx > 4096) bx = 4096;
+    if (bx < 1) bx = 1;
+
+    for (int n0 = 0; n0 < B; n0 += ns) {
+        int ns_cur = ns;
+        if (n0 + ns_cur > B) ns_cur = B - n0;
+        for (int g0 = 0; g0 < GN_GROUPS; g0 += gb) {
+            gn_stats_kernel<<<dim3(tiles, ns_cur), dim3(64, 4), 0, stream>>>(
+                y.data_ptr<float>(), partial.data_ptr<float>(),
+                HW, tiles, ppb, n0, g0, log2n4);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            gn_finalize_kernel<<<ns_cur * gb, 256, 0, stream>>>(
+                partial.data_ptr<float>(), mean.data_ptr<float>(),
+                rstd.data_ptr<float>(), tiles, invN, eps, n0, g0, gb);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            gn_silu_nhwc_inplace<<<dim3(bx, ns_cur), 256, 0, stream>>>(
+                y.data_ptr<float>(), mean.data_ptr<float>(), rstd.data_ptr<float>(),
+                gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                HW, n0, g0, log2n4);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    }
+}
+
+// PLAN ITEM 2/6/7: chunked GN2 (stats -> finalize -> apply+residual+transpose).
+static void run_gn2_chunked(const at::Tensor& y, const float* resp, float* outp,
+                            at::Tensor& mean, at::Tensor& rstd,
+                            const at::Tensor& gamma, const at::Tensor& beta,
+                            int B, int C, int HW, double eps, int ns, int gb,
+                            cudaStream_t stream) {
+    const int n4     = 2 * gb;
+    const int log2n4 = ilog2_i(n4);
+    const int pp     = 32 / gb;
+    const bool full  = (ns == B) && (gb == 32);
+
+    int tiles, ppb;
+    pick_tiling(ns, HW, full ? (114 * 16) : (114 * 4), pp, tiles, ppb);
+
+    auto partial = at::empty({(long)ns * (long)tiles * (long)gb * 2}, y.options());
+    const double invN = 1.0 / ((double)HW * (double)GN_CPG);
+
+    const float* y2p = y.data_ptr<float>();
+    const bool use_v4 = (HW % 4 == 0) && (HW >= 32) &&
+                        aligned16(y2p) && aligned16(resp) && aligned16(outp);
+    const int full_tiles = HW / 32;
+    const int tail_start = full_tiles * 32;
+    const int ctiles     = gb / 4;                 // 32-channel tiles per chunk
+
+    for (int n0 = 0; n0 < B; n0 += ns) {
+        int ns_cur = ns;
+        if (n0 + ns_cur > B) ns_cur = B - n0;
+        for (int g0 = 0; g0 < GN_GROUPS; g0 += gb) {
+            const int c_tile_off = g0 / 4;         // (g0*8)/32
+
+            gn_stats_kernel<<<dim3(tiles, ns_cur), dim3(64, 4), 0, stream>>>(
+                y2p, partial.data_ptr<float>(), HW, tiles, ppb, n0, g0, log2n4);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            gn_finalize_kernel<<<ns_cur * gb, 256, 0, stream>>>(
+                partial.data_ptr<float>(), mean.data_ptr<float>(),
+                rstd.data_ptr<float>(), tiles, invN, eps, n0, g0, gb);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            if (use_v4) {
+                if (full_tiles > 0) {
+                    dim3 grd(full_tiles, ctiles, ns_cur);
+                    gn_silu_res_nchw_v4_kernel<<<grd, 256, 0, stream>>>(
+                        y2p, resp, outp,
+                        mean.data_ptr<float>(), rstd.data_ptr<float>(),
+                        gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                        C, HW, c_tile_off, n0);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                }
+                if (tail_start < HW) {
+                    dim3 blk(32, 8);
+                    dim3 grd(1, ctiles, ns_cur);
+                    gn_silu_res_nchw_kernel<<<grd, blk, 0, stream>>>(
+                        y2p, resp, outp,
+                        mean.data_ptr<float>(), rstd.data_ptr<float>(),
+                        gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                        C, HW, tail_start, c_tile_off, n0);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                }
+            } else {
+                dim3 blk(32, 8);
+                dim3 grd((HW + 31) / 32, ctiles, ns_cur);
+                gn_silu_res_nchw_kernel<<<grd, blk, 0, stream>>>(
+                    y2p, resp, outp,
+                    mean.data_ptr<float>(), rstd.data_ptr<float>(),
+                    gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                    C, HW, 0, c_tile_off, n0);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            }
+        }
+    }
+}
+
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor w1, torch::Tensor n1w, torch::Tensor n1b,
+                          torch::Tensor w2, torch::Tensor n2w, torch::Tensor n2b,
+                          double eps) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "fp32 only");
+    TORCH_CHECK(x.dim() == 4, "x must be NCHW");
+    const int B = (int)x.size(0);
+    const int C = (int)x.size(1);
+    const int H = (int)x.size(2);
+    const int W = (int)x.size(3);
+    TORCH_CHECK(C == GN_C, "this kernel is specialised for C=256");
+    const int HW = H * W;
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto x_c  = x.is_contiguous() ? x : x.contiguous();
+    auto g1_c = n1w.is_contiguous() ? n1w : n1w.contiguous();
+    auto b1_c = n1b.is_contiguous() ? n1b : n1b.contiguous();
+    auto g2_c = n2w.is_contiguous() ? n2w : n2w.contiguous();
+    auto b2_c = n2b.is_contiguous() ? n2b : n2b.contiguous();
+
+    // ---------------- PLAN ITEM 1: chunk planner ----------------
+    int ns = B, gb = 32;
+    plan_chunks(B, HW, ns, gb);
+
+    // ---------------- PLAN ITEM 9: validation ----------------
+    const int n4 = 2 * gb;
+    TORCH_CHECK(gb == 4 || gb == 8 || gb == 16 || gb == 32, "bad gb");
+    TORCH_CHECK((GN_GROUPS % gb) == 0, "gb must tile 32 groups");
+    TORCH_CHECK(((gb * GN_CPG) % 32) == 0, "chunk must be a multiple of 32 channels");
+    TORCH_CHECK((n4 & (n4 - 1)) == 0 && n4 > 0, "n4 must be a power of two");
+    TORCH_CHECK(ns >= 1 && ns <= B, "bad ns");
+    {
+        long long covered = 0;
+        int nchunks_dbg = 0;
+        for (int n0 = 0; n0 < B; n0 += ns) {
+            int ns_cur = ns; if (n0 + ns_cur > B) ns_cur = B - n0;
+            for (int g0 = 0; g0 < GN_GROUPS; g0 += gb) {
+                covered += (long long)ns_cur * gb;
+                ++nchunks_dbg;
+            }
+        }
+        TORCH_CHECK(covered == (long long)B * GN_GROUPS,
+                    "chunk list does not tile (B x 32 groups) exactly");
+        (void)nchunks_dbg;
+    }
+    const int nchunks = ((B + ns - 1) / ns) * (GN_GROUPS / gb);
+    // PLAN ITEM 10: nchunks == 1 -> ns == B, gb == 32 -> original launch geometry.
+    if (nchunks == 1) { ns = B; gb = 32; }
+
+    // ---- K_A : one-shot NCHW -> NHWC for the activations
+    auto x_nhwc = at::empty({B, C, H, W},
+                            x_c.options().memory_format(at::MemoryFormat::ChannelsLast));
+    {
+        dim3 blk(32, 8);
+        dim3 grd((HW + 31) / 32, C / 32, B);
+        nchw2nhwc_kernel<<<grd, blk, 0, stream>>>(
+            x_c.data_ptr<float>(), x_nhwc.data_ptr<float>(), C, HW);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    auto w1c = w1.contiguous(at::MemoryFormat::ChannelsLast);
+    auto w2c = w2.contiguous(at::MemoryFormat::ChannelsLast);
+
+    at::Tensor no_bias;  // undefined -> no bias
+
+    auto mean = at::empty({B, GN_GROUPS}, x_c.options());
+    auto rstd = at::empty({B, GN_GROUPS}, x_c.options());
+
+    // ---- conv1 (cuDNN NHWC TF32 implicit GEMM)  [untouched mainloop]
+    auto y1 = at::conv2d(x_nhwc, w1c, no_bias, {1, 1}, {1, 1}, {1, 1}, 1);
+    if (!y1.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y1 = y1.contiguous(at::MemoryFormat::ChannelsLast);
+
+    // ---- GN1 + SiLU, L2-blocked over (sample, group) chunks
+    run_gn1_chunked(y1, mean, rstd, g1_c, b1_c, B, HW, eps, ns, gb, stream);
+
+    // ---- conv2 (cuDNN NHWC TF32 implicit GEMM)  [untouched mainloop]
+    auto y2 = at::conv2d(y1, w2c, no_bias, {1, 1}, {1, 1}, {1, 1}, 1);
+    if (!y2.is_contiguous(at::MemoryFormat::ChannelsLast))
+        y2 = y2.contiguous(at::MemoryFormat::ChannelsLast);
+
+    auto out = at::empty({B, C, H, W}, x_c.options());  // contiguous NCHW
+
+    // ---- GN2 + SiLU + residual + NHWC->NCHW, L2-blocked over the same chunks
+    run_gn2_chunked(y2, x_c.data_ptr<float>(), out.data_ptr<float>(),
+                    mean, rstd, g2_c, b2_c, B, C, HW, eps, ns, gb, stream);
+
+    return out;
+}
+"""
+
+_CPP_SRC = r"""
+torch::Tensor fused_block(torch::Tensor x,
+                          torch::Tensor w1, torch::Tensor n1w, torch::Tensor n1b,
+                          torch::Tensor w2, torch::Tensor n2w, torch::Tensor n2b,
+                          double eps);
+"""
+
+_ext = load_inline(
+    name="vae_resblock_fused_l2blk",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["fused_block"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3",
+        "-std=c++20",
+        "--expt-relaxed-constexpr",
+        "-lineinfo",
+        "-gencode=arch=compute_90,code=sm_90",
+    ],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """Granularity (C): the whole residual block collapsed into a few fused kernels
+    plus two vendor cuDNN convs.  This revision applies L2 cache blocking: the
+    GroupNorm stats pass and its affine+SiLU apply pass now run back-to-back over
+    the same <=20 MB (sample, channel-group) slice, so the apply pass hits L2
+    instead of re-reading the activation from DRAM."""
+
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        if torch.is_tensor(eps):
+            eps_f = float(eps.reshape(()).item())
+        else:
+            eps_f = float(eps)
+
+        if (x.is_cuda and x.dtype == torch.float32 and x.dim() == 4
+                and x.size(1) == 256 and conv1_weight.dtype == torch.float32
+                and conv2_weight.dtype == torch.float32):
+            return self.ext.fused_block(x, conv1_weight, norm1_weight, norm1_bias,
+                                        conv2_weight, norm2_weight, norm2_bias, eps_f)
+
+        # Fallback (never taken for this problem's workloads): reference semantics.
+        out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, 32, weight=norm1_weight, bias=norm1_bias, eps=eps_f)
+        out = F.silu(out)
+        out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)
+        out = F.group_norm(out, 32, weight=norm2_weight, bias=norm2_bias, eps=eps_f)
+        out = F.silu(out)
+        return out + x
+```

@@ -1,0 +1,35 @@
+[BATCH] Output folder: /home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/own_gemm/20260804_154010_vae_block_002_claude_claude-opus-5
+[vae_block_002.py] Round 0
+[Seed] Generating the initial kernel ...
+[ref_profile] Profiling reference model to inform granularity choice ...
+[gpu_lock] own_gemm(D/implicit_gemm): waiting for the GPU to free up (ref_profile) ...
+[gpu_lock] own_gemm(D/implicit_gemm): acquired after 3.5s (ref_profile)
+[ref_profile] REFERENCE PROFILE (measured on this GPU, not estimated)
+[ref_profile] The unmodified reference takes 1479.3 us of GPU time per forward.
+[ref_profile] Where that time actually goes:
+[Seed] Drawing candidate 1/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=82905, Out=73004, Total=155909
+[92mFinish reason: end_turn[0m
+[extract] recovered kernel across a mid-stream continuation fence (239 -> 459 lines)
+[seed] score=0.6565 (geomean over 4 shapes: 8x256x64x128=0.6426x  2x256x64x64=0.5678x  4x256x256x256=0.6407x  1x256x131x131=0.7945x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/own_gemm/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json
+[Seed] Drawing candidate 2/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=100000, Out=104127, Total=204127
+[92mFinish reason: end_turn[0m
+[extract] recovered kernel across a mid-stream continuation fence (179 -> 436 lines)
+[seed] score=0.1755 (geomean over 4 shapes: 8x256x64x128=0.1792x  2x256x64x64=0.1404x  4x256x256x256=0.1775x  1x256x131x131=0.2122x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/own_gemm/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json
+[Seed] Drawing candidate 3/3 ...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+⚠️  Exception occurred (attempt 1/3). Retrying in 1.0s...
+Skipping non-text content block of type 'ThinkingBlock'

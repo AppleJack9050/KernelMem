@@ -1,0 +1,210 @@
+{
+  "version": 1,
+  "task": "tasks/vae_block_002.py",
+  "next_round": 6,
+  "total_rounds": 10,
+  "base": {
+    "code_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_163632.py",
+    "eval_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0006.json",
+    "score": 1.6686793298194427
+  },
+  "best": {
+    "code_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_163632.py",
+    "eval_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0006.json",
+    "score": 1.6686793298194427
+  },
+  "current": {
+    "code_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_164625.py",
+    "eval_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0007.json",
+    "score": 1.5970224016811059
+  },
+  "repair_chain": null,
+  "base_score": 1.6686793298194427,
+  "best_score": 1.6686793298194427,
+  "optimization_tree": {
+    "kernel_20260804_154617": {
+      "parent": null,
+      "kernel_name": "kernel_20260804_154617",
+      "kernel_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_154617.py",
+      "speedup": 1.598914981804153,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "seed",
+      "round": 0,
+      "strategy": null,
+      "method_matched": false,
+      "timestamp": "2026-08-04T15:58:39.248256",
+      "ncu_profile_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_154617_ncu.csv"
+    },
+    "kernel_20260804_160557": {
+      "parent": "kernel_20260804_154617",
+      "kernel_name": "kernel_20260804_160557",
+      "kernel_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_160557.py",
+      "speedup": 1.6127682779720398,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 1,
+      "strategy": {
+        "bottleneck": "[DRAM-bandwidth-bound, memory-instruction-limited] Hottest non-removable, non-mainloop kernel is gn_silu_res_nchw_kernel (12.9% forward GPU time, 1,488us, 141us on the profiled 8x256x64x128 shape). It moves the minimum 3x67MB but reaches only 66.36% DRAM vs 82.55% for the float4 gn_stats_kernel, with 70.0% long-scoreboard stalls and the highest instruction count (36.4M) because every load/store is a scalar 4-byte access.",
+        "primary_optimisation_method": "mem_vectorize: convert the GN2+SiLU+residual+NHWC->NCHW epilogue to 128-bit (float4) accesses on all three streams — float4 along C for the NHWC read (C=256, always 16B aligned) and float4 along W for the NCHW residual read and output store — using the existing 32x32 smem tile as the transpose buffer. Evidence-tied: the same candidate's float4 elementwise kernel hits 77.4% DRAM at 19.3 warp-cycles/instr, while this scalar kernel gets 66.4% at 27.6 cycles/instr with 2.2x the instructions; 4x fewer L1TEX wavefronts raises memory-level parallelism on a DRAM-bound kernel.",
+        "method_name": "mem_vectorize",
+        "modification_plan": "SMEM BUDGET (mandatory, tiling is reused not introduced): tile is 32 channels x 32 pixels, padded to float[32][36] = 32*36*4 = 4,608 B/block (single buffer). H100 limit is 227 KB/block and 228 KB/SM, so 4,608 B allows >32 blocks/SM — it is not the occupancy limiter (registers cap at 8 blocks). PASS.\n\nCHECKLIST\n1. Add `gn_silu_res_nchw_v4_kernel` next to the existing one. Block = 256 threads (1-D). Grid = (HW/32, C/32, B). Replace ALL scalar accesses with float4: (a) NHWC load — `int ch4 = tid & 7; int pl = tid >> 3; const float4 v = *reinterpret_cast<const float4*>(yn + (size_t)(p0+pl)*C + c0 + 4*ch4);` (8 threads x 16 B = 128 B contiguous per pixel, 4 pixels per warp); (b) NCHW residual load and output store — `int p4 = tid & 7; int cc = c0 + (tid >> 3); float4 r = *reinterpret_cast<const float4*>(res + nchw_base + (size_t)cc*HW + p0 + 4*p4);` and the matching `*reinterpret_cast<float4*>(out + ...) = o;` (8 threads x 16 B = 128 B contiguous per channel row, 4 rows per warp).\n2. Fold the affine into the vector load: per thread compute the group once as `g = (c0 + 4*ch4) >> 3` (replace the `c / GN_CPG` integer division), load mean/rstd once, then `a_k = rstd*gamma[c+k]`, `b_k = beta[c+k] - mean*a_k`, and use FMA `t = fmaf(v.k, a_k, b_k); tile[4*ch4+k][pl] = silu_f(t);` — 4 channels per thread, one mean/rstd fetch instead of four (4 consecutive channels always lie in the same group of 8 because c0 is a multiple of 32).\n3. Store phase: read `float4 s = *reinterpret_cast<const float4*>(&tile[cc-c0][4*p4]);` (row stride 36 floats keeps 16 B alignment and avoids bank conflicts), then `o.x = s.x + r.x; ...` and one 16 B store. Net per thread: 1 vector load of y2, 1 vector load of res, 1 vector store — down from 4 scalar loads + 4 scalar loads + 4 scalar stores.\n4. Host dispatch guard (anti-regression for the awkward shape): use the vector kernel only when `HW % 4 == 0` and `(HW % 32 == 0)`; otherwise launch the existing scalar kernel unchanged. HW=17161 (131x131) is odd, so that shape keeps today's 2.058x path bit-for-bit. For HW%32!=0 but HW%4==0, launch the vector kernel on `HW/32` full tiles and the scalar kernel on the `HW%32` tail columns (grid offset), so no pixel is written twice and none is missed.\n5. Do NOT touch conv1/conv2 (cuDNN sm90 TF32 implicit GEMM, 62% of forward, already ~221 TFLOPS = measured TF32 peak — default-keep mainloop), nor gn_stats/gn_finalize/gn_silu_nhwc_inplace/nchw2nhwc. Exactly one mechanism changes.\n6. Keep everything fp32 end-to-end; stats still accumulate in float and combine in double; no dtype change anywhere.\n7. Verify: max |diff| vs reference under atol 2.8e-3 on all four shapes; assert 16 B alignment of `out`/`res`/`y2` base pointers (caching allocator guarantees 256 B) before taking the vector path.",
+        "evidence": "gn_silu_res_nchw_kernel: gpu__time_duration 142,880 ns, 12.9% of forward (1,488us), gpu__dram_throughput 66.23% vs 82.55% (gn_stats, float4) and 77.90% (gn_silu_nhwc_inplace, float4); smsp__inst_executed.sum 36.4M — 1.6x the float4 kernel's 22.8M for the same 3-stream byte count; long_scoreboard 70.04%, warp cycles/issued instr 27.55 vs 19.28. Root cause: scalar 4 B accesses give only 128 B per warp memory instruction and 4x more in-flight requests per byte, so the kernel cannot saturate HBM despite 90.17% achieved occupancy. Refutation of alternatives: (a) it is not occupancy-bound — 90.17% achieved, 14.39 active warps/scheduler; (b) it is not the conv — the sm90_xmma fprop kernel already runs 77.3 GFLOP in ~350us = ~221 TFLOPS, i.e. at the board's measured 223 TFLOPS TF32 peak, so rewriting it cannot win and it stays untouched.",
+        "expected_metric_change": "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed for gn_silu_res_nchw: 66.2% -> >=78%; smsp__inst_executed.sum: 36.4M -> <=16M; smsp__warp_issue_stalled_long_scoreboard pct: 70.0% -> <60%; kernel duration 142.9us -> <=118us on 8x256x64x128, forward total 1.142ms -> ~1.11ms (speedup 1.441 -> ~1.48). Anti-regression constraints: (1) nchw2nhwc/gn_stats/gn_finalize/gn_silu_nhwc_inplace durations and the cuDNN conv durations must not change by more than 2%; (2) the 1x256x131x131 shape (HW=17161, odd) must take the untouched scalar path and keep speedup >=2.05; (3) geometric-mean speedup across all four shapes must strictly increase; (4) max abs error stays within atol 2.8e-3 / rtol 1e-5 on every shape.",
+        "headroom": "medium"
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-04T16:06:51.840519",
+      "paired_verdict": {
+        "rel_pct": 1.40274356471084,
+        "se_pct": 0.2943727709243281,
+        "t": 4.765194689394148,
+        "reps": 3,
+        "resolved": true
+      },
+      "ncu_profile_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_160557_ncu.csv"
+    },
+    "kernel_20260804_161451": {
+      "parent": "kernel_20260804_160557",
+      "kernel_name": "kernel_20260804_161451",
+      "kernel_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_161451.py",
+      "speedup": 1.6209786633686663,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 2,
+      "strategy": {
+        "bottleneck": "[compute-bound mainloop + serialized memory-bound tail] `sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_nhwc` holds 63.5% (7,133us/24 launches, ~297us each ≈260 TFLOPS TF32) but touches DRAM at only ~0.45 TB/s (~22% peak). The remaining 36.5% (gn_stats, gn_silu_nhwc_inplace, nchw2nhwc, gn_silu_res_nchw_v4) runs at 76–89% DRAM peak with SM 13–40%. They run strictly sequentially, so complementary resources are never used simultaneously.",
+        "primary_optimisation_method": "Multi-stream batch-chunk pipelining: split the batch into independent chunks (GroupNorm stats are per-(n,group), so chunking along N is exactly equivalent) and run each chunk's whole pipeline on one of two side streams, so the SM/tensor-core-bound cuDNN conv of one chunk executes concurrently with the DRAM-bound nchw2nhwc/gn_stats/gn_silu/epilogue kernels of another. Metrics justify it: conv uses ~22% DRAM, GN kernels use 13–40% SM — resources are disjoint, so co-residency compresses wall time toward max(conv, mem) instead of their sum.",
+        "method_name": "stream_pipeline_overlap",
+        "modification_plan": "1. HOIST + EVENT (host code in `fused_block`): before any chunk work, on the current stream compute `x_c`, `w1c = w1.contiguous(ChannelsLast)`, `w2c`, `g1_c/b1_c/g2_c/b2_c`, and `out = at::empty({B,C,H,W}, x_c.options())`. Then `at::cuda::CUDAEvent ev_ready; ev_ready.record(at::cuda::getCurrentCUDAStream());`.\n2. CHUNK RULE (exact): `long px = (long)B*HW; int nchunks = 1; if (B >= 2 && px >= 65536) nchunks = std::min<int>(B, std::min<int>(4, (int)(px/32768)));` `int cs = (B+nchunks-1)/nchunks;`. This gives nchunks=2 for 8x64x128, 4 for 4x256x256, and 1 for 2x64x64 and 1x131x131 (those two keep today's exact code path — anti-regression).\n3. STREAM POOL: function-local `static std::array<at::cuda::CUDAStream,2> pool = {at::cuda::getStreamFromPool(), at::cuda::getStreamFromPool()};` (created once; round-robin `pool[i&1]` so chunk i's conv overlaps chunk i-1's memory-bound tail).\n4. PER-CHUNK BODY: loop `for (i=0;i<nchunks;++i)` with `int b0=i*cs, bs=std::min(cs,B-b0); at::cuda::CUDAStreamGuard g(pool[i&1]); ev_ready.block(pool[i&1]);`. Inside: allocate chunk-local `x_nhwc_i` ({bs,C,H,W} ChannelsLast), `mean_i`, `rstd_i`, `partial_i` (allocator binds them to that stream). Launch every existing kernel unchanged except grid.z / `B` argument = `bs`, and base pointers offset: `x_c.data_ptr<float>() + (size_t)b0*C*HW` for K_A and the residual, `out.data_ptr<float>() + (size_t)b0*C*HW` for K_E. `pick_tiling(bs, HW, ...)` sizes partial per chunk.\n5. CONV ON SIDE STREAM: call `at::conv2d(x_nhwc_i, w1c, ...)` and `at::conv2d(y1_i, w2c, ...)` inside the `CUDAStreamGuard` so cuDNN and its workspace use that stream.\n6. STATS BUFFER RACE FIX: the current single shared `mean`/`rstd`/`partial` must become per-chunk tensors; GN1 and GN2 of the same chunk may still share them (same stream = ordered).\n7. ALLOCATOR SAFETY: for tensors created on the main stream but consumed on side streams call `x_c.record_stream(s); w1c.record_stream(s); w2c.record_stream(s); out.record_stream(s); g1_c/b1_c/g2_c/b2_c.record_stream(s);`.\n8. JOIN: each chunk records `at::cuda::CUDAEvent ev_i; ev_i.record(pool[i&1]);` and after the loop every `ev_i.block(at::cuda::getCurrentCUDAStream())` before `return out;`.\n9. PRESERVE mem_vectorize: `gn_silu_res_nchw_v4_kernel` and `gn_silu_nhwc_inplace` keep their float4 loads/stores verbatim; only grid.z and base pointers change, and chunk base offsets `b0*C*HW` stay 16B-aligned (C*HW multiple of 4), so the `use_v4` alignment predicate still passes. The scalar tail kernel and `HW%4` fallback are untouched.\n10. VALIDATION: assert per-chunk conv still has >=512 CTAs (bs*HW/64 * C/128); if `nchunks==1`, execute the original single-stream path unmodified.",
+        "evidence": "Conv: 63.5% of forward time, 297us/launch, 7.73e10 FLOP => ~260 TFLOPS TF32 (69% of 378 peak) yet only ~134MB moved per launch = ~0.45 TB/s (~22% of DRAM peak). Tail kernels: gn_silu_res_nchw_v4 dram 89.02% / sm 37.63%; gn_stats dram 82.45% / sm 13.73%; nchw2nhwc dram 80.37%; gn_silu_nhwc_inplace dram 76.73%. Root cause: the two resource classes are used in strict alternation, so ~343us/forward of pure-bandwidth work is fully exposed instead of hiding under 594us of tensor-core work. Refutation of alternative: the advisory blames uncoalesced shared accesses in gn_silu_res_nchw_v4 (60% excessive wavefronts, 57% estimated speedup), but that kernel already runs at 89.0% of DRAM peak — bank-conflict removal cannot beat the roofline, capping any such fix well under 1.3% overall. Rewriting the cuDNN mainloop is also refuted: 260 TFLOPS already exceeds the 223 TFLOPS measured on an 8192^3 TF32 GEMM.",
+        "expected_metric_change": "Wall-clock forward time on 8x64x128 and 4x256x256 down 15–30% while the SUM of per-kernel durations stays roughly constant (nsys must show conv rows time-overlapping gn_* rows; that overlap is the success signal). Conv-kernel dram__throughput rises from ~22% toward 40–60% (it now shares DRAM with GN); gn_* kernel individual durations may lengthen up to ~20% — acceptable only if total time drops. Anti-regression constraints: (a) nchunks==1 path for 2x64x64 and 1x131x131 must be bit-identical to today (speedups 1.44x/2.08x must not move); (b) per-chunk conv CTA count >=512 so sm__throughput of the conv does not fall >5%; (c) launch count rises only by the per-chunk multiplier (132 -> <=280), no new elementwise/copy kernels may appear; (d) mem_vectorize stays live — verify gn_silu_res_nchw_v4_kernel still launches (not the scalar variant) and its l1tex sector count per launch is unchanged; (e) max_atol <= 0.0028 on all four shapes (per-chunk stats are exactly per-sample, so numerics are unchanged).",
+        "headroom": "medium"
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-04T16:15:45.923523",
+      "paired_verdict": {
+        "rel_pct": -0.35464766980496387,
+        "se_pct": 0.09736476794361698,
+        "t": -3.642464079104453,
+        "reps": 3,
+        "resolved": true
+      }
+    },
+    "kernel_20260804_162713": {
+      "parent": "kernel_20260804_160557",
+      "kernel_name": "kernel_20260804_162713",
+      "kernel_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_162713.py",
+      "speedup": 1.5694453831040234,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 3,
+      "strategy": {
+        "bottleneck": "[DRAM-bandwidth-bound] The GroupNorm stats→apply pairs (gn_stats+gn_silu_nhwc_inplace, gn_stats+gn_silu_res_nchw_v4) hold 26.8% of forward time and run at 77–89% of DRAM peak. Each pair streams the same 67 MB activation from DRAM twice: stats reads it (lts hit 2.1%), then the apply pass re-reads it after the whole tensor has flushed L2 (lts hit 50.6% / 33.2%).",
+        "primary_optimisation_method": "L2 cache blocking: schedule the GroupNorm stats pass and its affine+SiLU apply pass over the SAME ≤20 MB slice back-to-back, chunking over (sample, channel-group) instead of running each pass over the whole tensor. GroupNorm statistics are exactly per (n,group), so slicing by n and by whole groups is algebraically identical. The apply pass then hits L2 instead of DRAM, deleting ~134 MB of the 603 MB non-conv DRAM traffic (22%) on the only kernels that are already at the bandwidth roofline.",
+        "method_name": "l2_cache_blocking",
+        "modification_plan": "1. HOST CHUNK PLANNER (in fused_block, before any launch): bps = (size_t)HW*256*4 (bytes per sample). total = B*bps. If total <= 24MB -> nchunks=1, ns=B, gb=32, exactly today's code path (guarantees 2x64x64 and 1x131x131 stay bit-identical). Else: ns = clamp((int)(20MB/bps),1,B); if ns>=1 use gb=32; if ns==1 and bps>20MB pick the largest gb in {16,8,4} with bps*gb/32 <= 20MB (never below 4, so a chunk is always a multiple of 32 channels). Chunk list = all (n0=k*ns, g0=j*gb). Mid shape -> ns=2,gb=32 (4 chunks of 16.8MB); large -> ns=1,gb=8 (16 chunks of 16.8MB).\n2. REPLACE run_group_stats + apply with a per-chunk loop: for each chunk launch gn_stats(chunk) -> gn_finalize(chunk) -> apply(chunk). Do this for BOTH GroupNorms. Nothing else changes: K_A, both at::conv2d calls, and the fp32/TF32 contract are untouched.\n3. gn_stats_kernel: add args (n_off, ns, g0, gb). Let n4 = 2*gb (float4 per pixel inside the chunk, power of two), pp = 64/n4. Thread map for tx in [0,64): sub_p = tx>>log2(n4), c4 = 2*g0 + (tx & (n4-1)), lg = (tx & (n4-1))>>1. Pixel loop: p = p_start + ty*pp + sub_p, stride 4*pp, load base[(size_t)p*64 + c4] as float4 (128-bit load preserved; gb>=4 keeps >=128B contiguous per pixel, so DRAM/L2 lines stay fully used). shfl_down(...,1) still merges the 2 float4 of a group; store into the existing sm_s/sm_ss[4][32] at [ty][sub_p*gb+lg] (gb*pp==32 always, shared size unchanged, 2048 B/block). Final: threads lin<gb sum over ty and over the pp sub-pixel slots, write partial at group index (g0+lin).\n4. gn_finalize_kernel: launch ns*gb blocks; idx maps to (n_off+n_local, g0+g_local); partial base offset uses the same per-chunk buffer. Keep the double accumulation verbatim.\n5. gn_silu_nhwc_inplace: add (n_off, g0, gb). total = (long long)HW*n4; for i in grid-stride: p = i>>log2(n4), q = i&(n4-1), index = p*64 + 2*g0 + q; group g = g0 + (q>>1). Keep the float4 load/store and the a/b FMA folding exactly as-is (mem_vectorize preserved). Base pointer offset by n_off*HW*256, gridDim.y = ns.\n6. gn_silu_res_nchw_v4_kernel and the scalar tail kernel: add c_tile_off = g0*8/32 and n_off; c0 = (c_tile_off + blockIdx.y)*32; grid = (full_tiles, gb/4, ns); offset y/res/out base pointers by n_off*C*HW and mean/rstd by n_off*32. All three float4 streams and the HW%4/HW%32 fallbacks are unchanged (mem_vectorize preserved).\n7. Allocate one partial buffer sized for the largest chunk once per GroupNorm and reuse it across chunks (same stream => ordered, no race); mean/rstd stay full-size [B,32].\n8. pick_tiling: call with (ns, HW) so each chunk still emits >= 114*4 CTAs; clamp ppb as today.\n9. VALIDATION: assert gb*8 % 32 == 0, n4 power of two, and that chunks tile (B x 32 groups) exactly; verify the sum over chunks of written groups == B*32 (this is the guard the earlier tail bug needed).\n10. ANTI-REGRESSION: keep the nchunks==1 branch calling the untouched original launch sequence.",
+        "evidence": "Verdict (i) on the previous round: its predicted metric DID move -- per-kernel dram throughput fell 89.02%->83.89% (v4) and 76.73%->61.05% (silu) while each kernel did half the work, i.e. conv/tail co-residency was real; it was just shape-gated (+5.3% mid, -0.8/-1.7/-0.6% elsewhere). So I keep that direction alive but attack an independent, shape-general target that composes with it. Root cause here: 603 MB of non-conv DRAM traffic per forward for a 67 MB tensor; gn_stats reads y at lts__t_sector_hit_rate 2.1% and the apply pass re-reads the identical bytes at 50.6%/33.2% hit -- pure capacity misses (67 MB vs 50 MB L2). Independent confirmation: the 1x256x131x131 shape, whose entire 17.2 MB working set is L2-resident, scores 2.08x while the 67 MB mid shape scores 1.46x. Refutation of the alternative: the 63.5% cuDNN conv delivers 77.3 GFLOP/297us = 260 TFLOPS TF32 (69% of 378 peak, above the 223 TFLOPS measured on an 8192^3 TF32 GEMM) -- no headroom. The advisory's 57% 'uncoalesced shared access' claim on v4 is refuted by its own 89.02% dram throughput: bank-conflict removal cannot beat the roofline.",
+        "expected_metric_change": "(1) lts__t_sector_hit_rate: gn_silu_nhwc_inplace 50.6% -> >=75%, gn_silu_res_nchw_v4_kernel 33.2% -> >=60% (the deciding metric; if it does not move, the blocking is not achieving residency). (2) gpu__time_duration summed over the 4 GN kernels per forward drops from ~330us to ~250-270us on 8x64x128 while their dram throughput stays >=75% (bytes removed, not bandwidth lost). (3) Anti-regression: gn_stats_kernel duration per byte must not rise >10% (gb>=4 keeps >=128B contiguous runs; if l1tex sectors/request rises, gb was chosen too small); total forward launch count <= 70 (was 132 for 12 iters => ~11/forward; per-chunk finalize must not exceed +40 launches or its ~2.5us floor eats the gain); mem_vectorize must stay live -- gn_silu_res_nchw_v4_kernel (not the scalar variant) must still launch with unchanged 128-bit sectors/request, and gn_silu_nhwc_inplace must keep float4 accesses; the nchunks==1 path must leave 2x256x64x64 (1.4377x) and 1x256x131x131 (2.0820x) within noise; max_atol <= 0.0027 on all four shapes (chunking by whole (n,group) is exact).",
+        "headroom": "medium"
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-04T16:28:08.673607",
+      "paired_verdict": {
+        "rel_pct": -3.067764244483262,
+        "se_pct": 0.2331934809763443,
+        "t": -13.155445991195894,
+        "reps": 3,
+        "resolved": true
+      }
+    },
+    "kernel_20260804_163632": {
+      "parent": "kernel_20260804_160557",
+      "kernel_name": "kernel_20260804_163632",
+      "kernel_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_163632.py",
+      "speedup": 1.6686793298194427,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 4,
+      "strategy": {
+        "bottleneck": "[compute-bound vendor mainloop] `sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x128x32` holds 63.5% of forward GPU time (7,143us/24 launches ≈297us each). It runs a heuristic-selected (untimed) cuDNN engine at 77.3 GFLOP/297us ≈260 TFLOPS TF32, i.e. ~69% of TF32 peak, while every non-conv kernel is already pinned at 76–89% of DRAM peak, capping any tail-only round at 36.5%.",
+        "primary_optimisation_method": "cuDNN engine autotuning for both 3x3 convs: replace the heuristic-plan `at::conv2d` calls with explicit `at::cudnn_convolution(..., benchmark=true, deterministic=false, allow_tf32=true)` so cuDNN times all candidate engine configs (including Winograd-nonfused and alternative tile/split-K implicit-GEMM engines) for these four fixed shapes and caches the fastest. This is the only permitted lever on the 63.5% mainloop; dtype contract unchanged (fp32 storage, TF32 math, exactly as today).",
+        "method_name": "cudnn_algo_autotune",
+        "modification_plan": "CHECKLIST\n1. Add a host helper in the extension, immediately above `fused_block`:\n   `static at::Tensor conv3x3_nhwc_autotuned(const at::Tensor& in, const at::Tensor& w)` that does:\n   `return at::cudnn_convolution(in, w, /*padding=*/{1,1}, /*stride=*/{1,1}, /*dilation=*/{1,1}, /*groups=*/1, /*benchmark=*/true, /*deterministic=*/false, /*allow_tf32=*/true);`\n   wrapped in `try { ... } catch (const std::exception&) { return at::conv2d(in, w, at::Tensor(), {1,1}, {1,1}, {1,1}, 1); }` so an unavailable/failed ATen overload silently reverts to today's exact path.\n2. Replace BOTH conv sites verbatim:\n   `auto y1 = conv3x3_nhwc_autotuned(x_nhwc, w1c);` and `auto y2 = conv3x3_nhwc_autotuned(y1, w2c);`\n   Keep the existing `if (!y.is_contiguous(ChannelsLast)) y = y.contiguous(ChannelsLast);` guards unchanged — they are the safety net if an autotuned engine returns NCHW.\n3. Belt-and-braces for the fallback path: once, in `fused_block` behind a `static bool once = [](){ at::globalContext().setBenchmarkCuDNN(true); return true; }();`, so even the `at::conv2d` fallback uses timed plan selection. Do not touch `allow_tf32` (must stay true = reference semantics).\n4. Nothing else changes: K_A `nchw2nhwc_kernel`, `gn_stats_kernel`, `gn_finalize_kernel`, `gn_silu_nhwc_inplace`, `gn_silu_res_nchw_v4_kernel` (all float4 paths), the scalar tail kernel, the `use_v4` alignment predicate, `pick_tiling`, and the fp32/double-combine reduction contract are all left byte-for-byte identical. The already-credited `mem_vectorize` mechanism therefore remains fully live and must still show `gn_silu_res_nchw_v4_kernel` launching with 5,632 B smem / 28 regs.\n5. Weight preparation stays as-is (`w1c/w2c = contiguous(ChannelsLast)`); the autotuner keys on the resulting NHWC descriptors, so the plan cache hits on every subsequent call for the same shape.\n6. Plan-cache amortisation: cuDNN's benchmark cache is process-global and keyed by (shapes, dtype, layout, conv params). With 4 scored shapes x 2 convs = 8 entries, the search runs only during warmup/correctness calls; steady-state timed iterations pay zero search cost. Do NOT allocate/free per-call workspaces yourself — let ATen own them.\n7. Numerical-contract note: fp32 in, fp32 out, TF32 math, exactly as the current base and as the reference; no downcast/upcast anywhere. The base already differs algorithmically from the reference (NHWC engine vs the reference's NCHW engine) and passes max_atol 0.0028, so a same-precision engine swap is inside the demonstrated error budget.\n8. Reject-if guard (documented for the next round): if nsys shows new `nchwToNhwc`/`nhwcToNchw` transform kernels or an extra elementwise kernel appearing around the convs, the selected engine demanded a layout change; in that case pin `benchmark=false` for that conv.\nWHY THIS AND NOT THE TAIL: the four tail kernels sit at 80.4 / 82.5 / 76.7 / 89.0 % of DRAM peak — the roofline — and their traffic cannot be algebraically reduced (SiLU nonlinearity blocks folding the GN affine into the next conv's weights; the residual, both transposes and the two stats reads are each already single-touch), so the entire non-conv region is capped at 36.5% and its remaining headroom is a few percent at best.",
+        "evidence": "Conv = 63.5% of forward GPU time, 297us/launch, 77.3 GFLOP => 260 TFLOPS TF32 (~69% of the 378 TF32 spec) chosen by an UNTIMED heuristic plan (tilesize64x128x32) — the classic case where benchmark-mode engine selection wins. Previous attempt classification: attempt #2 (l2_cache_blocking) is class (b)->abandon: its deciding metric never moved (gn_silu_nhwc_inplace lts__t_sector_hit_rate predicted 50.6->>=75%, measured 52.66%; gn_silu_res_nchw_v4 predicted 33.2->>=60%, measured 34.22%) and it simultaneously BROKE the tail's parallelism (gn_stats waves/SM 2.67->0.67, dram 82.45%->56.64%), so it was structurally incompatible, not merely mis-tuned. Attempt #1 was class (c) (mid +5.3%, others -0.6..-1.7%). Root cause here: both prior rounds left 63.5% of the timeline untouched, so both were Amdahl-capped at 36.5%. Refutation of the alternative bottleneck (the tail kernels / advisory's 57% 'uncoalesced shared access' on gn_silu_res_nchw_v4): that kernel already runs at 89.02% of DRAM peak, so removing bank conflicts cannot beat the roofline — its whole remaining headroom is <1.3% of forward time.",
+        "expected_metric_change": "(1) Conv kernel duration drops from 297us/launch (or the kernel NAME changes away from `..._tilesize64x128x32`, e.g. to a Winograd/alternative-tile engine) and its share of forward GPU time falls below 63.5%; achieved conv throughput rises above 260 TFLOPS. (2) Forward wall-clock on 8x256x64x128 falls below 1.121ms and on 4x256x256x256 below 4.166ms; the four GN/transpose kernels' durations and dram throughputs (80.4/82.5/76.7/89.0%) must stay UNCHANGED (they are untouched — any movement means the diff leaked). Anti-regression constraints: (a) launches per forward stay at 11 (132/12) — no new `nchwToNhwc`/transform/elementwise kernels may appear around the convs; (b) mem_vectorize must remain live: `gn_silu_res_nchw_v4_kernel` (not the scalar variant) still launches with launch__shared_mem_per_block=5632 and 28 regs/thread and unchanged 128-bit sectors/request; (c) max_atol <= 0.0027 on all four shapes (fp32 in/out, TF32 math, unchanged); (d) no per-call re-benchmark: steady-state host time per forward must not rise (plan cached per shape) — if the small 2x256x64x64 shape regresses >2%, the search is not amortising and benchmark must be gated off for it.",
+        "headroom": "medium"
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-04T16:37:28.595322",
+      "paired_verdict": {
+        "rel_pct": 1.8725523991425463,
+        "se_pct": 0.27528985535061024,
+        "t": 6.802111893144971,
+        "reps": 3,
+        "resolved": true
+      },
+      "ncu_profile_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260804_163632_ncu.csv"
+    },
+    "kernel_20260804_164625": {
+      "parent": "kernel_20260804_163632",
+      "kernel_name": "kernel_20260804_164625",
+      "kernel_path": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_164625.py",
+      "speedup": 1.5970224016811059,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 5,
+      "strategy": {
+        "bottleneck": "[latency/serialization + mixed bound] The forward is one strictly serial chain: nchw2nhwc → cuDNN conv1 → gn_stats1/finalize/apply1 → cuDNN conv2 → gn_stats2/finalize → gn_silu_res_nchw_v4. The hottest non-removable kernel, sm90_xmma_fprop_implicit_gemm (41.9% GPU time, ~366 µs/conv ≈211 TF32 TFLOPS ≈95% of achievable), is tensor-core bound but uses only ~0.37 TB/s, while the 340 µs of GN kernels run at 77–89% DRAM peak with SM throughput 13–63%. Each phase idles the other unit.",
+        "primary_optimisation_method": "Batch-chunked multi-stream pipelining (stream_pipeline). GroupNorm statistics are per (n,group), so the block is exactly separable along N: split the batch into K chunks and run each chunk's full transform→conv→GN chain on its own CUDA stream with events. Chunk i's DRAM-bound GN kernels (89% DRAM, 13–63% SM) then execute concurrently with chunk i±1's TC-bound conv (95% TC, 0.37 TB/s), filling the idle unit. No dtype, layout, or per-kernel code change; both existing mechanisms stay live.",
+        "method_name": "stream_pipeline",
+        "modification_plan": "1) Make the block batch-chunkable (exact rewrite, no numerics change): in fused_block, replace the single monolithic pass with a loop over K chunks of the batch. Compute `int K = pick_chunks(B, HW)` where pick_chunks returns the largest K in {1,2,3,4} with K<=B, B%K==0, and (B/K)*HW >= 16384; otherwise 1. For each chunk c: nb = B/K, n0 = c*nb; slice every tensor by narrowing dim 0: `auto x_c_ch = x_c.narrow(0,n0,nb); auto x_nhwc_ch = x_nhwc.narrow(0,n0,nb); auto out_ch = out.narrow(0,n0,nb);` and pass `x_c.data_ptr<float>() + (size_t)n0*C*HW` style base pointers to the custom kernels with grid.z = nb instead of B. All five custom kernels already index by blockIdx.z==n, so only the base pointer and grid.z change — no kernel source edits.\n2) Give each chunk private state: allocate `mean1/rstd1/mean2/rstd2` as full {B,32} tensors ONCE on the entry stream and narrow per chunk (today mean/rstd are reused between GN1 and GN2, which is unsafe once chunks overlap). Keep run_group_stats' `partial` allocation inside the chunk loop; it is allocated under the chunk's stream guard so the caching allocator keeps it stream-ordered.\n3) Streams and ordering: `int S = min(K,3); std::vector<at::cuda::CUDAStream> st; for(i<S) st.push_back(at::cuda::getStreamFromPool());` Record `at::cuda::CUDAEvent start; start.record(entry_stream);` then for each side stream `start.block(st[i])` so every chunk sees the caller's prior writes to x. Wrap each chunk body in `at::cuda::CUDAStreamGuard g(st[c % S]);` so both the custom kernel launches (use `at::cuda::getCurrentCUDAStream()` as they already do) and the cuDNN calls land on that stream. After the loop, record one event per side stream and `ev.block(entry_stream)` so the entry stream (and the returned `out`, allocated on the entry stream) is correctly ordered before return.\n4) Preserve cudnn_algo_autotune: keep `at::cudnn_convolution(..., benchmark=true, deterministic=false, allow_tf32=true)` verbatim. All chunks share one shape, so the plan cache is keyed identically. To avoid K concurrent benchmark searches on the first call, run chunk 0 alone on the entry stream (no guard) on the first invocation for a given (nb,H,W) — track with a small static set — then pipeline chunks 1..K-1; steady state is unaffected.\n5) Preserve mem_vectorize: gn_silu_res_nchw_v4_kernel, gn_silu_nhwc_inplace, gn_stats_kernel bodies are byte-for-byte unchanged; the float4 alignment predicate still holds because chunk base pointers advance by nb*C*HW floats (16B-aligned whenever HW%4==0, which is the existing use_v4 condition).\n6) pick_tiling(B,HW) is called with nb instead of B, so tiles/ppb adapt per chunk and gn_finalize still reduces all tiles of that chunk — output is mathematically identical up to float summation order (stats accumulate in double in finalize).\n7) Anti-regression guard: K==1 reproduces today's code path exactly for B=1 (131x131) and B=2 (64x64), so those shapes cannot regress.\n8) Reject-if: if nsys shows no kernel-timeline overlap (chunks serialized) or conv duration inflating >15% from DRAM contention, drop K to 2.",
+        "evidence": "Conv = 41.9% GPU time, ~366 µs/launch at mid shape ≈211 TF32 TFLOPS (~95% of the 223 TFLOPS measured GEMM roof) yet only ~134 MB/366 µs ≈0.37 TB/s DRAM — the tensor pipe is saturated while 80% of the 1.84 TB/s bandwidth idles. Conversely gn_silu_res_nchw_v4 hits 89.0% DRAM peak (1.81 TB/s) with SM throughput 39.5%, gn_stats 82% DRAM with SM 13.4%, gn_silu_nhwc 77% DRAM with SM 62.6%. Root cause: the two resource classes are used in strictly disjoint time windows because the chain is serial; nothing overlaps. Refutation of the obvious alternative ('the GN kernels are inefficient / need more vectorization or coalescing'): they already run at 1.6–1.8 TB/s of a 1.84 TB/s measured ceiling, i.e. ≤15% intrinsic headroom each (≤5% of forward), and their long_scoreboard stalls are simply DRAM latency at full bandwidth — tuning them cannot recover the ~340 µs, only hiding them behind the conv can.",
+        "expected_metric_change": "(1) Wall-clock forward for 8x256x64x128 down from 1.072 ms toward ~0.85–0.95 ms (target ≥1.15x on the mid and 4x256x256x256 shapes); (2) nsys timeline shows concurrent execution — sm90_xmma_fprop_implicit_gemm overlapping gn_stats/gn_silu kernels, with sum-of-kernel-durations roughly flat or up to +10% higher (per-kernel durations may lengthen under contention) while total GPU busy time drops; (3) gpu__dram_throughput during conv windows rises well above the current ~0.37 TB/s. Anti-regression constraints: small (2x256x64x64) and awkward (1x256x131x131) shapes must stay at K=1 and hold ≥1.47x / ≥2.17x respectively; the conv kernel name must remain the autotuned sm90_xmma ...tilesize128x128x32 variant (proof cudnn_algo_autotune still caches a timed plan and did not revert to a heuristic/default engine); no new nchwToNhwc/nhwcToNchw transform or extra elementwise kernels may appear; custom kernel launch count must stay at 5 kernel types (K× more launches is expected and fine, but no kernel may split or lose its float4 path — watch that gn_silu_res_nchw_v4_kernel, not the scalar variant, still executes for HW%4==0).",
+        "headroom": "medium"
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-04T16:47:59.092448",
+      "paired_verdict": {
+        "rel_pct": -3.9705115407446367,
+        "se_pct": 0.19360439583777395,
+        "t": -20.508374944500904,
+        "reps": 3,
+        "resolved": true
+      }
+    }
+  },
+  "scores": [
+    1.598914981804153,
+    1.6127682779720398,
+    1.6209786633686663,
+    1.5694453831040234,
+    1.6686793298194427,
+    1.5970224016811059
+  ],
+  "err_flags": [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+  ],
+  "last_score_for_curve": 1.5970224016811059,
+  "rounds_since_improvement": 1,
+  "stop_reason": null,
+  "opt_history_files": {
+    "1": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_154617/opt_round_001.json",
+    "2": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_160557/opt_round_002.json",
+    "3": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_160557/opt_round_003.json",
+    "4": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_160557/opt_round_004.json",
+    "5": "/home/elek/KernelMem/run/20260804_154005_vae_block_002_lineages/keep_vendor/20260804_154010_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260804_163632/opt_round_005.json"
+  },
+  "next_individual_id": 8,
+  "timestamp": "2026-08-04T16:48:19.171002"
+}

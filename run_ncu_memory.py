@@ -117,6 +117,23 @@ METRICS_NEW = ",".join([
         "smsp__thread_inst_executed_pred_on_per_inst_executed",
         "smsp__warps_eligible",
 
+        # Instruction mix. Without these the profile cannot express HOW MUCH WORK
+        # each issued instruction does, only how busy the SM is -- and on a
+        # tensor-core kernel that is the difference between winning and losing.
+        # Measured on 002/own_winograd (wmma m16n16k8) against the cuDNN kernel
+        # it was replacing, same conv, same GPU:
+        #     tensor inst   33,554,432  vs   2,359,296   (14x MORE for 2.25x LESS math)
+        #     total inst   977,600,512  vs  46,712,360
+        #     -> 512 MACs per tensor instruction vs 16,384; cuDNN issues wgmma
+        #        64x128x8, the candidate issues mma.m16n8k4.
+        # Every metric already in this list looked unremarkable on that kernel
+        # (sm__throughput 45%, dram 1.5%) or actively misleading (occupancy 24.7%
+        # flagged as the limiter, while the kernel that beats it by 11x runs at
+        # 18.2%). Derive MACs/instruction from these two and the bottleneck is
+        # visible instead of inferred.
+        "sm__inst_executed_pipe_tensor",
+        "smsp__inst_executed",
+
 ])
 
 

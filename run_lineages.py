@@ -50,7 +50,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from utils.lineage import (LineageSpec, LineageState, ceilings, fund,
-                           read_lineage_progress, trajectory_verdict, vendor_split)
+                           read_lineage_progress, read_stop_reason,
+                           trajectory_verdict, vendor_split)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -112,9 +113,26 @@ def _parse_args() -> argparse.Namespace:
                         "serialized regardless, so this caps LLM concurrency and "
                         "host memory, not device contention.")
     p.add_argument("--grace", type=int, default=5,
-                   help="Rounds a lineage runs before the trajectory test may "
-                        "kill it. A structural change is worse before it is "
-                        "tuned; this is the room it gets to prove otherwise.")
+                   help="OPTIMIZATION rounds a lineage runs before the trajectory "
+                        "test may kill it (the seed draw does not count). A "
+                        "structural change is worse before it is tuned; this is "
+                        "the room it gets to prove otherwise.")
+    p.add_argument("--child_patience", type=int, default=0,
+                   help="--patience handed to each child (0 = disabled, the "
+                        "default here). main_memory_latest.py has its own "
+                        "plateau stopper, defaulting to 4, and leaving it on "
+                        "gives a lineage TWO stoppers that cannot see each "
+                        "other: the trajectory test is kill-only, so a child "
+                        "can shut itself down on a 4-round drought even after "
+                        "the coordinator has ruled 'already at X >= target, "
+                        "keep'. Both rules also extrapolate from droughts, and "
+                        "stacking two mechanisms with the same blind spot "
+                        "roughly doubles the chance of ending a lineage right "
+                        "before it pays -- on vae_block_002 a lineage killed at "
+                        "1.6216 scored 1.7098 the very next round. The "
+                        "coordinator is the only component with the "
+                        "cross-lineage view, so it holds sole stopping "
+                        "authority unless you set this back to 4.")
     p.add_argument("--poll_s", type=float, default=60.0,
                    help="Seconds between trajectory checks.")
     p.add_argument("--dry_run", action="store_true",
@@ -133,9 +151,15 @@ def _spawn(spec: LineageSpec, state: LineageState, args, lock_file: Path) -> sub
         "--gpu", args.gpu, "--model_name", args.model_name,
         "--round", str(args.round), "--num_seeds", str(args.num_seeds),
         "--device", str(args.device),
-        "--work_dir", str(state.batch_dir.parent),
+        # Per-lineage work_dir, NOT the shared root: the child names its batch
+        # folder "<stamp>_<task>_<tag>" from a 1-second timestamp, and lineages
+        # are spawned in a tight loop, so under the shared root two of them land
+        # in the SAME folder and overwrite each other's checkpoint and code.
+        "--work_dir", str(state.batch_dir),
         "--subproc_id", str(state.subproc_id),
         "--seed_granularity", spec.granularity,
+        # Sole stopping authority lives in the coordinator -- see --child_patience.
+        "--patience", str(args.child_patience),
     ]
     # The algorithm is what separates own_gemm from own_winograd; without it
     # they are the same lineage run twice.
@@ -150,6 +174,21 @@ def _spawn(spec: LineageSpec, state: LineageState, args, lock_file: Path) -> sub
     print(f"[lineage] starting {spec.label} -> {state.batch_dir}", flush=True)
     return subprocess.Popen(cmd, cwd=str(ROOT), env=env, stdout=log,
                             stderr=subprocess.STDOUT)
+
+
+def _child_batch_dir(lineage_dir: Path, task_stem: str) -> Path:
+    """Where the child actually writes, resolved rather than assumed.
+
+    The child names its own batch folder "<stamp>_<task>_<tag>" under the
+    work_dir it is given, so the coordinator cannot know that name up front.
+    Reading the lineage folder itself finds no checkpoint and therefore no
+    scores -- which trajectory_verdict cannot distinguish from a lineage that
+    has genuinely not finished a round, so it reports "within grace" forever and
+    the stop-by-trajectory gate never fires.
+    """
+    cands = sorted((p for p in lineage_dir.glob(f"*_{task_stem}_*") if p.is_dir()),
+                   key=lambda p: p.name)
+    return cands[-1] if cands else lineage_dir
 
 
 def main() -> None:
@@ -223,12 +262,28 @@ def main() -> None:
             time.sleep(args.poll_s)
             for st in list(running):
                 p = procs[st.spec.id]
-                st.scores, st.rounds_done = read_lineage_progress(st.batch_dir, task_stem)
+                st.scores, st.rounds_done = read_lineage_progress(
+                    _child_batch_dir(st.batch_dir, task_stem), task_stem)
                 st.best = max(st.scores) if st.scores else None
 
                 if p.poll() is not None:
-                    st.status = "done"
-                    st.reason = f"exited rc={p.returncode}"
+                    # rc=0 alone cannot separate "ran every round" from "stopped
+                    # itself early": both exit clean. Use the round count, and
+                    # the reason the child recorded, so the summary says which.
+                    stop_reason = read_stop_reason(
+                        _child_batch_dir(st.batch_dir, task_stem), task_stem)
+                    if p.returncode != 0:
+                        st.status = "failed"
+                        st.reason = (f"exited rc={p.returncode} after "
+                                     f"{st.rounds_done}/{args.round} rounds")
+                    elif st.rounds_done >= args.round:
+                        st.status = "done"
+                        st.reason = f"completed all {args.round} rounds"
+                    else:
+                        st.status = "stopped_early"
+                        st.reason = (f"self-stopped after {st.rounds_done}/{args.round} "
+                                     f"rounds ({stop_reason or 'reason not recorded'}), "
+                                     f"not a trajectory kill")
                     running.remove(st)
                     print(f"[lineage] {st.spec.label} finished "
                           f"(best {st.best if st.best is None else round(st.best,4)})",
@@ -259,7 +314,8 @@ def main() -> None:
 
     # ---- report ----
     for st in states:
-        st.scores, st.rounds_done = read_lineage_progress(st.batch_dir, task_stem)
+        st.scores, st.rounds_done = read_lineage_progress(
+            _child_batch_dir(st.batch_dir, task_stem), task_stem)
         st.best = max(st.scores) if st.scores else None
     ranked = sorted([s for s in states if s.best is not None],
                     key=lambda s: -s.best)
