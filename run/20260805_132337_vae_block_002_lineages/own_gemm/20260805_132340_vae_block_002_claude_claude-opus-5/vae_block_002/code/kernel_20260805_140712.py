@@ -1,0 +1,494 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA = r'''
+#include <cudaTypedefs.h>
+using PFN_cuTensorMapEncodeTiled  = PFN_cuTensorMapEncodeTiled_v12000;
+using PFN_cuTensorMapEncodeIm2col = PFN_cuTensorMapEncodeIm2col_v12000;
+
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+
+#include <cutlass/cutlass.h>
+#include <cutlass/conv/kernel/default_conv2d_fprop.h>
+#include <cutlass/conv/device/implicit_gemm_convolution.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+
+// ---------------------------------------------------------------------------
+// Tiled implicit-GEMM conv2d 3x3 stride1 pad1, NHWC, TF32 tensor cores,
+// fp32 accumulate (same numerics class as the reference, which is cuDNN TF32).
+// Built device-side from CUTLASS inside this extension -- no cuDNN, no
+// at::conv2d anywhere in the forward path.
+// ---------------------------------------------------------------------------
+using LayoutT = cutlass::layout::TensorNHWC;
+
+using ConvKernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
+    float, LayoutT, float, LayoutT, float, LayoutT, float,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 16>,
+    cutlass::gemm::GemmShape<64, 64, 16>,
+    cutlass::gemm::GemmShape<16, 8, 8>,
+    cutlass::epilogue::thread::LinearCombination<float, 4, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<4>,
+    3, cutlass::arch::OpMultiplyAdd,
+    cutlass::conv::IteratorAlgorithm::kOptimized>::Kernel;
+
+using ImplicitGemm = cutlass::conv::device::ImplicitGemmConvolution<ConvKernel>;
+
+static torch::Tensor conv3x3_nhwc(torch::Tensor x, torch::Tensor w) {
+  int N = (int)x.size(0), H = (int)x.size(1), W = (int)x.size(2), C = (int)x.size(3);
+  int K = (int)w.size(0), R = (int)w.size(1), S = (int)w.size(2);
+  int P = H, Q = W;
+  auto y = torch::empty({N, P, Q, K}, x.options());
+  cutlass::conv::Conv2dProblemSize problem(
+      {N, H, W, C}, {K, R, S, C}, {1, 1, 1, 1}, {1, 1}, {1, 1},
+      {N, P, Q, K}, cutlass::conv::Mode::kCrossCorrelation, 1);
+  cutlass::TensorRef<float, LayoutT> ra(x.data_ptr<float>(), LayoutT::packed({N, H, W, C}));
+  cutlass::TensorRef<float, LayoutT> rb(w.data_ptr<float>(), LayoutT::packed({K, R, S, C}));
+  cutlass::TensorRef<float, LayoutT> rc(y.data_ptr<float>(), LayoutT::packed({N, P, Q, K}));
+  typename ImplicitGemm::Arguments args(problem, ra, rb, rc, rc, {1.0f, 0.0f});
+  ImplicitGemm op;
+  size_t ws = op.get_workspace_size(args);
+  auto wsbuf = torch::empty({(long)(ws > 0 ? ws : 1)}, x.options().dtype(torch::kUInt8));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  TORCH_CHECK(op.initialize(args, wsbuf.data_ptr(), stream) == cutlass::Status::kSuccess,
+              "cutlass conv init failed");
+  TORCH_CHECK(op(stream) == cutlass::Status::kSuccess, "cutlass conv launch failed");
+  return y;
+}
+
+// ---------------------------------------------------------------------------
+// weight (K,C,3,3) -> (K,3,3,C)
+// ---------------------------------------------------------------------------
+__global__ void wt_kcrs_to_krsc(const float* __restrict__ src, float* __restrict__ dst,
+                                int K, int C, int RS, long total) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  int c = (int)(i % C);
+  long t = i / C;
+  int rs = (int)(t % RS);
+  int k = (int)(t / RS);
+  dst[i] = src[((long)k * C + c) * RS + rs];
+}
+
+__global__ void wt_kcrs_to_krsc_fast(const float* __restrict__ src, float* __restrict__ dst,
+                                     int C, int RS) {
+  extern __shared__ float s[];
+  int k = blockIdx.x;
+  int n = C * RS;
+  const float* sp = src + (long)k * n;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) s[i] = sp[i];
+  __syncthreads();
+  float* dp = dst + (long)k * n;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    int c = i % C;
+    int rs = i / C;
+    dp[i] = s[c * RS + rs];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// NCHW -> NHWC (shared-memory tiled, vectorised on the channel side)
+// ---------------------------------------------------------------------------
+#define TT 64
+__global__ void nchw2nhwc(const float* __restrict__ src, float* __restrict__ dst,
+                          int C, long HW) {
+  __shared__ float sm[TT][TT + 1];
+  int tid = threadIdx.x;
+  long p0 = (long)blockIdx.x * TT;
+  int c0 = blockIdx.y * TT;
+  int n = blockIdx.z;
+  const float* sbase = src + (long)n * C * HW;
+  float* dbase = dst + (long)n * HW * C;
+
+  int pp = tid % TT, cc0 = tid / TT;
+#pragma unroll
+  for (int j = 0; j < TT; j += (256 / TT)) {
+    int cc = cc0 + j;
+    long p = p0 + pp;
+    float v = 0.f;
+    if (p < HW && (c0 + cc) < C) v = sbase[(long)(c0 + cc) * HW + p];
+    sm[cc][pp] = v;
+  }
+  __syncthreads();
+  if (c0 + TT <= C) {
+    int cq = tid % (TT / 4), pp0 = tid / (TT / 4);
+#pragma unroll
+    for (int j = 0; j < TT; j += (256 / (TT / 4))) {
+      int pp1 = pp0 + j;
+      long p = p0 + pp1;
+      if (p < HW) {
+        float4 v;
+        v.x = sm[4 * cq + 0][pp1];
+        v.y = sm[4 * cq + 1][pp1];
+        v.z = sm[4 * cq + 2][pp1];
+        v.w = sm[4 * cq + 3][pp1];
+        reinterpret_cast<float4*>(dbase + p * C + c0)[cq] = v;
+      }
+    }
+  } else {
+    int cc1 = tid % TT, pp0 = tid / TT;
+#pragma unroll
+    for (int j = 0; j < TT; j += (256 / TT)) {
+      int pp1 = pp0 + j;
+      long p = p0 + pp1;
+      if (p < HW && (c0 + cc1) < C) dbase[p * C + c0 + cc1] = sm[cc1][pp1];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GroupNorm partial moments over an NHWC tensor. grid = (nchunk, N)
+// partial layout: [n][chunk][2*G]  (sum then sumsq per group)
+// Fully deterministic: fixed-order intra-block reduction, no atomics.
+// ---------------------------------------------------------------------------
+__global__ void gn_partial(const float* __restrict__ src, float* __restrict__ partial,
+                           long HW, int C, int G, int nchunk, long chunk) {
+  __shared__ float ss[256];
+  __shared__ float ssq[256];
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
+  int n = blockIdx.y;
+  long p_begin = (long)blockIdx.x * chunk;
+  long p_end = p_begin + chunk;
+  if (p_end > HW) p_end = HW;
+
+  int cpg = C / G;
+  int cq = C / 4;                 // float4 per pixel
+  int quads_per_thread_row = cq;  // threads cover channels
+  const float4* base = reinterpret_cast<const float4*>(src + (long)n * HW * C);
+
+  float s = 0.f, sq = 0.f;
+  int q = tid % quads_per_thread_row;      // channel quad
+  int prow = tid / quads_per_thread_row;   // pixel row offset
+  int rows = nthreads / quads_per_thread_row;
+  if (p_begin < p_end) {
+    for (long p = p_begin + prow; p < p_end; p += rows) {
+      float4 v = base[p * cq + q];
+      s += v.x + v.y + v.z + v.w;
+      sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+  }
+  ss[tid] = s;
+  ssq[tid] = sq;
+  __syncthreads();
+  float* out = partial + ((long)n * nchunk + blockIdx.x) * (2 * G);
+  if (tid < G) {
+    float ts = 0.f, tsq = 0.f;
+    for (int i = 0; i < nthreads; ++i) {
+      int qi = i % quads_per_thread_row;
+      if ((qi * 4) / cpg == tid) { ts += ss[i]; tsq += ssq[i]; }
+    }
+    out[tid] = ts;
+    out[G + tid] = tsq;
+  }
+}
+
+__global__ void gn_finalize(const float* __restrict__ partial, const float* __restrict__ gamma,
+                            const float* __restrict__ beta, float* __restrict__ scale,
+                            float* __restrict__ shift, int nchunk, int G, int C,
+                            long HW, float eps) {
+  int g = blockIdx.x;
+  int n = blockIdx.y;
+  int tid = threadIdx.x;
+  __shared__ float red[64];
+  float s = 0.f, sq = 0.f;
+  for (int i = tid; i < nchunk; i += blockDim.x) {
+    const float* p = partial + ((long)n * nchunk + i) * (2 * G);
+    s += p[g];
+    sq += p[G + g];
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    s += __shfl_down_sync(0xffffffff, s, off);
+    sq += __shfl_down_sync(0xffffffff, sq, off);
+  }
+  int lane = tid & 31, warp = tid >> 5;
+  if (lane == 0) { red[warp] = s; red[32 + warp] = sq; }
+  __syncthreads();
+  if (tid == 0) {
+    int nwarp = (blockDim.x + 31) / 32;
+    float ts = 0.f, tsq = 0.f;
+    for (int i = 0; i < nwarp; ++i) { ts += red[i]; tsq += red[32 + i]; }
+    int cpg = C / G;
+    float cnt = (float)((double)HW * (double)cpg);
+    float mean = ts / cnt;
+    float var = tsq / cnt - mean * mean;
+    float rstd = rsqrtf(var + eps);
+    for (int j = 0; j < cpg; ++j) {
+      int c = g * cpg + j;
+      float sc = gamma[c] * rstd;
+      scale[(long)n * C + c] = sc;
+      shift[(long)n * C + c] = beta[c] - mean * sc;
+    }
+  }
+}
+
+__device__ __forceinline__ float silu(float v) { return v / (1.f + __expf(-v)); }
+
+// out = silu(src * scale + shift), NHWC -> NHWC  (feeds conv2 directly)
+__global__ void gn_silu(const float* __restrict__ src, float* __restrict__ dst,
+                        const float* __restrict__ scale, const float* __restrict__ shift,
+                        long HW, int C, long total_q) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total_q) return;
+  int cq = C / 4;
+  int q = (int)(i % cq);
+  long n = i / ((long)HW * cq);
+  const float4* s4 = reinterpret_cast<const float4*>(src);
+  float4* d4 = reinterpret_cast<float4*>(dst);
+  const float4* sc4 = reinterpret_cast<const float4*>(scale + n * C);
+  const float4* sh4 = reinterpret_cast<const float4*>(shift + n * C);
+  float4 v = s4[i];
+  float4 a = sc4[q], b = sh4[q];
+  float4 o;
+  o.x = silu(v.x * a.x + b.x);
+  o.y = silu(v.y * a.y + b.y);
+  o.z = silu(v.z * a.z + b.z);
+  o.w = silu(v.w * a.w + b.w);
+  d4[i] = o;
+}
+
+// out_nchw = silu(src_nhwc * scale + shift) + residual_nchw  (fused epilogue)
+__global__ void gn_silu_res_nchw(const float* __restrict__ src, const float* __restrict__ res,
+                                 float* __restrict__ dst, const float* __restrict__ scale,
+                                 const float* __restrict__ shift, int C, long HW) {
+  __shared__ float sm[TT][TT + 1];
+  int tid = threadIdx.x;
+  long p0 = (long)blockIdx.x * TT;
+  int c0 = blockIdx.y * TT;
+  int n = blockIdx.z;
+  const float* sbase = src + (long)n * HW * C;
+  const float* sc = scale + (long)n * C;
+  const float* sh = shift + (long)n * C;
+
+  if (c0 + TT <= C) {
+    int cq = tid % (TT / 4), pp0 = tid / (TT / 4);
+    float4 a = reinterpret_cast<const float4*>(sc + c0)[cq];
+    float4 b = reinterpret_cast<const float4*>(sh + c0)[cq];
+#pragma unroll
+    for (int j = 0; j < TT; j += (256 / (TT / 4))) {
+      int pp = pp0 + j;
+      long p = p0 + pp;
+      float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (p < HW) v = reinterpret_cast<const float4*>(sbase + p * C + c0)[cq];
+      sm[4 * cq + 0][pp] = silu(v.x * a.x + b.x);
+      sm[4 * cq + 1][pp] = silu(v.y * a.y + b.y);
+      sm[4 * cq + 2][pp] = silu(v.z * a.z + b.z);
+      sm[4 * cq + 3][pp] = silu(v.w * a.w + b.w);
+    }
+  } else {
+    int cc0 = tid % TT, pp0 = tid / TT;
+#pragma unroll
+    for (int j = 0; j < TT; j += (256 / TT)) {
+      int pp = pp0 + j;
+      long p = p0 + pp;
+      int c = c0 + cc0;
+      float v = 0.f;
+      if (p < HW && c < C) v = silu(sbase[p * C + c] * sc[c] + sh[c]);
+      sm[cc0][pp] = v;
+    }
+  }
+  __syncthreads();
+  int pp1 = tid % TT, cc1 = tid / TT;
+#pragma unroll
+  for (int j = 0; j < TT; j += (256 / TT)) {
+    int cc = cc1 + j;
+    long p = p0 + pp1;
+    int c = c0 + cc;
+    if (p < HW && c < C) {
+      long idx = (long)(n * C + c) * HW + p;
+      dst[idx] = sm[cc][pp1] + res[idx];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+static void launch_stats(torch::Tensor o, torch::Tensor partial, int nchunk, long chunk,
+                         long HW, int C, int G, cudaStream_t stream) {
+  int N = (int)o.size(0);
+  dim3 grid(nchunk, N);
+  gn_partial<<<grid, 256, 0, stream>>>(
+      o.data_ptr<float>(), partial.data_ptr<float>(), HW, C, G, nchunk, chunk);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fused_block(torch::Tensor x, torch::Tensor cw1, torch::Tensor g1, torch::Tensor b1,
+                          torch::Tensor cw2, torch::Tensor g2, torch::Tensor b2, double eps) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat32, "float32 cuda input expected");
+  TORCH_CHECK(x.dim() == 4, "4D input expected");
+  auto xc = x.is_contiguous() ? x : x.contiguous();
+  auto w1c = cw1.is_contiguous() ? cw1 : cw1.contiguous();
+  auto w2c = cw2.is_contiguous() ? cw2 : cw2.contiguous();
+  auto g1c = g1.is_contiguous() ? g1 : g1.contiguous();
+  auto b1c = b1.is_contiguous() ? b1 : b1.contiguous();
+  auto g2c = g2.is_contiguous() ? g2 : g2.contiguous();
+  auto b2c = b2.is_contiguous() ? b2 : b2.contiguous();
+
+  int N = (int)xc.size(0), C = (int)xc.size(1), H = (int)xc.size(2), W = (int)xc.size(3);
+  long HW = (long)H * W;
+  const int G = 32;
+  TORCH_CHECK(C % 4 == 0 && C % G == 0, "channel count must be divisible by 4 and 32");
+  TORCH_CHECK((C / 4) <= 256 && (256 % (C / 4)) == 0, "unsupported channel count");
+  TORCH_CHECK((C / G) % 4 == 0, "group size must be a multiple of 4");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto opt = xc.options();
+
+  // weights -> KRSC
+  int K = (int)w1c.size(0);
+  long wtot = (long)K * C * 9;
+  auto w1n = torch::empty({K, 3, 3, C}, opt);
+  auto w2n = torch::empty({K, 3, 3, C}, opt);
+  {
+    size_t smem = (size_t)C * 9 * sizeof(float);
+    if (smem <= 32768) {
+      wt_kcrs_to_krsc_fast<<<K, 256, smem, stream>>>(w1c.data_ptr<float>(), w1n.data_ptr<float>(), C, 9);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      wt_kcrs_to_krsc_fast<<<K, 256, smem, stream>>>(w2c.data_ptr<float>(), w2n.data_ptr<float>(), C, 9);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+      int th = 256;
+      int bl = (int)((wtot + th - 1) / th);
+      wt_kcrs_to_krsc<<<bl, th, 0, stream>>>(w1c.data_ptr<float>(), w1n.data_ptr<float>(), K, C, 9, wtot);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      wt_kcrs_to_krsc<<<bl, th, 0, stream>>>(w2c.data_ptr<float>(), w2n.data_ptr<float>(), K, C, 9, wtot);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+  }
+
+  // x -> NHWC
+  auto xn = torch::empty({N, H, W, C}, opt);
+  {
+    dim3 grid((unsigned)((HW + TT - 1) / TT), (unsigned)((C + TT - 1) / TT), (unsigned)N);
+    nchw2nhwc<<<grid, 256, 0, stream>>>(xc.data_ptr<float>(), xn.data_ptr<float>(), C, HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  // stats chunking
+  int target_blocks = 1024;
+  int nchunk = (int)((HW + 255) / 256);
+  if (nchunk < 1) nchunk = 1;
+  int want = target_blocks / (N > 0 ? N : 1);
+  if (want < 1) want = 1;
+  if (nchunk > want) nchunk = want;
+  long chunk = (HW + nchunk - 1) / nchunk;
+  nchunk = (int)((HW + chunk - 1) / chunk);
+
+  auto partial = torch::empty({N, nchunk, 2 * G}, opt);
+  auto scale = torch::empty({N, C}, opt);
+  auto shift = torch::empty({N, C}, opt);
+
+  // ---- conv1 + groupnorm1 + silu1
+  auto o1 = conv3x3_nhwc(xn, w1n);
+  launch_stats(o1, partial, nchunk, chunk, HW, C, G, stream);
+  {
+    dim3 grid(G, N);
+    gn_finalize<<<grid, 256, 0, stream>>>(partial.data_ptr<float>(), g1c.data_ptr<float>(),
+                                          b1c.data_ptr<float>(), scale.data_ptr<float>(),
+                                          shift.data_ptr<float>(), nchunk, G, C, HW, (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  auto t1 = torch::empty({N, H, W, C}, opt);
+  {
+    long total_q = (long)N * HW * (C / 4);
+    int th = 256;
+    long bl = (total_q + th - 1) / th;
+    gn_silu<<<(unsigned)bl, th, 0, stream>>>(o1.data_ptr<float>(), t1.data_ptr<float>(),
+                                             scale.data_ptr<float>(), shift.data_ptr<float>(),
+                                             HW, C, total_q);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  // ---- conv2 + groupnorm2 + silu2 + residual + NHWC->NCHW (fused epilogue)
+  auto o2 = conv3x3_nhwc(t1, w2n);
+  launch_stats(o2, partial, nchunk, chunk, HW, C, G, stream);
+  {
+    dim3 grid(G, N);
+    gn_finalize<<<grid, 256, 0, stream>>>(partial.data_ptr<float>(), g2c.data_ptr<float>(),
+                                          b2c.data_ptr<float>(), scale.data_ptr<float>(),
+                                          shift.data_ptr<float>(), nchunk, G, C, HW, (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto out = torch::empty({N, C, H, W}, opt);
+  {
+    dim3 grid((unsigned)((HW + TT - 1) / TT), (unsigned)((C + TT - 1) / TT), (unsigned)N);
+    gn_silu_res_nchw<<<grid, 256, 0, stream>>>(o2.data_ptr<float>(), xc.data_ptr<float>(),
+                                               out.data_ptr<float>(), scale.data_ptr<float>(),
+                                               shift.data_ptr<float>(), C, HW);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return out;
+}
+'''
+
+_CPP = ("torch::Tensor fused_block(torch::Tensor x, torch::Tensor cw1, torch::Tensor g1, "
+        "torch::Tensor b1, torch::Tensor cw2, torch::Tensor g2, torch::Tensor b2, double eps);")
+
+_ext = load_inline(
+    name="vae_res_block_fused",
+    cpp_sources=_CPP,
+    cuda_sources=_CUDA,
+    functions=["fused_block"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3", "-std=c++20", "--expt-relaxed-constexpr", "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+        "-I/home/otter77/git_project/KernelMem/third_party/cutlass/include",
+    ],
+)
+
+
+class ModelNew(nn.Module):
+    # =====================================================================
+    # GRANULARITY: (D) full forward rewrite -- the whole residual block runs
+    #              inside one custom extension call; no torch op performs any
+    #              part of the math.
+    #
+    # OPS REPLACED (all of them):
+    #   conv2d #1, group_norm #1, silu #1, conv2d #2, group_norm #2,
+    #   silu #2, residual add, and both NCHW<->NHWC layout changes.
+    #
+    # OWNED CONVOLUTION:
+    #   Both 3x3/pad1/stride1 convolutions are executed by a tiled implicit
+    #   GEMM built from CUTLASS device-side inside this extension
+    #   (DefaultConv2dFprop, NHWC, TF32 tensor cores, fp32 accumulate,
+    #   threadblock 128x128x16 / warp 64x64x16 / mma 16x8x8, 3 stages,
+    #   IteratorAlgorithm::kOptimized). cuDNN / at::conv2d are NOT used.
+    #   ElementA=float converts fp32->TF32 in-register in the mainloop, so
+    #   cuDNN's separate convertTensor pass disappears and the vendor's four
+    #   nchwToNhwc passes shrink to two (one of which is fused away below).
+    #
+    # KERNEL / FUSION MAP:
+    #   wt_kcrs_to_krsc_fast : weight (K,C,3,3) -> (K,3,3,C) via shared mem.
+    #   nchw2nhwc            : x -> NHWC once (conv1 prologue layout change).
+    #   conv3x3_nhwc         : implicit-GEMM conv (CUTLASS, in-extension).
+    #   gn_partial/gn_finalize: GroupNorm moments in two deterministic stages
+    #                          (fixed-order reduction, no atomics), folding
+    #                          gamma/beta into per-(n,c) scale/shift.
+    #   gn_silu              : GroupNorm-affine + SiLU fused into ONE
+    #                          vectorised pass whose output feeds conv2
+    #                          directly (removes 2 extra round trips).
+    #   gn_silu_res_nchw     : conv2 epilogue fused: GroupNorm-affine + SiLU +
+    #                          residual add + NHWC->NCHW transpose in a single
+    #                          shared-memory tiled kernel, so the normalised,
+    #                          activated and transposed tensors are never
+    #                          materialised in global memory.
+    #
+    # LEFT IN PYTORCH: nothing computational -- only tensor allocation, which
+    #   cannot be avoided and costs no GPU time.
+    #
+    # PRECISION: fp32 storage everywhere; TF32 tensor cores for the convs
+    #   exactly as the cuDNN reference does; all reductions accumulate in
+    #   fp32; no narrower dtype is used anywhere.
+    # =====================================================================
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias, conv2_weight,
+                norm2_weight, norm2_bias, eps):
+        return _ext.fused_block(x, conv1_weight, norm1_weight, norm1_bias,
+                                conv2_weight, norm2_weight, norm2_bias, float(eps))

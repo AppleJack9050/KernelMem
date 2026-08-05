@@ -38,7 +38,12 @@ etc.
 
 Compile-time triage checklist (scan CUDA_CODE for these red flags):
 - Heavy templates: "template<", deeply nested types, many template parameters
-- Large includes: cutlass/constexpr-heavy headers, metaprogramming utilities
+- Large includes: constexpr-heavy headers, metaprogramming utilities
+  NOTE: a CUTLASS/CuTe include legitimately costs ~50s. That is EXPECTED COST, not a
+  root cause. Do NOT propose removing CUTLASS unless the log shows the build actually
+  exceeded its limit AND the rest of the TU is otherwise cheap. Replacing a vendor
+  GEMM/conv with CUTLASS is a sanctioned optimisation; prefer raising the compile
+  budget or cutting the number of instantiated tile configs over dropping it.
 - constexpr blowups: "constexpr", "consteval", large constexpr loops/tables
 - Forced unroll: "#pragma unroll" on loops with non-trivial bounds or large constants
 - Excessive inlining: "__forceinline__", large device functions in headers

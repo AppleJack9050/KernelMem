@@ -31,13 +31,36 @@ from typing import Any, Dict, List, Optional
 
 # Operation-count ratio versus a direct/implicit-GEMM convolution. Winograd
 # F(m x m, r x r) needs (m+r-1)^2 multiplies where direct needs (m*r)^2, so
-# F(2x2,3x3) is 36/16 = 2.25. This is an EXACT arithmetic fact, which is what
-# makes it usable as a ceiling: it bounds how much less work is possible, not
-# how fast any particular implementation will be.
+# F(2x2,3x3) is 36/16 = 2.25. The op-count part is an EXACT arithmetic fact.
+#
+# But an op-count ratio is only a usable SPEED ceiling if the cheaper algorithm
+# runs on the SAME execution units. On fp32 conv it does not, and the gap is
+# large enough to invert the conclusion. Measured on RTX 5090 (sm_120), 2026-08-05:
+#
+#   * TF32 Winograd is INADMISSIBLE when the harness reference is cuDNN TF32.
+#     End-to-end, F(2x2,3x3)+TF32 gives 7.4e-3 .. 1.02e-2 against the reference
+#     and FAILS the 0.01 budget on 4x256x256x256; F(4x4,3x3)+TF32 gives ~9e-2,
+#     ~10x over. The output transform amplifies the low-precision rounding
+#     injected in the Winograd domain (A^T entries reach 8).
+#   * fp32 Winograd IS accurate (1.1e-4, same as direct fp32) but cannot use the
+#     tensor cores at all -- no fp32 MMA instruction exists. It runs on the CUDA
+#     cores at 62.7 TFLOP/s achievable versus 105.9 for TF32.
+#
+#   => the realisable ratio for fp32 Winograd is 2.25 * (62.7/105.9) ~= 1.33,
+#      not 2.25. Quoting 2.25 funded a lineage on a ceiling of 2.9x that no
+#      admissible implementation can reach, while own_gemm (which DOES work) was
+#      refused. Ratios below are effective, i.e. op-count x execution-unit rate.
+# Revisit per GPU: on a card where TF32 is much faster than fp32 the derate is
+# harsher (H100 is ~3.7x), and on a benchmark whose reference is NOT TF32 the
+# admissibility objection disappears and the raw op-count ratio applies.
 ALGORITHM_WORK_RATIO: Dict[str, float] = {
-    "implicit_gemm": 1.0,      # cannot beat the vendor at its own algorithm
-    "winograd_f2x3": 2.25,     # F(2x2,3x3)
-    "winograd_f4x3": 4.0,      # F(4x4,3x3) -- accuracy-degrading, see memorybank
+    "implicit_gemm": 1.0,      # op-count parity with the vendor; see ceilings()
+                               # -- parity does NOT mean parity in time, because
+                               # owning the op deletes the vendor's satellite
+                               # convertTensor/transform passes.
+    "winograd_f2x3": 1.33,     # 2.25 op-count x (62.7/105.9) fp32-vs-TF32 derate
+    "winograd_f4x3": 2.37,     # 4.0 op-count x same derate; TF32 form is
+                               # inadmissible on accuracy, see memorybank
 }
 
 
@@ -70,7 +93,7 @@ class LineageState:
 
 
 def ceilings(total_us: float, vendor_us: float, spec: LineageSpec,
-             residual_us: float = 0.0) -> float:
+             residual_us: float = 0.0, vendor_overhead_us: float = 0.0) -> float:
     """Best speedup this lineage could ever reach. An UPPER bound, deliberately.
 
     Upper bounds are the right tool for a funding gate: if even the bound loses
@@ -78,10 +101,23 @@ def ceilings(total_us: float, vendor_us: float, spec: LineageSpec,
     decision is safe without predicting how well anything will be implemented.
 
     Keeping the vendor operator caps you at Amdahl -- ``total/vendor`` -- reached
-    only if every other kernel becomes free. Replacing it with the SAME algorithm
-    caps you at the same number, because matching the vendor is the best case.
-    Only a lower-operation-count algorithm moves the bound, which is why
-    ``ALGORITHM_WORK_RATIO`` is the sole term that can raise it.
+    only if every other kernel becomes free.
+
+    Replacing it with the SAME algorithm used to cap at that same number, on the
+    reasoning that "matching the vendor is the best case". That is false, and it
+    cost a real opportunity: `vendor_us` is not all mainloop. cuDNN's TF32 conv
+    also launches a separate fp32->TF32 convertTensor pass -- a full read+write
+    of the input, measured at ~17% of the conv's own time on vae_block_002 --
+    plus layout transforms and casts. A same-algorithm CUTLASS conv converts
+    in-register in the mainloop and deletes that pass outright, measuring
+    1.04-1.13x faster than cuDNN across the four scored shapes WHILE ITS GEMM IS
+    ~3% SLOWER. It wins on memory traffic, not arithmetic.
+
+    So owning the operator can beat the vendor at algorithmic parity, and
+    ``ALGORITHM_WORK_RATIO`` is no longer the sole term that raises the bound.
+    Pass *vendor_overhead_us* -- the satellite kernels attributable to the vendor
+    op (convertTensor / transform / im2col / cast) -- and it is removed from the
+    floor when the lineage owns the op. Leave it 0 and behaviour is unchanged.
 
     *residual_us* is work that survives even perfect fusion (e.g. a final
     elementwise pass that must read and write the tensor). Pass it when known --
@@ -91,10 +127,16 @@ def ceilings(total_us: float, vendor_us: float, spec: LineageSpec,
     if vendor_us <= 0 or total_us <= 0:
         return float("inf")
     ratio = ALGORITHM_WORK_RATIO.get(spec.algorithm, 1.0)
+    # NOTE: vendor_overhead_us is measured SEPARATELY from vendor_us (the marker
+    # lists in utils.reference_profile are disjoint), so it is added to the
+    # keep-the-vendor floor rather than subtracted from the owning one.
+    overhead = max(0.0, vendor_overhead_us)
     if not spec.owns_vendor_op:
-        # Vendor kernel retained: its time is fixed, whatever the lineage does.
-        floor = vendor_us + residual_us
+        # Vendor kernel retained: mainloop AND its satellites are both fixed.
+        floor = vendor_us + overhead + residual_us
     else:
+        # Owning the op deletes the satellites even at algorithmic parity; only
+        # the mainloop is subject to ALGORITHM_WORK_RATIO.
         floor = (vendor_us / max(ratio, 1e-9)) + residual_us
     return total_us / max(floor, 1e-9)
 
@@ -221,3 +263,15 @@ def vendor_split(profile: Dict[str, Any]) -> tuple[float, float]:
     vendor = sum(float(k.get("us") or 0.0) for k in (profile.get("kernels") or [])
                  if _is_vendor_gemm(str(k.get("name") or "")))
     return total, vendor
+
+
+def vendor_overhead(profile: Dict[str, Any]) -> float:
+    """Time in vendor-internal satellite kernels (convertTensor, transforms).
+
+    Disjoint from `vendor_split`'s GEMM total. Feed it to `ceilings` as
+    `vendor_overhead_us`: it is fixed cost for a keep-the-vendor lineage and
+    free to delete for a lineage that owns the operator.
+    """
+    from utils.reference_profile import _is_vendor_satellite
+    return sum(float(k.get("us") or 0.0) for k in (profile.get("kernels") or [])
+               if _is_vendor_satellite(str(k.get("name") or "")))

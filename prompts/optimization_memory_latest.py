@@ -97,6 +97,7 @@ GPU Name: $gpu_name
 Architecture: $gpu_arch
 Details:
 $gpu_items
+$cutlass_block
 
 [BASE KERNEL FILE]
 This is the current CUDA kernel implementation that you must optimize. Study its structure, parameter handling, and kernel implementations before making changes.
@@ -217,8 +218,8 @@ def build_optimization_prompt(
         except Exception as exc:
             raise RuntimeError("CUDA device not found – pass --gpu <name>.") from exc
 
-    if gpu_name not in gpu_info:
-        raise KeyError(f"{gpu_name} not present in GPU_SPEC_INFO")
+    from prompts.generate_custom_cuda_memory import resolve_gpu_name
+    gpu_name = resolve_gpu_name(gpu_name, gpu_info)
 
     info = gpu_info[gpu_name]
     gpu_arch = info.get("GPU Architecture", "Unknown")
@@ -226,10 +227,16 @@ def build_optimization_prompt(
 
     arch_src = Path(arch_path).read_text().strip()
     optimization_suggestion_text = _format_problem(optimization_suggestion)
+    # The capability advertisement used to live only in the SEED prompt, so every
+    # optimization round after round 0 was blind to CUTLASS -- i.e. 25 of the 26
+    # rounds of the best run so far. Emit it here too; it is "" when CUTLASS is
+    # absent or does not compile, so this is a no-op on machines without it.
+    from prompts.generate_custom_cuda_memory import _cutlass_block
     return _OPTIMIZATION_PROMPT_TEMPLATE.substitute(
         gpu_name=gpu_name,
         gpu_arch=gpu_arch,
         gpu_items=gpu_items,
+        cutlass_block=_cutlass_block(),
         arch_src=arch_src,
         history_block="",  # Not used anymore, kept for backward compatibility
         optimization_suggestion=optimization_suggestion_text,

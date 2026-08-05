@@ -49,7 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from utils.lineage import (LineageSpec, LineageState, ceilings, fund,
+from utils.lineage import (LineageSpec, LineageState, ceilings, fund, vendor_overhead,
                            read_lineage_progress, read_stop_reason,
                            trajectory_verdict, vendor_split)
 
@@ -216,6 +216,10 @@ def main() -> None:
         print("[ERROR] reference profiling failed; cannot compute ceilings.")
         return
     total_us, vendor_us = vendor_split(prof)
+    # Vendor-internal satellites (convertTensor etc): fixed for keep_vendor,
+    # deletable by a lineage that owns the op. Without this term own_gemm's
+    # ceiling equals keep_vendor's and it can never be funded.
+    overhead_us = vendor_overhead(prof)
     print(f"[lineage] reference {total_us:.1f} us/forward, vendor GEMM/conv "
           f"{vendor_us:.1f} us ({vendor_us/max(total_us,1e-9)*100:.1f}%)")
 
@@ -223,7 +227,8 @@ def main() -> None:
     states: List[LineageState] = []
     for i, pid in enumerate(wanted):
         spec = PLANS[pid]
-        ceil = ceilings(total_us, vendor_us, spec, residual_us=args.residual_us)
+        ceil = ceilings(total_us, vendor_us, spec, residual_us=args.residual_us,
+                        vendor_overhead_us=overhead_us)
         ok, why = fund(ceil, args.incumbent, args.min_gain)
         st = LineageState(spec=spec, subproc_id=100 + i,
                           batch_dir=root / spec.id, ceiling=ceil,

@@ -193,6 +193,16 @@ output the code within:
 # ---------------------------------------------------------------------------
 
 
+# CUDA 13 dropped the unversioned PFN_cuTensorMap* aliases that CUTLASS <= 3.5.x
+# still references, so cutlass/cutlass.h fails to compile there without this
+# prelude. _cutlass_probe() decides whether it is actually needed.
+_CUTLASS_PFN_SHIM = "\n".join([
+    "#include <cudaTypedefs.h>",
+    "using PFN_cuTensorMapEncodeTiled  = PFN_cuTensorMapEncodeTiled_v12000;",
+    "using PFN_cuTensorMapEncodeIm2col = PFN_cuTensorMapEncodeIm2col_v12000;",
+])
+
+
 def _cutlass_include_dir() -> str | None:
     """Path to CUTLASS/CuTe C++ headers, or None when they are not installed.
 
@@ -205,6 +215,9 @@ def _cutlass_include_dir() -> str | None:
     env = os.environ.get("CUTLASS_INCLUDE_DIR")
     if env:
         cands.append(Path(env))
+    # headers-only copy vendored in this repo (see third_party/cutlass)
+    cands.append(Path(__file__).resolve().parent.parent
+                 / "third_party" / "cutlass" / "include")
     try:                                    # pip install nvidia-cutlass
         spec = importlib.util.find_spec("cutlass_library")
         if spec and spec.origin:
@@ -227,27 +240,185 @@ def _cutlass_include_dir() -> str | None:
     return None
 
 
+def _cutlass_probe(inc: str, gencode: str) -> "tuple[bool, str]":
+    """nvcc-compile a small TU against `inc`; cache the verdict on disk.
+
+    Returns (ok, shim).  `shim` is prelude source the generated kernel MUST emit
+    before any cutlass include for the build to succeed (empty when the headers
+    compile as-is).
+
+    A file-existence check is not enough: it advertised CUTLASS as "verified to
+    compile" on toolchains where it does not.  CUDA 13 against CUTLASS <= 3.5.x
+    is exactly that case -- the headers are present and every build still fails
+    on PFN_cuTensorMapEncodeTiled.  An agent told the headers were verified
+    burns its attempts on that error and the compile-timeout judge then blames
+    CUTLASS itself, so the branch gets abandoned for the wrong reason.
+    """
+    import hashlib
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+
+    nvcc = shutil.which("nvcc")
+    if not nvcc:
+        return (False, "")
+    try:
+        ver = subprocess.run([nvcc, "--version"], capture_output=True,
+                             text=True, timeout=30).stdout
+    except Exception:
+        return (False, "")
+
+    key = hashlib.sha1(f"{inc}|{gencode}|{ver}".encode()).hexdigest()[:16]
+    cache = Path.home() / ".cache" / "kernelmem" / "cutlass_probe.json"
+    db: dict = {}
+    try:
+        db = json.loads(cache.read_text())
+        if key in db:
+            hit = db[key]
+            return (bool(hit.get("ok")), str(hit.get("shim", "")))
+    except Exception:
+        db = {}
+
+    # NB: plain replace, not str.format -- the C++ body contains braces.
+    src = ("#include <cuda.h>\n"
+           "#include <cuda_runtime.h>\n"
+           "__SHIM__\n"
+           "#include <cutlass/cutlass.h>\n"
+           "#include <cute/tensor.hpp>\n"
+           "#include <cutlass/gemm/device/gemm.h>\n"
+           "int main() { return 0; }\n")
+
+    ok, shim = False, ""
+    with tempfile.TemporaryDirectory() as td:
+        for cand in ("", _CUTLASS_PFN_SHIM):
+            cu = Path(td) / "probe.cu"
+            cu.write_text(src.replace("__SHIM__", cand))
+            cmd = [nvcc, "-std=c++20", "-O0", *gencode.split(), f"-I{inc}",
+                   "--expt-relaxed-constexpr", "-DNDEBUG",
+                   "-c", str(cu), "-o", str(Path(td) / "probe.o")]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            except Exception:
+                break
+            if res.returncode == 0:
+                ok, shim = True, cand
+                break
+
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        db[key] = {"ok": ok, "shim": shim}
+        cache.write_text(json.dumps(db, indent=1))
+    except Exception:
+        pass
+    return (ok, shim)
+
+
+def resolve_gpu_name(gpu_name: str, gpu_info: dict) -> str:
+    """Map a torch device name onto a GPU_SPEC_INFO key.
+
+    torch.cuda.get_device_name() returns "NVIDIA GeForce RTX 5090" while the
+    spec table is keyed "RTX 5090", so auto-detect could never hit and callers
+    had to pass --gpu by hand. main_memory_latest.py still DEFAULTS to
+    "A100-80GB", which silently feeds A100 bandwidth and tensor-core rates to a
+    model reasoning about a different card -- worse than crashing, because the
+    roofline arithmetic in the prompt is then quietly wrong.
+    """
+    if gpu_name in gpu_info:
+        return gpu_name
+    cleaned = (gpu_name.replace("NVIDIA", "")
+                       .replace("GeForce", "")
+                       .replace("Tesla", "")
+                       .strip())
+    if cleaned in gpu_info:
+        _log_capability(f"gpu-spec:{gpu_name}", True, f"matched '{cleaned}'")
+        return cleaned
+    up = cleaned.upper()
+    hits = [k for k in gpu_info if k.upper() == up] \
+        or [k for k in gpu_info if up.startswith(k.upper()) or k.upper() in up]
+    if hits:
+        best = max(hits, key=len)
+        _log_capability(f"gpu-spec:{gpu_name}", True, f"matched '{best}'")
+        return best
+    raise KeyError(
+        f"{gpu_name} not present in GPU_SPEC_INFO (known: {sorted(gpu_info)}). "
+        "Pass --gpu with one of those names, or add the card to "
+        "prompts/hardware/gpu_specs.py.")
+
+
+_CAPABILITY_LOGGED: set = set()
+
+
+def _log_capability(name: str, available: bool, detail: str = "") -> None:
+    """Announce a capability verdict exactly once per process.
+
+    Capabilities used to fail SILENTLY: when CUTLASS was absent the guidance
+    block simply vanished from the prompt and nothing anywhere said so, so a run
+    could spend its whole budget unable to reach an optimisation without a
+    single line of evidence why. Any capability gated on the environment must
+    say what it decided.
+    """
+    if name in _CAPABILITY_LOGGED:
+        return
+    _CAPABILITY_LOGGED.add(name)
+    mark = "available" if available else "UNAVAILABLE"
+    msg = f"[capability] {name}: {mark}"
+    if detail:
+        msg += f" ({detail})"
+    print(msg, file=sys.stderr, flush=True)
+
+
 def _cutlass_block() -> str:
-    """Guidance emitted only when CUTLASS headers are actually present."""
+    """Guidance emitted only when CUTLASS headers actually COMPILE here."""
     inc = _cutlass_include_dir()
     if not inc:
+        _log_capability("cutlass", False,
+                        "headers not found; set CUTLASS_INCLUDE_DIR or populate "
+                        "third_party/cutlass/include")
         return ""
-    return "\n".join([
+    ok, shim = _cutlass_probe(inc, _detect_gencode_flag())
+    if not ok:
+        _log_capability("cutlass", False,
+                        f"headers at {inc} do NOT compile with this toolchain")
+        return ""
+    _log_capability("cutlass", True,
+                    f"{inc}{'; PFN shim required' if shim else ''}")
+    lines = [
         "",
-        "CUTLASS / CuTe IS AVAILABLE (headers verified to compile in this environment)",
+        "CUTLASS / CuTe IS AVAILABLE (compile-probed in this environment)",
         f'- Add "-I{inc}" to extra_cuda_cflags and you may #include <cutlass/...>',
-        "  and <cute/tensor.hpp>. Verified with -std=c++20 and the gencode flag above.",
+        "  and <cute/tensor.hpp>. Probed with the gencode flag above and -std=c++20;",
+        "  use -std=c++20, not c++17 (torch's headers do not build under c++17 here).",
+    ]
+    if shim:
+        lines += [
+            "- REQUIRED PRELUDE: this CUDA toolkit dropped the unversioned PFN_cuTensorMap*",
+            "  aliases CUTLASS references. Emit these lines BEFORE any cutlass include, or",
+            "  the build fails with 'identifier PFN_cuTensorMapEncodeTiled is undefined':",
+        ] + [f"      {ln}" for ln in shim.splitlines()]
+    lines += [
         "- PREFER IT OVER HAND-WRITTEN wgmma PTX when you own a GEMM/conv. Hopper",
         "  warpgroup MMA needs shared-memory descriptors with specific swizzle layouts and",
         "  correct wgmma.fence / commit_group / wait_group ordering; those are what",
         "  hand-written warpgroup code gets wrong, and CUTLASS already encodes them.",
         "  cute::tiled_mma / the SM90 collective builders reach the same instructions the",
         "  vendor kernels use.",
+        "- IT CAN BEAT A VENDOR CONV WITHOUT BEATING ITS MATH. cuDNN's TF32 path runs a",
+        "  separate fp32->TF32 convertTensor pass over the input (a full read+write of the",
+        "  tensor, ~10-13% of conv time); a CUTLASS conv with ElementA=float converts",
+        "  in-register in the mainloop and skips it. Owning the kernel additionally lets you",
+        "  fold a following reduction (e.g. GroupNorm sum/sumsq) into the epilogue, deleting",
+        "  another full read of the conv output.",
+        "- ACCURACY NOTE: when the harness reference is itself cuDNN TF32, a conv whose",
+        "  accumulation order differs from cuDNN's costs real error budget. CUTLASS tracks",
+        "  it closely (cuDNN dispatches CUTLASS kernels); an ad-hoc TF32 conv with a",
+        "  different reduction order may not. Check tolerance across several seeds, not one.",
         "- COST: a CUTLASS include adds roughly 50s to the build. Worth it when you are",
         "  replacing a vendor GEMM/conv; not worth it for an elementwise or reduction",
         "  kernel, where plain CUDA compiles in a few seconds and is just as fast.",
         "",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def _detect_gencode_flag() -> str:  # noqa: D401
@@ -311,8 +482,7 @@ def build_seed_prompt(
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("CUDA device not found – pass --gpu <name>.") from exc
 
-    if gpu_name not in gpu_info:
-        raise KeyError(f"{gpu_name} not present in GPU_SPEC_INFO")
+    gpu_name = resolve_gpu_name(gpu_name, gpu_info)
 
     info = gpu_info[gpu_name]
     gpu_arch = info.get("GPU Architecture", "Unknown")

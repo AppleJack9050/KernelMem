@@ -1,0 +1,6 @@
+# Vendored third-party headers (16 MB, thousands of files). Re-fetch with:
+#   git clone --depth 1 --branch v3.5.1 https://github.com/NVIDIA/cutlass.git
+# and copy include/ + tools/util/include/ into third_party/cutlass/.
+# NOTE: because this is ignored, the CUTLASS capability does NOT travel with the
+# repo -- install it (or set CUTLASS_INCLUDE_DIR) on every machine you run on.
+third_party/cutlass/

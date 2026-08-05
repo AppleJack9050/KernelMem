@@ -77,7 +77,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Path to a single task .py file OR a directory containing many tasks (.py)",
     )
     # p.add_argument("--gpu", default="Quadro RTX 6000", help="GPU name in prompt spec")
-    p.add_argument("--gpu", default="A100-80GB", help="GPU name in prompt spec")
+    # Default None => auto-detect from torch and normalise via resolve_gpu_name().
+    # It used to default to "A100-80GB", which meant the auto-detect branch was
+    # dead code and a run on any other card silently fed the model A100
+    # bandwidth / tensor-core numbers -- corrupting exactly the roofline
+    # reasoning the prompt asks it to do.
+    p.add_argument("--gpu", default=None, help="GPU name in prompt spec (default: auto-detect)")
     p.add_argument("--server_type", default="claude", help="Label only; all calls go through the Claude Agent SDK (subscription credit)")
     p.add_argument("--server_address", default="localhost", help="Unused (kept for compatibility)")
     p.add_argument("--server_port", type=int, default=8000, help="Unused (kept for compatibility)")
@@ -863,8 +868,33 @@ def _nsys_launch_table_block(full_df, top_n: int = 15) -> str:
     """
     has_time = "time_pct" in full_df.columns and full_df["time_pct"].notna().any()
     sort_col = "time_pct" if has_time else "kernel_launch_count"
-    df = full_df.sort_values(sort_col, ascending=False).head(top_n)
     total = int(full_df["kernel_launch_count"].sum())
+
+    # A cuDNN exhaustive autotune probes each candidate engine a handful of
+    # times, and those probes can dominate the profile: on vae_block_002 a
+    # conv2d_grouped_direct probe took 76.4% of GPU time in FOUR launches, which
+    # squeezed every steady-state kernel into rounding error -- the fp32->TF32
+    # convertTensor pass showed as "0.5%" when it is really ~17% of the conv it
+    # feeds. Round 25 read that 0.5% and correctly ignored it. So flag the
+    # one-time kernels and re-base the percentages on steady-state work only.
+    try:
+        counts = [int(c) for c in full_df["kernel_launch_count"].tolist()]
+        max_launch = max(counts) if counts else 0
+        setup_cut = max(1.0, 0.10 * max_launch)
+        steady_ns = sum(
+            float(t) for t, c in zip(full_df["total_time_ns"].tolist(), counts)
+            if c >= setup_cut and float(t) == float(t)
+        )
+    except Exception:
+        setup_cut, steady_ns = 0.0, 0.0
+
+    def _is_setup(row) -> bool:
+        try:
+            return int(row["kernel_launch_count"]) < setup_cut
+        except Exception:
+            return False
+
+    df = full_df.sort_values(sort_col, ascending=False).head(top_n)
 
     lines = [
         "",
@@ -877,9 +907,23 @@ def _nsys_launch_table_block(full_df, top_n: int = 15) -> str:
         "that holds 4% of the time caps the whole round at 4%, however well it goes.",
         "Look also for kernels that do no math — layout transforms, copies, casts.",
         "",
+        "READ 'steady %', NOT 'raw %'. Rows marked (one-time) are cuDNN autotune",
+        "probes and similar setup work: they run a handful of times regardless of",
+        "the workload and can swamp the raw column. 'steady %' re-bases on the",
+        "kernels that actually run every forward.",
+        "",
+        "ATTRIBUTE SATELLITE KERNELS TO THE OP THEY SERVE. A vendor conv/GEMM is",
+        "not just its mainloop: cuDNN's TF32 path also launches a separate",
+        "convertTensor (fp32->TF32) pass, and layout transforms / im2col / casts",
+        "belong to the op they surround. Judging 'the conv is at 91% of TF32 peak,",
+        "so it has no headroom' from the MAINLOOP ALONE is a mistake — add the",
+        "satellite kernels in first. Removing a satellite needs no faster math:",
+        "owning the op (e.g. via CUTLASS) can delete it outright.",
+        "",
     ]
     if has_time:
-        lines += ["| kernel | GPU time % | total (us) | launches |", "|---|---|---|---|"]
+        lines += ["| kernel | steady % | raw % | total (us) | launches |",
+                  "|---|---|---|---|---|"]
     else:
         lines += ["| kernel | launches |", "|---|---|"]
 
@@ -891,19 +935,40 @@ def _nsys_launch_table_block(full_df, top_n: int = 15) -> str:
             pct = r["time_pct"]
             _tt = r["total_time_ns"]
             us = _tt / 1e3 if _tt == _tt else float("nan")  # NaN-safe; pandas is not imported here
-            lines.append(f"| `{name}` | {pct:.1f}% | {us:,.0f} | {int(r['kernel_launch_count'])} |")
+            if _is_setup(r):
+                steady = "(one-time)"
+            elif steady_ns > 0 and _tt == _tt:
+                steady = f"{100.0 * float(_tt) / steady_ns:.1f}%"
+            else:
+                steady = "n/a"
+            lines.append(f"| `{name}` | {steady} | {pct:.1f}% | {us:,.0f} | "
+                         f"{int(r['kernel_launch_count'])} |")
         else:
             lines.append(f"| `{name}` | {int(r['kernel_launch_count'])} |")
 
     lines.append("")
     if has_time:
-        top = df.iloc[0]
-        top_name = str(top["Kernel Name"])[:60]
-        lines.append(
-            f"Hottest kernel: `{top_name}` at **{top['time_pct']:.1f}%** of forward GPU time. "
-            f"By Amdahl, a round that leaves it untouched is capped at "
-            f"{100.0 - float(top['time_pct']):.1f}% even if it drives everything else to zero."
-        )
+        # Amdahl off STEADY-STATE work. Quoting the raw column here named the
+        # cuDNN autotune probe as "hottest at 76.4%" and derived a 23.6% cap
+        # from it -- a bound computed from work that does not run in the forward
+        # pass at all.
+        steady_rows = [r for _, r in full_df.iterrows() if not _is_setup(r)]
+        top = None
+        if steady_rows and steady_ns > 0:
+            top = max(steady_rows,
+                      key=lambda r: (float(r["total_time_ns"])
+                                     if float(r["total_time_ns"]) == float(r["total_time_ns"])
+                                     else -1.0))
+        if top is not None:
+            top_name = str(top["Kernel Name"])[:60]
+            top_pct = 100.0 * float(top["total_time_ns"]) / steady_ns
+            lines.append(
+                f"Hottest STEADY-STATE kernel: `{top_name}` at **{top_pct:.1f}%** of "
+                f"per-forward GPU time. By Amdahl, a round that leaves it untouched is "
+                f"capped at {100.0 - top_pct:.1f}% even if it drives everything else to "
+                f"zero. (One-time autotune probes are excluded; they inflate the raw "
+                f"column but do not run per forward.)"
+            )
         lines.append("")
     lines.append(f"Total kernel launches in the forward pass: **{total}**")
     lines.append("")

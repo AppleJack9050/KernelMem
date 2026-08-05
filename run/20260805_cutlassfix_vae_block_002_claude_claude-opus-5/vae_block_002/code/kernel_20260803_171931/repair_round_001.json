@@ -1,0 +1,31 @@
+{
+  "round": 18,
+  "repair_round": 1,
+  "kernel_to_repair": "/home/otter77/git_project/KernelMem/run/20260802_150231_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260803_171931.py",
+  "kernel_to_repair_name": "kernel_20260803_171931",
+  "error_log": "Traceback (most recent call last):\n  File \"/home/otter77/git_project/KernelMem/utils/compile_and_run.py\", line 1076, in compare_and_bench\n    raise ValueError(device_state.leak_message(_leaks))\nValueError: Candidate leaked device-global state.\nChanged after the candidate ran:\n  persisting_l2_bytes: 18874368 -> 50331648\n\nThis state outlives the candidate's own execution and changes how UNRELATED work on the device performs, including the reference the candidate is scored against. A kernel that raises the persisting-L2 reservation and never releases it does not get faster -- it makes everything else slower, which inflates T_ref/T_k without improving the kernel.\nFix: set such state and restore it INSIDE forward (save the previous value, restore before returning; for persisting L2 also call cudaCtxResetPersistingL2Cache()). Do not configure it from a static initializer or module scope, which runs once and never unwinds.\n",
+  "problem_identification": {
+    "critical_issue": "Persisting-L2 carve-out set in __init__ and never restored leaks device-global state",
+    "evidence": [
+      "Candidate leaked device-global state.",
+      "persisting_l2_bytes: 18874368 -> 50331648"
+    ],
+    "root_cause": "ModelNew.__init__ calls ext.init_l2_persist(48MB), which issues cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 48MB) once at construction. Nothing saves the prior 18MB value or resets it, so the reservation outlives forward() and shrinks normal L2 for all later work, including the reference. The known-good kernel has no such device-level call.",
+    "trigger_condition": "Any run: ModelNew construction executes the one-shot cudaDeviceSetLimit; the harness compares persisting_l2_bytes before/after the candidate.",
+    "must_hold_invariants": [
+      "No cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize) outside forward()",
+      "If set inside forward, save old value and restore + cudaCtxResetPersistingL2Cache() before returning",
+      "Device-global limits unchanged after candidate execution"
+    ],
+    "minimal_fix": "Delete the init_l2_persist call in __init__ (and the carve-out helper), leaving g_l2_persist_budget=0 so persist_flag returns 0 and the ld_cg path runs, matching the known-good kernel.",
+    "patch_anchor": "self.ext.init_l2_persist(48 * 1024 * 1024)",
+    "confidence": "high"
+  },
+  "repair_strategy": null,
+  "timestamp": "2026-08-03T17:20:16.566776",
+  "runnable": true,
+  "speedup": 1.1853671001302377,
+  "test_passed": true,
+  "repaired_kernel": "/home/otter77/git_project/KernelMem/run/20260802_150231_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260803_172232.py",
+  "test_timestamp": "2026-08-03T17:23:06.523298"
+}

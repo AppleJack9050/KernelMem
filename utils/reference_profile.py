@@ -39,9 +39,41 @@ _VENDOR_GEMM_MARKERS = (
 _DEFAULT_ITERS = 50
 
 
+# Satellite kernels the VENDOR op launches internally. These sit in neither
+# bucket correctly by default: they are not GEMM mainloop, but they are also NOT
+# "ordinary library code a custom kernel can replace" -- you cannot delete them
+# while still calling the vendor op. Counting them as replaceable inflated the
+# keep-the-vendor ceiling and, worse, made owning the op look like it bought
+# nothing, so `own_gemm` could never be funded. Measured on vae_block_002:
+# cuDNN's fp32->TF32 convertTensor pass is ~17% of the conv's own time and
+# disappears entirely under a CUTLASS conv (ElementA=float converts in-register).
+# Which satellite you pay depends only on WHICH cuDNN engine gets picked, and a
+# keep-the-vendor lineage cannot escape paying one of them:
+#   * feed cuDNN NCHW  -> it launches nchwToNhwcKernel  (203.1 us on the vae_block_002
+#                         reference, 8.6% of the forward)
+#   * feed cuDNN NHWC  -> it launches convertTensor for the fp32->TF32 rounding
+#                         (166 us measured on the best candidate, ~17% of conv time)
+# Only OWNING the operator removes both: a CUTLASS conv reads fp32 in its native
+# layout and converts in-register in the mainloop.
+# Qualify the layout engines with the cuDNN namespace so a candidate's OWN
+# transpose kernel (e.g. nchw2nhwc_kernel) is never miscounted as vendor cost.
+_VENDOR_SATELLITE_MARKERS = (
+    "converttensor",
+    "engines_precompiled::nchwtonhwc",
+    "engines_precompiled::nhwctonchw",
+    "engines_precompiled::transform",
+)
+
+
 def _is_vendor_gemm(name: str) -> bool:
     low = name.lower()
     return any(m in low for m in _VENDOR_GEMM_MARKERS)
+
+
+def _is_vendor_satellite(name: str) -> bool:
+    """Vendor-internal plumbing: removable only by owning the vendor op."""
+    low = name.lower()
+    return any(m in low for m in _VENDOR_SATELLITE_MARKERS)
 
 
 def _shorten(name: str, width: int = 58) -> str:
