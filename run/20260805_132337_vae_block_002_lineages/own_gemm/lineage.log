@@ -288,3 +288,226 @@ Skipping non-text content block of type 'ToolUseBlock'
 Skipping non-text content block of type 'ThinkingBlock'
 Skipping non-text content block of type 'ToolUseBlock'
 Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=2965197, Out=96122, Total=3061319
+[92mFinish reason: end_turn[0m
+[seed] score=1.1311 (geomean over 4 shapes: 8x256x64x128=1.1332x  2x256x64x64=1.0589x  4x256x256x256=1.2299x  1x256x131x131=1.1092x)
+[seed] metrics saved to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0002.json
+[Seed] candidate 1/3: 1.1461
+[Seed] candidate 2/3: 1.2063  <-- selected
+[Seed] candidate 3/3: 1.1311
+[base] Setting initial base_kernel: 1.2063
+[best] Updating best_kernel: 1.2063 vs -inf [stored-score (no paired verdict available)]
+[vae_block_002.py] Round 1
+Optimizing start
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['nchw2nhwc_kernel', 'gn_partial_kernel', 'gn_finalize_kernel', 'gn_silu_nhwc_kernel', 'gn_silu_add_nhwc2nchw_kernel', 'kcrs2krsc_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/test_kernel_100.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931.py)
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/test_kernel_100.py
+[ncu] Multiple kernels detected (6), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/6: nchw2nhwc_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel0_metrics.csv --kernel-name=::regex:\bnchw2nhwc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully
+[ncu] [metrics] Completed for kernel 1/6: nchw2nhwc_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel0_section.csv --kernel-name=::regex:\bnchw2nhwc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel0]] completed successfully
+[ncu] [section] Completed for kernel 1/6: nchw2nhwc_kernel
+[ncu] Profiling kernel 2/6: gn_partial_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel1_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully
+[ncu] [metrics] Completed for kernel 2/6: gn_partial_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel1_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel1]] completed successfully
+[ncu] [section] Completed for kernel 2/6: gn_partial_kernel
+[ncu] Profiling kernel 3/6: gn_finalize_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel2_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully
+[ncu] [metrics] Completed for kernel 3/6: gn_finalize_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel2_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel2]] completed successfully
+[ncu] [section] Completed for kernel 3/6: gn_finalize_kernel
+[ncu] Profiling kernel 4/6: gn_silu_nhwc_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel3_metrics.csv --kernel-name=::regex:\bgn_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully
+[ncu] [metrics] Completed for kernel 4/6: gn_silu_nhwc_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel3_section.csv --kernel-name=::regex:\bgn_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel3]] completed successfully
+[ncu] [section] Completed for kernel 4/6: gn_silu_nhwc_kernel
+[ncu] Profiling kernel 5/6: gn_silu_add_nhwc2nchw_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel4_metrics.csv --kernel-name=::regex:\bgn_silu_add_nhwc2nchw_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully
+[ncu] [metrics] Completed for kernel 5/6: gn_silu_add_nhwc2nchw_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel4_section.csv --kernel-name=::regex:\bgn_silu_add_nhwc2nchw_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel4]] completed successfully
+[ncu] [section] Completed for kernel 5/6: gn_silu_add_nhwc2nchw_kernel
+[ncu] Profiling kernel 6/6: kcrs2krsc_kernel
+[ncu] [metrics[kernel5]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel5_metrics.csv --kernel-name=::regex:\bkcrs2krsc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [metrics[kernel5]] completed successfully
+[ncu] [metrics] Completed for kernel 6/6: kcrs2krsc_kernel
+[ncu] [section[kernel5]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_temp_100_kernel5_section.csv --kernel-name=::regex:\bkcrs2krsc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py --repeat 100
+[ncu] [section[kernel5]] completed successfully
+[ncu] [section] Completed for kernel 6/6: kcrs2krsc_kernel
+[ok] Merged 6 kernel profiles into: /home/otter77/git_project/KernelMem/ncu_temp_100.csv
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260805_144931_ncu.csv
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/nsys_temp_100 /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 6 kernel(s)
+[nsys] Saved launch counts to: nsys_temp_100.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 7 kernel(s)
+[nsys] Saved launch counts to: nsys_full_100.csv
+[nsys] Added full launch table (7 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260805_144931_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260805_144931_nsys.csv
+[machine_check] Using kernel_launch_count from nsys: 108
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_judge_gate_prompt.txt
+Usage: In=25870, Out=267, Total=26137
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=66719, Out=25580, Total=92299
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931/opt_round_001.json
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Usage: In=876403, Out=43150, Total=919553
+[92mFinish reason: end_turn[0m
+[opt] score=1.2084 (geomean over 4 shapes: 8x256x64x128=1.2405x  2x256x64x64=1.1443x  4x256x256x256=1.2278x  1x256x131x131=1.2235x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0003.json
+[opt] Optimization history updated: speedup=1.2084
+[base] Re-measuring base and candidate side by side (3-8 interleaved reps)...
+[base] Keeping base_kernel 1.2063 (1.2084: paired +0.34% +/-0.22% (1.5 sigma, t=+1.5, 8 reps, escalated, UNRESOLVED; 1.1893 -> 1.1853 ms), below the 0.5% margin)
+[best] Keeping best_kernel 1.2063 (1.2084 scores higher but paired +0.34% +/-0.22% (1.5 sigma, t=+1.5, 8 reps, escalated, UNRESOLVED; 1.1893 -> 1.1853 ms)); not separable from measurement drift
+[vae_block_002.py] Round 2
+Optimizing start
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['nchw2nhwc_kernel', 'gn_partial_kernel', 'gn_finalize_kernel', 'gn_silu_nhwc_kernel', 'gn_silu_add_nhwc2nchw_kernel', 'kcrs2krsc_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/test_kernel_100.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931.py)
+[ncu] cache hit (d718df62): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260805_144931_ncu.csv
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260805_160426 (1.2084 vs base 1.2063) -- note it scored ABOVE the base but inside the margin (not resolvable from noise), so this is 'unproven', not 'failed'
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/rejected_kernel_100.py
+[ncu] Multiple kernels detected (6), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/6: nchw2nhwc_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel0_metrics.csv --kernel-name=::regex:\bnchw2nhwc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully
+[ncu] [metrics] Completed for kernel 1/6: nchw2nhwc_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel0_section.csv --kernel-name=::regex:\bnchw2nhwc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel0]] completed successfully
+[ncu] [section] Completed for kernel 1/6: nchw2nhwc_kernel
+[ncu] Profiling kernel 2/6: gn_partial_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel1_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully
+[ncu] [metrics] Completed for kernel 2/6: gn_partial_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel1_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel1]] completed successfully
+[ncu] [section] Completed for kernel 2/6: gn_partial_kernel
+[ncu] Profiling kernel 3/6: gn_finalize_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel2_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully
+[ncu] [metrics] Completed for kernel 3/6: gn_finalize_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel2_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel2]] completed successfully
+[ncu] [section] Completed for kernel 3/6: gn_finalize_kernel
+[ncu] Profiling kernel 4/6: gn_silu_nhwc_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel3_metrics.csv --kernel-name=::regex:\bgn_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully
+[ncu] [metrics] Completed for kernel 4/6: gn_silu_nhwc_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel3_section.csv --kernel-name=::regex:\bgn_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel3]] completed successfully
+[ncu] [section] Completed for kernel 4/6: gn_silu_nhwc_kernel
+[ncu] Profiling kernel 5/6: gn_silu_add_nhwc2nchw_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel4_metrics.csv --kernel-name=::regex:\bgn_silu_add_nhwc2nchw_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully
+[ncu] [metrics] Completed for kernel 5/6: gn_silu_add_nhwc2nchw_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel4_section.csv --kernel-name=::regex:\bgn_silu_add_nhwc2nchw_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel4]] completed successfully
+[ncu] [section] Completed for kernel 5/6: gn_silu_add_nhwc2nchw_kernel
+[ncu] Profiling kernel 6/6: kcrs2krsc_kernel
+[ncu] [metrics[kernel5]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel5_metrics.csv --kernel-name=::regex:\bkcrs2krsc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [metrics[kernel5]] completed successfully
+[ncu] [metrics] Completed for kernel 6/6: kcrs2krsc_kernel
+[ncu] [section[kernel5]] running: /usr/local/cuda/bin/ncu --config-file-path /home/otter77/git_project/KernelMem/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/ncu_rejected_100_kernel5_section.csv --kernel-name=::regex:\bkcrs2krsc_kernel\b /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/rejected_kernel_100.py --repeat 100
+[ncu] [section[kernel5]] completed successfully
+[ncu] [section] Completed for kernel 6/6: kcrs2krsc_kernel
+[ok] Merged 6 kernel profiles into: /home/otter77/git_project/KernelMem/ncu_rejected_100.csv
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/nsys_temp_100 /home/otter77/miniconda3/bin/python3 bench_ref_inputs_100.py --device-idx 0 --test /home/otter77/git_project/KernelMem/test_kernel_100.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 6 kernel(s)
+[nsys] Saved launch counts to: nsys_temp_100.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/nsys_temp_100.nsys-rep
+[nsys] Extracted launch counts for 7 kernel(s)
+[nsys] Saved launch counts to: nsys_full_100.csv
+[nsys] Added full launch table (7 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260805_144931_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260805_144931_nsys.csv
+[opt] Loaded 1 previous optimization attempts from /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931
+[machine_check] Using kernel_launch_count from nsys: 108
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_judge_gate_prompt.txt
+Usage: In=25870, Out=267, Total=26137
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_machine_check_result.json
+
+[stop] Signal 15 received. Finishing the current round, then writing artifacts and a resumable checkpoint. Signal again to abort now.
