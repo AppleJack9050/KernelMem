@@ -32,6 +32,7 @@ from prompts.optimization_memory_latest import build_optimization_prompt
 from prompts.judger_repair_memory import build_correctness_prompts
 from prompts.judger_optimization_memory_latest import build_judger_optimization_prompts
 from utils.gpu_lock import gpu_section
+from utils.torch_ext_cache import sweep_stale_batons, sweep_unheld_batons
 
 # ---------------------------------------------------------------------------
 # Serialize every GPU-touching entry point behind one cross-process mutex.
@@ -1410,12 +1411,28 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                       f"above {start_round} to extend it; artifacts will be rewritten as-is.",
                       flush=True)
 
+    # Clear orphaned torch extension build locks before anything compiles. A
+    # baton left behind by a killed process never expires on its own, and the
+    # kernel that later picks that extension name hangs until the compile alarm
+    # and is then misreported as an illegal memory access -- scored -inf and sent
+    # to repair for a bug it does not have. Swept here rather than only before
+    # the seed because every round compiles, and the poisoned name is chosen by
+    # the model, not by the round index. See utils/torch_ext_cache.
+    sweep_stale_batons()
+
     for round_idx in range(start_round, args.round):
         if _STOP_REQUESTED:
             print(f"[stop] Stopping before round {round_idx}. Completed {round_idx} of "
                   f"{args.round} rounds; resume with --resume {batch_dir}", flush=True)
             break
         print(f"[{task_path.name}] Round {round_idx}")
+        # Collect batons this run stranded. The startup sweep above cannot: a
+        # lineage killed mid-build leaves a lock only minutes old, far inside
+        # that 3600s age gate, so without this every later round of THIS run
+        # stays exposed to the extension name it orphaned. Liveness is the gate
+        # here instead of age -- an unheld lock means the builder is gone -- so
+        # it costs nothing when the cache is healthy (no locks, no /proc walk).
+        sweep_unheld_batons()
         # Reset every round: only a round whose judge JSON asks for it may take
         # structural grace, and a stale True would hand it to an unrelated round.
         _structural_declared = False

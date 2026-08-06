@@ -11,7 +11,7 @@ import os
 import shutil
 import tempfile
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -81,6 +81,47 @@ _SUBSCRIPTION_ENV = {
     "CLAUDE_CODE_USE_BEDROCK": "",
     "CLAUDE_CODE_USE_VERTEX": "",
 }
+
+
+# ---------------------------------------------------------------------------
+# Give every tool-mode agent its own torch extension build directory.
+#
+# The agent is told to compile with load_inline (see _TOOL_MODE_INSTRUCTION),
+# and torch keys its build directory on the extension NAME alone:
+# ~/.cache/torch_extensions/py313_cu130/<name>/. The name is whatever the model
+# picked, and independently generated kernels reuse names constantly -- see the
+# note in utils/verify_chain.py about two rounds both emitting
+# `vae_resblock_fused_ms_graph_ext`, and kernel_20260806_064326.py /
+# kernel_20260806_064916.py in this repo, which collide on
+# `vae_resblock_fused_l2`. So an agent's throwaway compile lands in the same
+# directory the harness later builds the real kernel in, and two agents running
+# at once (already the case across lineages) write the same cuda.cu concurrently.
+#
+# Worse, that directory is guarded by torch's FileBaton, which has no timeout,
+# no staleness check and no holder-liveness check, and is released only in the
+# winner's `finally`. Anything that skips stack unwinding orphans it permanently:
+# p.terminate()/p.kill() after the 20-minute p.join in main_memory_latest, and
+# run_lineages' SIGTERM/SIGKILL. (The 600s SIGALRM in utils/compile_and_run does
+# NOT, despite looking like the obvious candidate -- it raises an ordinary Python
+# exception that unwinds through cpp_extension's `finally: baton.release()`.) A
+# later kernel that picks a poisoned name then spins until the compile alarm and
+# gets reported as an illegal memory access, so a good kernel is scored -inf and
+# sent to repair for a bug it does not have.
+#
+# Pointing the agent at its own directory removes both. It is not free: when the
+# agent's last successful compile is byte-identical to the file it returns, the
+# harness's first build of that kernel used to be a ninja no-op and is now a cold
+# nvcc compile -- the 482 object builds in this repo's .ninja_log files run a
+# median of 9.9s and a p90 of 26.9s. Paying that once per accepted kernel to stop
+# an agent from poisoning the directory the harness measures in is the right
+# trade, but it is a trade. This does not contradict run_ncu_memory.py's note
+# about leaving TORCH_EXTENSIONS_DIR unset -- that is about the HARNESS reusing
+# built .so files under ncu, a different process.
+# ---------------------------------------------------------------------------
+def _agent_build_env(workdir: str) -> Dict[str, str]:
+    ext_dir = os.path.join(workdir, "torch_ext")
+    os.makedirs(ext_dir, exist_ok=True)
+    return {"TORCH_EXTENSIONS_DIR": ext_dir}
 
 
 def retry_with_backoff(
@@ -276,7 +317,7 @@ def query_server(
             permission_mode="bypassPermissions",  # headless: nothing can approve a prompt
             cwd=workdir,
             max_turns=_TOOL_MAX_TURNS,
-            env=dict(_SUBSCRIPTION_ENV),
+            env={**_SUBSCRIPTION_ENV, **_agent_build_env(workdir)},
         )
     else:
         options = ClaudeAgentOptions(

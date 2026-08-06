@@ -1,26 +1,26 @@
 {
   "version": 1,
   "task": "tasks/vae_block_002.py",
-  "next_round": 2,
-  "total_rounds": 8,
+  "next_round": 9,
+  "total_rounds": 14,
   "base": {
-    "code_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931.py",
-    "eval_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json",
-    "score": 1.206261914743255
+    "code_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_070840.py",
+    "eval_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json",
+    "score": 1.2684202744377366
   },
   "best": {
-    "code_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931.py",
-    "eval_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json",
-    "score": 1.206261914743255
+    "code_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_070840.py",
+    "eval_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json",
+    "score": 1.2684202744377366
   },
   "current": {
-    "code_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_160426.py",
-    "eval_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0003.json",
-    "score": 1.2084090661786366
+    "code_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_093619.py",
+    "eval_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0010.json",
+    "score": 1.2690348902425717
   },
   "repair_chain": null,
-  "base_score": 1.206261914743255,
-  "best_score": 1.206261914743255,
+  "base_score": 1.2684202744377366,
+  "best_score": 1.2684202744377366,
   "optimization_tree": {
     "kernel_20260805_144931": {
       "parent": null,
@@ -64,23 +64,247 @@
         "reps": 8,
         "resolved": false
       }
+    },
+    "kernel_20260806_064326": {
+      "parent": "kernel_20260805_144931",
+      "kernel_name": "kernel_20260806_064326",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_064326.py",
+      "speedup": null,
+      "runnable": false,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 2,
+      "strategy": {
+        "bottleneck": "[memory/DRAM-bound tail around a peak-bound mainloop] The CUTLASS TF32 implicit GEMM is 84.5% of steady time but already runs 77.3 GFLOP in 784us = 98.6 TFLOPS ≈ 94% of the 104.8 TFLOPS TF32 peak, so it has no headroom. The largest remaining, actually-improvable segment is the GroupNorm moment pass: gn_partial re-reads the whole 67MB conv output from DRAM (2x per forward, 92us) at 0.34% L2 hit.",
+        "primary_optimisation_method": "Producer-consumer L2 locality fusion: slice each conv into batch chunks sized to the L2 (with an L2 persisting access-policy window over the chunk's output), and launch gn_partial on each chunk immediately after its conv, so the GroupNorm moment pass reads the conv output out of L2 instead of DRAM. Metrics justify it: gn_partial is 88% DRAM SOL, 96.2% long-scoreboard stall, lts hit 0.34% — pure re-read traffic that fusion removes; the conv mainloop itself is at 94% of TF32 peak and cannot be sped up.",
+        "method_name": "l2_persist_chunk_fusion",
+        "modification_plan": "1. Add an `int n0` parameter to gn_partial_kernel and use `const int n = n0 + blockIdx.y;` for both the input base pointer and the partial slot offset `(((size_t)n*numChunks + blockIdx.x)*G + g)*2`. Nothing else in the kernel changes, so every (n,chunk,g) slot is still written exactly once and the partial sums are bitwise identical to today (odd-HW tail behaviour preserved).\n2. Split `group_moments` into `moments_partial_range(y, n0, nN, HW,C,G, part, numChunks, pixPerChunk, stream)` (launches gn_partial with `dim3 grid(numChunks, nN)` and n0) and `moments_finalize(part, mean, rstd, N*G, ...)` launched once, after all chunks, unchanged. Allocate `part` for the full N up front.\n3. Give `conv3x3_nhwc_into` explicit base-pointer + N-override arguments: `conv3x3_nhwc_range(const float* xptr, const float* wptr, float* outptr, int Nsub, int H,int W,int C,int K,...)`, building Conv2dProblemSize with N=Nsub and TensorRefs from the offset pointers `xh + (size_t)n0*HW*C`, `y + (size_t)n0*HW*C`. Everything else (128x128x16 tile, kOptimized, alpha=1/beta=0) is untouched.\n4. New host helper `conv_then_moments(in, w, y, N,H,W,C, part, ...)`:\n   a. `size_t bytes = (size_t)N*HW*C*4;` query `cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize)` once (static). budget = l2/2.\n   b. GATE: if `bytes <= budget || N == 1` -> single full conv + single moments_partial_range(n0=0,nN=N) (exactly today's code path; small 2x64x64 and awkward 1x131x131 shapes keep byte-identical behaviour).\n   c. else `nsub = max(1, (int)(budget / ((size_t)HW*C*4)))`; raise nsub until CTAs = ceil((size_t)nsub*HW/128)*ceil(C/128) >= 170 (one full wave) so chunking never starves the grid; loop `for (n0=0; n0<N; n0+=nsub)` with `nN=min(nsub,N-n0)`: conv3x3_nhwc_range(...) then immediately moments_partial_range(y,n0,nN,...) on the SAME stream.\n5. L2 persistence for the chunk: once per call do `cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, min(budget, maxPersistingL2CacheSize))`. Before each chunk's conv set `cudaStreamAttrValue v; v.accessPolicyWindow = {.base_ptr = y + (size_t)n0*HW*C, .num_bytes = min(chunkBytes, cudaDevAttrMaxAccessPolicyWindowSize), .hitRatio = 1.0f, .hitProp = cudaAccessPropertyPersisting, .missProp = cudaAccessPropertyStreaming}; cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &v);` so the conv's streamed activation reads do not evict the freshly written output. After the chunk's gn_partial, set num_bytes=0 and call `cudaCtxResetPersistingL2Cache()` at the end of fused_resblock. All of this is guarded by a `#if CUDART_VERSION >= 11000` / attribute-query fallback that silently skips persistence if unsupported (correctness never depends on it).\n6. Call `conv_then_moments` for BOTH convs (conv1->y1 moments, conv2->y2 moments). gn_finalize, gn_silu_nhwc, gn_silu_add_nhwc2nchw, nchw2nhwc, kcrs2krsc, buffer reuse (z1=xh, y2=y1) stay byte-identical, so this composes with every mechanism the base already carries.\n7. Correctness: chunking is along the batch axis only; each output element is produced by exactly one conv call with identical problem geometry and padding, and moments are reduced over the same per-(n,chunk,g) partials, so results are bitwise unchanged. Validate all four shapes against the reference (max_atol 0.0027-0.003).\n8. Anti-regression: keep a compile-time switch to force the single-shot path; if the chunked path is not faster for a shape key, the gate (bytes<=budget) already keeps small shapes on the old path.",
+        "evidence": "Round-1 verdict: (ii)-by-construction — the conv does 77.3 GFLOP in 784us = 98.6 TFLOPS = 94% of the 104.8 TFLOPS TF32 peak, so a mainloop tile retune had <=6% theoretical headroom; NCU cannot profile the CUTLASS kernel here and every non-conv kernel duration in the retune profile is within 1-3% of base, so the +0.18% is unproven. New target has independent evidence: gn_partial gpu__time_duration 46,176ns x2 per forward (92us of ~1,942us), gpu__dram_throughput 87.7% of peak, lts__t_sector_hit_rate 0.34%, long_scoreboard stall 96.2% — it is a pure DRAM re-read of the 67MB conv output that was written moments earlier. Refutation of the alternative 'gn_silu_add is the bottleneck': it moves 201MB (y2+residual+out) at 88.6% DRAM SOL = 113us, which is its irreducible traffic; no fusion removes it, whereas gn_partial's 67MB read is removable outright.",
+        "expected_metric_change": "gn_partial: lts__t_sector_hit_rate.pct 0.34% -> >50%, gpu__dram_throughput.avg 87.7% -> <45%, gpu__time_duration 46us -> <22us per launch on the mid shape; per-forward wall time 1.848ms -> ~1.76ms (mid) and 7.72ms -> ~7.4ms (large). Anti-regression: CUTLASS conv per-forward total must stay within 2% (chunk CTA count forced >=170), and the small (2x64x64) and awkward (1x131x131) shapes take the un-chunked gate path so their times must be unchanged; numerical output bitwise identical to the current candidate on all four shapes.",
+        "headroom": "medium",
+        "structural_rewrite": false
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-06T06:43:57.091594"
+    },
+    "kernel_20260806_064916": {
+      "parent": "kernel_20260806_064326",
+      "kernel_name": "kernel_20260806_064916",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_064916.py",
+      "speedup": 1.129786270006812,
+      "runnable": true,
+      "ncu_passed": false,
+      "phase": "repair",
+      "round": 3,
+      "strategy": {
+        "critical_issue": "Persisting-L2 device limit raised once from static flag and never restored",
+        "evidence": [
+          "Candidate leaked device-global state.",
+          "persisting_l2_bytes: 18874368 -> 50331648"
+        ],
+        "root_cause": "set_persist_window() calls cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, l2_size/2) behind a static one-shot `limit_set` flag. This is device-global, outlives forward(), and is never lowered back; reset_persist() only clears the window and cache contents, not the reservation. The harness detects the 18MB->48MB residual change after the candidate runs.",
+        "trigger_condition": "Any forward() call on a device where l2_info().ok is true and the chunked path calls set_persist_window; the raised limit persists after fused_resblock returns.",
+        "must_hold_invariants": [
+          "persisting L2 limit queried and restored to its prior value before forward returns",
+          "access-policy window cleared and cudaCtxResetPersistingL2Cache() called at exit",
+          "no device-global state configured from static/one-shot initializers"
+        ],
+        "minimal_fix": "In fused_resblock, query prior limit with cudaDeviceGetLimit(cudaLimitPersistingL2CacheSize) at entry and restore it in reset_persist(); delete the static `limit_set` one-shot guard.",
+        "patch_anchor": "cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, budget);",
+        "confidence": "high"
+      },
+      "method_matched": false,
+      "timestamp": "2026-08-06T06:49:21.413135",
+      "paired_verdict": {
+        "rel_pct": -5.769577265735604,
+        "se_pct": 0.2566840016437405,
+        "t": -22.477354368751733,
+        "reps": 3,
+        "resolved": true
+      }
+    },
+    "kernel_20260806_070840": {
+      "parent": "kernel_20260805_144931",
+      "kernel_name": "kernel_20260806_070840",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_070840.py",
+      "speedup": 1.2684202744377366,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 4,
+      "strategy": {
+        "bottleneck": "[latency/serialization around a saturated mainloop] For the profiled mid shape the CUTLASS TF32 implicit-GEMM conv runs ~1475us of the 1848us forward at ~105 TFLOPS (=TF32 peak) while moving only ~180 GB/s, so DRAM sits ~90% idle during it; the remaining 373us is DRAM-bound GN/transpose kernels (gn_partial 92us, gn_silu_add 114us, nchw2nhwc 72us, gn_silu 69us) that run strictly serialized after it.",
+        "primary_optimisation_method": "Batch-chunked two-stream pipelining: split the block along the batch axis into independent per-image chunks (GroupNorm moments are per (n,g), so chunks are fully independent) and run the whole chain conv1->partial->finalize->silu->conv2->partial2->finalize2->silu_add per chunk on two alternating CUDA streams. The compute-bound conv of one chunk then executes concurrently with the DRAM-bound GN/transpose kernels of the other, hiding most of the 373us tail behind the tensor-core-saturated conv. Purely a scheduling change; every kernel body stays byte-identical.",
+        "method_name": "stream_pipeline_overlap",
+        "modification_plan": "1. Keep ALL kernels byte-identical (nchw2nhwc, gn_partial, gn_finalize, gn_silu_nhwc, gn_silu_add_nhwc2nchw, kcrs2krsc, the CUTLASS 128x128x16 conv). Only the host driver in `fused_resblock` changes: add batch-range arguments so every step can be launched on a sub-range of images.\n2. Add an `int n0` parameter to gn_partial_kernel and gn_finalize_kernel launches by POINTER OFFSET instead of code change where possible: for gn_partial pass `y + (size_t)n0*HW*C` as the base and `part + (size_t)n0*numChunks*G*2` as the partial base, and launch `dim3 grid(numChunks, nSub)`; the kernel's `blockIdx.y` then indexes 0..nSub-1 relative to the offset base, so slot writes stay exactly once each (odd-HW tail unchanged). For gn_finalize launch `nSub*G` blocks with `part + n0*numChunks*G*2`, `mean + n0*G`, `rstd + n0*G`. No kernel source edits needed beyond nothing — offsets only.\n3. Give the conv a range form: `conv3x3_nhwc_range(const float* a, const float* w, float* d, int Nsub,int H,int W,int C,int K, cudaStream_t s)` building Conv2dProblemSize with N=Nsub from offset pointers `xh + (size_t)n0*HW*C`, `y + (size_t)n0*HW*C`. Same tile/epilogue/precision.\n4. nchw2nhwc and gn_silu_add: launch with `dim3 tgrid(ceil(HW/64), C/64, nSub)` and base pointers offset by `n0*C*HW` (NCHW side) and `n0*HW*C` (NHWC side). gn_silu_nhwc: launch `dim3(blocks, nSub)` with both tensors offset by `n0*HW*C`.\n5. Chunk sizing gate (anti-regression): `ctas(c) = ceil((size_t)c*HW/128) * ceil(C/128)`. Pick the smallest `chunkN` in 1..N with `ctas(chunkN) >= 170`; `chunks = ceil(N/chunkN)`. If no such chunkN exists or `chunks < 2`, take the EXISTING single-stream path unchanged (this catches 2x64x64 -> 128 CTAs and 1x131x131 -> N=1, so those two shapes are bit-identical and time-identical to today). Mid 8x64x128 gives chunkN=2, chunks=4; large 4x256x256 gives chunkN=1, chunks=4.\n6. Streams: create two `at::cuda::CUDAStream`s once via `at::cuda::getStreamFromPool()` (static, cached). At entry, record an event on the current stream after the two `to_nhwc_weight` repacks and `cudaStreamWaitEvent` it on both worker streams (weights are shared by all chunks).\n7. For chunk k use `s = worker[k % 2]`; wrap all of that chunk's work in `at::cuda::CUDAStreamGuard g(s);` so the caching allocator tags the CUTLASS workspace and `part` allocations to the right stream (avoids cross-stream reuse hazards). Allocate `xh`, `y1`, `mean`, `rstd`, `part` ONCE for the full N on the main stream before the loop, and record/wait an event so both workers see them.\n8. Chunk body (identical op order to today, all on `s`): nchw2nhwc(range) -> conv1(range) -> gn_partial+gn_finalize(range) -> gn_silu_nhwc(range, writes z1=xh slice) -> conv2(range) -> gn_partial+gn_finalize(range) -> gn_silu_add_nhwc2nchw(range, residual from `xc` slice). Buffer reuse (z1=xh, y2=y1) stays legal because each chunk touches only its own `n` slice.\n9. Join: after the loop record an event on each worker stream and `cudaStreamWaitEvent` both on the original current stream before returning `out`; also `c10::cuda::CUDACachingAllocator::recordStream(t, s)` for `out`, `xh`, `y1`, `mean`, `rstd`, `part` so tensors allocated on the main stream but used on workers are not freed early.\n10. Validate all four shapes against the reference (atol 0.0027-0.003); results are bitwise identical to today because every kernel does the same arithmetic over the same per-image data.",
+        "evidence": "Mid-shape accounting: total forward 1.848ms; NCU non-conv durations sum to 373us (gn_silu_add 113.7 + gn_partial 2x46.2 + nchw2nhwc 72.4 + gn_silu 69.3 + gn_finalize 2x8.8 + kcrs 2x4.3), leaving ~1475us of conv = 154.6 GFLOP / 1475us = 105 TFLOPS ~ 100% of the 104.8 TFLOPS TF32 peak, while the conv's DRAM demand is only ~134MB/1475us ~ 180 GB/s (10% of 1792 GB/s). Root cause: two complementary resources (tensor pipe, DRAM) are used strictly one after the other. Refutation of 'the GN/transpose kernels are the bottleneck and need faster kernels': they already run at 1.86-1.94 TB/s effective (nchw2nhwc 134MB/72.4us, gn_silu 134MB/69.3us, gn_silu_add 201MB/113.7us) i.e. at or above DRAM roofline, so no rewrite of them can help — only overlapping them with the conv can. History: Round 2 targeted the same gn_partial traffic and its test FAILED, i.e. case (b) (the mechanism never engaged at all — no metric moved because nothing ran); its defect was single-stream chunking that only hoped for L2 hits and broke correctness. This proposal is mechanism-distinct (concurrency, not L2 residency), needs no cudaStreamSetAttribute/persisting-L2 machinery, and COMPOSES with every mechanism the base carries: all six kernels, the buffer reuse (z1=xh, y2=y1) and the deterministic per-chunk partials are untouched.",
+        "expected_metric_change": "Mid shape wall time 1.848ms -> ~1.60-1.65ms (hiding 50-70% of the 373us serial tail); large shape 7.72ms -> ~6.9-7.2ms. gpu__dram_throughput measured DURING the conv rises from ~10% toward 50-70% (DRAM and tensor pipes busy simultaneously); per-kernel durations of gn_partial/gn_silu/nchw2nhwc individually may rise slightly (they now share bandwidth) but total forward time falls. Anti-regression: chunks<2 gate keeps 2x256x64x64 and 1x256x131x131 on the untouched single-stream path (must be within noise of today); CTA-count>=170 per chunk keeps the conv per-launch efficiency within 3% of today; numerical output bitwise identical on all four shapes.",
+        "headroom": "medium",
+        "structural_rewrite": false
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-06T07:08:46.165876",
+      "paired_verdict": {
+        "rel_pct": 5.304472387452974,
+        "se_pct": 0.21468309147321074,
+        "t": 24.70838458237361,
+        "reps": 3,
+        "resolved": true
+      },
+      "ncu_profile_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260806_070840_ncu.csv"
+    },
+    "kernel_20260806_072058": {
+      "parent": "kernel_20260806_070840",
+      "kernel_name": "kernel_20260806_072058",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_072058.py",
+      "speedup": 1.2590095863518127,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 5,
+      "strategy": {
+        "bottleneck": "[compute/latency-bound with severe wave quantization] The CUTLASS ImplicitGemmConvolution mainloop holds 89.9% of steady GPU time (31,476us / 96 launches). Its 128x128x16 tile gives only ceil(M/128) x 2 CTAs (C=256 -> 2 N-tiles), so grids land at 1.5-1.6 waves (256 and 270 CTAs vs 170 SMs) or below one wave (128 CTAs on the small shape), leaving 25-40% of SMs idle.",
+        "primary_optimisation_method": "CTA tile-geometry retune of the CUTLASS conv: add a second instantiation with ThreadblockShape<128,64,16>/WarpShape<64,32,16>/4 stages (doubles N-tiles from 2 to 4, halves per-CTA accumulators to 64 regs, 12KB/stage smem -> 2 CTAs/SM) and pick per launch between it and the current 128x128x16 by wave-efficiency. This directly attacks the measured tail idle (1.5 waves -> ~3.0 waves, sub-wave grids -> 1.5 waves) without changing dtype, epilogue, or the two-stream chunk pipeline.",
+        "method_name": "cta_tile_quantization_retune",
+        "modification_plan": "1. Refactor `conv3x3_nhwc_range` into a template: `template<class TB, class WARP, int STAGES> struct ConvOp { using Kernel = DefaultConv2dFprop<float,TensorNHWC,...,GemmShape TB, GemmShape WARP, GemmShape<16,8,8>, LinearCombination<float,4,float,float>, GemmIdentityThreadblockSwizzle<4>, STAGES, OpMultiplyAdd, IteratorAlgorithm::kOptimized>::Kernel; using Gemm = ImplicitGemmConvolution<Kernel>; };` Keep dtype fp32/TF32 and epilogue exactly as now.\n2. Instantiate exactly two configs: A = <128,128,16>/<64,64,16>/3 (today's, unchanged) and B = <128,64,16>/<64,32,16>/4. Smem budget check for B: (128+64)*16*4B = 12,288 B/stage x 4 stages = 49,152 B <= 99 KB per block, and 2 blocks/SM = 98 KB <= 100 KB per SM, so B keeps 2 CTAs/SM (A: 48 KB, 128 accum regs/thread).\n3. Add `conv3x3_nhwc_range(..., int cfg)` that dispatches to A or B with identical Arguments construction (ps, TensorRefs, {1.0f,0.0f}), identical workspace handling, identical stream argument. No other kernel body changes.\n4. Selection rule (host, per launch, compile-time-free): for a chunk with M = nSub*H*W, N = C: ctasA = ceil(M/128)*ceil(C/128); ctasB = ceil(M/128)*ceil(C/64). Define eff(x, slots) = x / (ceil(x/slots)*slots) with slotsA = 170 (1 CTA/SM at 128 accum regs) and slotsB = 340 (2 CTAs/SM). Choose B if eff(ctasB,slotsB) > eff(ctasA,slotsA) + 0.05 or if ctasA < 170; else keep A. Compute once per forward (shape is fixed for all chunks) and pass `cfg` down.\n5. Keep the two-stream batch chunking mechanism operational (round-4 optimisation): update ONLY the chunk-size gate so `tilesN` is derived from the selected config's N-tile width (128 for A, 64 for B) instead of the hardcoded 128, i.e. `tilesN = (C + tileN - 1) / tileN;` then the existing loop `ctas = ceil(c*HW/128)*tilesN >= 170` still finds the smallest chunk that fills the GPU. Streams, events, recordStream calls and the join stay exactly as they are.\n6. Leave `nchw2nhwc_kernel`, `gn_partial_kernel`, `gn_finalize_kernel`, `gn_silu_nhwc_kernel`, `gn_silu_add_nhwc2nchw_kernel`, `kcrs2krsc_kernel` byte-identical, so GroupNorm reduction order (and numerics) is unchanged and the awkward-shape tail handling stays correct.\n7. Numerics: both configs use the same TF32 MMA (16,8,8) and fp32 accumulate; only tile/warp partition of the K-loop reduction changes, which stays within the 2.8e-3 atol contract already met by config A.\n8. Guard: `TORCH_CHECK(op.can_implement(args) == Success)` on both paths; if B reports unsupported for a given problem (should not happen: C=256 and alignment-4 satisfied), fall back to A at runtime.\n9. Validation checklist: run all four scored shapes; expected grids after the change — mid chunk M=16384 -> B: 128*4 = 512 CTAs / 340 slots = 1.5 waves per SM-pair (vs A 256/170 = 1.51 waves at 1 CTA/SM but with 33% tail); awkward N=1 M=17161 -> B: 135*4 = 540 vs A 270; small N=2 M=8192 -> B: 64*4 = 256 CTAs vs A 128 (sub-wave). Keep whichever config the rule picks per shape.\n10. Anti-regression: if the large shape (4x256x256x256, A already at 6 waves, eff ~0.99) selects B and slows down, the eff+0.05 margin keeps A — verify the rule returns A there.",
+        "evidence": "Conv = 89.9% steady time, 31,476us over 96 launches; per-forward conv work sums to ~2.6ms while wall time is 1.613ms (streams overlap), i.e. ~59 TFLOPS vs 104.8 TF32 peak = 56% of peak. Root cause: with C=256 the 128-wide N-tile yields only 2 N-tiles, so grids are 256 CTAs (mid chunk) and 270 CTAs (awkward shape) against 170 SMs = 1.5-1.6 waves (33-41% tail idle), and 128 CTAs (small shape) never fills the GPU. Refutation of DRAM-bound alternative: each conv launch moves ~18-26MB for ~2-4e10 FLOP (<100 GB/s required at peak vs 1792 GB/s available); the genuinely DRAM-saturated kernels (85% DRAM throughput) are the GN/transpose kernels, which together are only ~10% of steady time.",
+        "expected_metric_change": "(1) CUTLASS conv total GPU time drops 10-25% (31,476us -> <28,000us) and its steady share falls below 89%; (2) conv grid size per launch rises from 256 to 512 CTAs (mid chunk) / 128 to 256 (small shape), pushing achieved occupancy and sm__throughput on the conv up while wave tail idle falls; (3) launch__occupancy_limit_registers for the conv improves (64 vs 128 accumulator regs/thread -> 2 blocks/SM). Anti-regression constraints: kernel launch count must stay 456 (no extra kernels, chunking gate still splits into >=2 chunks so the two-stream conv/GN overlap remains visible in the nsys timeline — if chunks collapses to 1 the round-4 pipelining is silently lost); GN kernel timings and numerics unchanged; the large 4x256x256x256 shape must not regress (rule must select config A there).",
+        "headroom": "medium",
+        "structural_rewrite": false
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-06T07:21:31.012435",
+      "paired_verdict": {
+        "rel_pct": -0.6489858893463651,
+        "se_pct": 0.11917043670885445,
+        "t": -5.445863145839637,
+        "reps": 3,
+        "resolved": true
+      }
+    },
+    "kernel_20260806_074616": {
+      "parent": "kernel_20260806_070840",
+      "kernel_name": "kernel_20260806_074616",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_074616.py",
+      "speedup": 1.264890722152103,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 6,
+      "strategy": {
+        "bottleneck": "[DRAM/overlap-bound residual, conv already at roofline] CUTLASS conv holds 89.6% steady time but 2 convs = 1.546e11 FLOP vs 104.8 TF32 TFLOPS = 1.475 ms floor against a 1.613 ms wall, i.e. ~91% of SOL. The remaining ~140 us is the un-hidden DRAM traffic of nchw2nhwc / gn_partial / gn_silu* (DRAM 80-87%, L2 hit 0.7-2%), plus small/awkward shapes where the chunk gate disables pipelining entirely.",
+        "primary_optimisation_method": "L2-residency chunk sizing of the existing two-stream batch pipeline: pick chunkN from the runtime l2CacheSize so that the per-chunk working set of both in-flight streams fits L2, and lower the CTA-fill threshold from 170 to ~85 CTAs per stream (two streams jointly fill the GPU) so chunks>=2 also on N=2. GN kernels then read conv output from L2 instead of DRAM (lts hit 0.7-1.9% today) and stop stealing bandwidth from the conv; the small shape gains conv/GN overlap it currently never gets.",
+        "method_name": "l2_resident_chunk_sizing",
+        "modification_plan": "Host-driver-only change in fused_resblock; every __global__ body stays byte-identical, so GroupNorm reduction order and numerics are bit-identical.\n\n1. Query L2 once: `static int L2B = [](){cudaDeviceProp p; cudaGetDeviceProperties(&p, 0); return p.l2CacheSize;}();` (never hardcode; falls back to 64MB if 0).\n2. Replace the current gate (`smallest c with ceil(c*HW/128)*tilesN >= 170`) with a two-part rule:\n   a. FILL: `ctas(c) = ((long)c*HW + 127)/128 * ((C+127)/128)`; pick `cfill` = smallest c in [1,N] with `ctas(c) >= 85` (half the 170 SMs, because two worker streams run concurrently); if none, `cfill = N`.\n   b. L2: per chunk the live bytes are 4 full-tensor slices (x slice read, xh, y1, out slice) = `4*(size_t)c*HW*C*4`. Two chunks are in flight, so require `2*live(c) <= 0.60*L2B`; let `cl2` = largest c satisfying it, min 1. Set `chunkN = max(1, min(cfill, cl2))`.\n3. OVERLAP CLAUSE: if `N >= 2 && (N + chunkN - 1)/chunkN < 2`, set `chunkN = N/2` (>=1) so at least two chunks exist and the two-stream pipeline actually engages. This is what fixes 2x256x64x64, where today `ctas(c)=c*64 < 170` for all c<=2 so `chunkN=0` and `pipelined=false` (single stream, zero conv/GN overlap).\n4. Keep `chunks = (N + chunkN - 1)/chunkN;  pipelined = (chunks >= 2);` and the entire event/record_stream/join structure untouched, so the round-4 stream_pipeline_overlap mechanism is preserved, not replaced.\n5. Keep numChunks/pixPerChunk for GroupNorm computed from the FULL batch exactly as now (they are per-image quantities), so the partial buffer layout, the empty-chunk zero-fill tail handling for odd HW (131x131), and the reduction order are unchanged -> identical outputs.\n6. Keep the CUTLASS config at <128,128,16>/<64,64,16>/3 stages (round-5 retune regressed; do not touch tile geometry).\n7. Reduce per-chunk workspace churn: hoist the CUTLASS workspace allocation out of `conv3x3_nhwc_range` into a single `torch::empty` sized for the largest chunk, allocated once per forward on the main stream and record_stream'd to both workers, passed in as a pointer (avoids 2*chunks allocator calls now that chunk count roughly doubles).\n8. Expected launch/geometry effect on the profiled mid shape: chunkN 2 -> 1, chunks 4 -> 8, per-chunk live bytes 4*8.4MB = 33.6MB, both streams 67MB; if that exceeds 0.60*L2B the rule keeps chunkN=2 automatically, so the change is self-limiting.\n9. Large shape 4x256x256x256: `live(1) = 4*67MB = 268MB > 0.6*L2B` -> `cl2 = 1`, `cfill = 1` (ctas=1024) -> chunkN stays 1, chunks stays 4: bit-identical schedule, no regression path.\n10. Awkward shape 1x256x131x131: N=1 -> chunkN=1, chunks=1, pipelined=false, unchanged behaviour (vec=0 path preserved).\n11. Validation: run all four scored shapes; assert output allclose to reference (atol 2.8e-3) and that nsys shows >=2 concurrent streams for N>=2 shapes.",
+        "evidence": "Round-5 classification = (a): the predicted metric DID move (conv N-tiles 2->4, grid 256->512 CTAs) yet all four shapes regressed (-0.4/-2.3/-0.2/-0.0%), so the wave-quantization model was wrong; the deciding number is the roofline: 2 convs = 1.546e11 FLOP / 104.8 TF32 TFLOPS = 1.475 ms vs 1.613 ms measured wall = ~91% of SOL, leaving ~9% total headroom, none of it inside the conv math. Root cause of that residual: the GN/transpose kernels run at 80-87% DRAM throughput with lts__t_sector_hit_rate 0.68/1.36/1.94/1.72% - every inter-kernel handoff (67MB tensors) goes to DRAM and competes with the conv. Refuted alternative: 'conv tail idle' (already disproved above) and 'gn_partial occupancy' (16% achieved occupancy, but it is at 70.7% DRAM with 2.5% SM throughput, so it is bandwidth- not occupancy-limited). Round-5 broke nothing structurally (launch count and overlap intact); this plan composes with stream_pipeline_overlap by re-tuning only its chunk-size gate and explicitly widens it to N=2 where the gate currently disables it.",
+        "expected_metric_change": "(1) lts__t_sector_hit_rate on gn_partial/gn_silu_nhwc/gn_silu_add rises from ~1-2% to >20%, and their gpu__dram_throughput falls below 70% (traffic served from L2). (2) 2x256x64x64 gains conv/GN overlap: nsys must show >=2 concurrent streams and >=2 chunks (today chunkN=0 -> pipelined=false), with its speedup rising above 1.15x. (3) Total per-forward wall drops toward the 1.475 ms conv roofline (mid shape <1.58 ms). Anti-regression constraints: 4x256x256x256 must keep chunkN=1/chunks=4 and its kernel schedule unchanged (its speedup must stay >=1.33x); the two-stream mechanism must remain visible (if the timeline shows a single stream, the gate broke); kernel launch count may rise at most ~2x on the mid shape and must not push CPU launch time above GPU time on the small shape; outputs must stay bit-identical to the current base (same GN reduction order).",
+        "headroom": "low",
+        "structural_rewrite": false
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-06T07:46:48.635041",
+      "paired_verdict": {
+        "rel_pct": -0.10494440128753224,
+        "se_pct": 0.16137741524907487,
+        "t": -0.6503041403009052,
+        "reps": 4,
+        "resolved": true
+      }
+    },
+    "kernel_20260806_082007": {
+      "parent": "kernel_20260806_070840",
+      "kernel_name": "kernel_20260806_082007",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_082007.py",
+      "speedup": 1.2630038990669714,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 7,
+      "strategy": {
+        "bottleneck": "[DRAM/latency-bound satellite segment] The GroupNorm moment path (gn_partial + gn_finalize) around the near-roofline CUTLASS conv: 4.7% of steady GPU time and 192 of 456 launches. gn_partial runs only 64 CTAs (0.06 waves/SM, 16.2% occupancy) so it reaches just 70.7% DRAM vs 85-87% for sibling streaming kernels; gn_finalize is pure launch latency (0.55% DRAM, 0.03 waves).",
+        "primary_optimisation_method": "atomic_privatize the GroupNorm moment reduction: one grid-filling kernel per chunk whose blocks privatize (sum, sumsq) per group in shared memory, atomically combine into per-(n,g) accumulators, and let the last-arriving block per (n,g) finalize mean/rstd. This deletes the second launch entirely and lets the moment pass use ~680 CTAs instead of 64, converting a 16%-occupancy, 70%-DRAM read into a bandwidth-saturated one. Matches the measured evidence (long-scoreboard 86.6% with 1.95 active warps/scheduler = not enough memory parallelism in flight).",
+        "method_name": "atomic_privatize",
+        "modification_plan": "Host driver + two GN kernels only; CUTLASS conv, nchw2nhwc, gn_silu_nhwc, gn_silu_add_nhwc2nchw stay byte-identical, so stream_pipeline_overlap (round 4) remains fully operational (per-chunk pointer offsets, worker streams, events, recordStream unchanged).\n\n1. Replace `gn_partial_kernel` + `gn_finalize_kernel` with ONE kernel `gn_moments_kernel(y, acc, cnt_ctr, mean, rstd, HW, C, G, Cg, pixPerBlock, blocksPerImage, cnt, eps)`. Delete both old kernels and the two launches in `group_moments_range`; `group_moments_range` now issues exactly one launch per call (96 -> 48 GN-reduction launches per profile run; total launches 456 -> ~372).\n2. Kernel body (keeps the existing vectorized float4 access pattern verbatim): tpp = C>>2, ppp = 256/tpp; block (bx, n) covers pixels [bx*pixPerBlock, min(HW,(bx+1)*pixPerBlock)); each thread accumulates s, ss over float4 loads; store to __shared__ sms[256]/smss[256]; __syncthreads(); threads 0..G-1 fold their group's lanes exactly as today into ts, tss.\n3. Combine with atomics instead of a second kernel: `atomicAdd(&acc[(n*G+g)*2], ts); atomicAdd(&acc[(n*G+g)*2+1], tss);` then `__threadfence();` and, from thread 0 of the block, `old = atomicAdd(&ctr[n], 1)`; the block that observes `old == blocksPerImage-1` re-reads acc for all G groups of image n and writes mean/rstd with the SAME double-precision formula the old finalize used (m = s/cnt; v = max(0, ss/cnt - m*m); rstd = 1/sqrt(v+eps)). Consumers (`gn_silu_nhwc_kernel`, `gn_silu_add_nhwc2nchw_kernel`) keep reading mean[]/rstd[] unchanged — no per-element double math is introduced.\n4. Buffers: allocate once per forward `acc` = 2 (stages) * N*G*2 floats and `ctr` = 2*N ints, and zero BOTH with a single `cudaMemsetAsync` on the main stream before `start_ev.record(main_stream)`, so both worker streams already wait on it; recordStream them to both workers like `part` today. Stage 1 uses slot 0, stage 2 slot 1, so no inter-stage re-zero and no extra launch inside the chunk loop. Drop the old `part` tensor and its numChunks/pixPerChunk math.\n5. Grid sizing (this is the fix for the 0.06-wave launch): `blocksPerImage = clamp(ceil((long)HW / (long)ppp), 1, max(1, 680 / max(nSub,1)))` refined as: target total CTAs ~= 4*170 = 680 across the (blocksPerImage, nSub) grid, but never more blocks than pixel-passes available, i.e. `blocksPerImage = min(ceil(HW/(ppp*4)), ceil(680/nSub))`, minimum 1. Then `pixPerBlock = ceil(HW/blocksPerImage)` and recompute `blocksPerImage = ceil(HW/pixPerBlock)` so NO launched block is empty — this makes the atomic counter target exactly equal to the launched block count and removes the unwritten-tail class of bug that bit run D on odd HW (131x131, HW=17161 is handled because pixPerBlock is a ceiling and the last block is simply short).\n6. Numerics: block partials are still fp32 sums of >=1024 elements; only the ~blocksPerImage-way final combine becomes atomic (nondeterministic order). Relative error on mean/rstd stays ~1e-6, far inside the 2.8e-3 atol contract. Keep the double-precision finalize arithmetic to avoid cancellation in ss/cnt - m*m.\n7. Accounting for what is removed: gn_finalize_kernel is deleted; its function (per-(n,g) mean/rstd) is subsumed by the last-block path in step 3, so no behaviour is lost. No listed base mechanism is disabled: chunking, two worker streams, events and joins are untouched.\n8. Validation: run all four scored shapes; assert allclose(atol 2.8e-3); confirm in nsys that (a) gn_finalize no longer appears, (b) two concurrent worker streams still appear for N>=2 shapes, (c) conv kernel time/launch count unchanged (96).",
+        "evidence": "gn_partial: 1351us steady (3.9%), 13.5us/launch, launch__grid_size=64, waves_per_multiprocessor=0.06, achieved occupancy 16.2%, DRAM 70.7% while nchw2nhwc/gn_silu_add on the same tensors hit 84.9-87.1% — it is under-filled, not bandwidth-limited (long_scoreboard 86.6% with only 1.95 active warps/scheduler = insufficient loads in flight). gn_finalize: 273us, 64 CTAs, 0.03 waves, DRAM 0.55% = pure launch/latency. Prior round-6 classification = (b): it predicted lts__t_sector_hit_rate >20% on the GN kernels; measured 1.48/1.93/1.76% — the L2-residency mechanism never engaged, so scheduling/L2 tuning is not the lever; this plan instead removes a launch and fixes memory-level parallelism, and composes with stream_pipeline_overlap (host loop untouched). Refuted alternative: the CUTLASS conv (88.3%) — 1.546e11 FLOP / 104.8 TF32 TFLOPS = 1.475ms vs 1.613ms wall, and two direct conv retunes (rounds 5, 6) regressed, so conv math is not the accessible headroom.",
+        "expected_metric_change": "(1) gn_moments_kernel launch__grid_size rises 64 -> ~680 CTAs, waves_per_multiprocessor 0.06 -> ~1.0, achieved occupancy 16.2% -> >60%, gpu__dram_throughput 70.7% -> >85%, kernel duration 13.5us -> <11us per launch. (2) gn_finalize_kernel disappears (273us and 96 launches removed); total forward launch count 456 -> ~372. Anti-regression: conv launch count stays 96 and its per-launch duration unchanged; nsys must still show two concurrent worker streams on N>=2 shapes (loss would mean the memset/event ordering broke pipelining); outputs allclose at atol 2.8e-3 on all four shapes, especially 1x256x131x131 where blocksPerImage must equal the atomic counter target (no empty blocks, no unwritten tail); small shape 2x256x64x64 must improve (fewer launches), not regress.",
+        "headroom": "medium",
+        "structural_rewrite": false
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-06T08:20:39.120580",
+      "paired_verdict": {
+        "rel_pct": -0.11526531818605301,
+        "se_pct": 0.19619572384562467,
+        "t": -0.5875016841689672,
+        "reps": 3,
+        "resolved": true
+      }
+    },
+    "kernel_20260806_093619": {
+      "parent": "kernel_20260806_070840",
+      "kernel_name": "kernel_20260806_093619",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_093619.py",
+      "speedup": 1.2690348902425717,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 8,
+      "strategy": {
+        "bottleneck": "[DRAM/bandwidth-bound satellite segment around a near-roofline conv] The CUTLASS conv holds 90.1% of steady time but sits at ~91% of the 104.8 TF32 TFLOPS peak (1.475ms floor vs 1.613ms wall). The accessible 9% is the GN/transpose segment: gn_partial, gn_silu_nhwc, gn_silu_add all run at 70-87% DRAM with lts__t_sector_hit_rate 0.7-1.9%, re-reading conv output from DRAM that was written microseconds earlier.",
+        "primary_optimisation_method": "L2 persisting access-policy window on the per-chunk conv-output slice: set cudaLimitPersistingL2CacheSize once and a per-stream cudaAccessPolicyWindow (hitProp=Persisting, missProp=Streaming) covering the y1/y2 chunk slice before the conv of each chunk. The conv's output stays resident in L2, so gn_partial and gn_silu/gn_silu_add read it from L2 instead of DRAM (removing ~2x67MB of DRAM reads per forward). Matches the metric evidence: those kernels are DRAM-saturated with ~1-2% L2 hit rate on data just produced.",
+        "method_name": "l2_persisting_window",
+        "modification_plan": "Host-driver-only change in fused_resblock; every __global__ body stays byte-identical, so GroupNorm reduction order and all numerics are bit-identical, and stream_pipeline_overlap (round 4) stays fully operational (chunk loop, worker streams, events, recordStream untouched).\n\n1. Query device caps once: `static cudaDeviceProp P = [](){cudaDeviceProp p; cudaGetDeviceProperties(&p,0); return p;}();` giving `P.persistingL2CacheMaxSize` and `P.accessPolicyMaxWindowSize`.\n2. Once per process (static bool): `cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, P.persistingL2CacheMaxSize);` (skip if 0).\n3. Compute per-chunk slice bytes `sliceB = (size_t)nSub*HW*C*4` (the y1/y2 buffer region for this chunk, base `y1p + offNHWC`).\n4. GATE (this is what keeps the large shape safe): enable the window only if `sliceB <= min(P.accessPolicyMaxWindowSize, P.persistingL2CacheMaxSize)`. Mid: 2*8.4MB=16.8MB, small: 4.2MB, awkward: 17.6MB -> enabled; large (4x256x256x256, 67MB/chunk) -> disabled, that shape keeps today's exact schedule and must not regress.\n5. Inside the chunk loop, immediately after `CUDAStreamGuard guard(s)` and before the first conv launch of that chunk, when the gate passes:\n   `cudaStreamAttrValue av{}; av.accessPolicyWindow.base_ptr = (void*)(y1p + offNHWC); av.accessPolicyWindow.num_bytes = sliceB; av.accessPolicyWindow.hitRatio = 1.0f; av.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting; av.accessPolicyWindow.missProp = cudaAccessPropertyStreaming; cudaStreamSetAttribute(cs, cudaStreamAttributeAccessPolicyWindow, &av);`\n   Because both stages reuse the same `y1p + offNHWC` region (conv1 out, then conv2 out), one window per chunk covers all six kernels of that chunk: conv1 write -> gn_partial read -> gn_silu read, conv2 write -> gn_partial read -> gn_silu_add read.\n6. missProp=Streaming is the second half of the mechanism: it marks the *other* streams of data touched by these kernels (x, xh/z1, out - 67MB each) as evict-first, which is precisely why round 6's L2-residency attempt never engaged (nothing stopped those streaming lines from evicting y1; measured lts hit stayed 1.9%).\n7. After the chunk's last kernel is enqueued, and again after the join, reset the policy so it does not leak to pooled streams: `av.accessPolicyWindow.num_bytes = 0; cudaStreamSetAttribute(...)` on each worker stream, plus `cudaCtxResetPersistingL2Cache()` is NOT used (it is device-wide and would stall); resetting num_bytes to 0 is sufficient.\n8. If `pipelined == false` (N=1 awkward shape, N=2 small shape) the same window is applied to the main stream around the single chunk, then cleared - so all four shapes that pass the gate benefit, not just the pipelined ones.\n9. Keep the CUTLASS config at <128,128,16>/<64,64,16>/3 stages (round-5 retune regressed) and keep the round-6 chunk gate exactly as it is in the current base (`ctas >= 170`), so no other mechanism changes.\n10. Keep gn_partial/gn_finalize as the two-kernel form (round-7 single-kernel atomic version was slower, 13.5us -> 16.7us per launch); launch count must stay 456.\n11. Numerics: cache policy has zero effect on results; assert allclose(atol 2.8e-3) on all four shapes.\n12. Validation in nsys/ncu: gn_partial and gn_silu_add must show lts__t_sector_hit_rate rising from ~1.4/1.7% to >30% and gpu__dram_throughput falling well below 70/87%; two concurrent worker streams must still be visible for N>=8.",
+        "evidence": "gn_partial: 70.71% DRAM, lts__t_sector_hit_rate 1.36%, l1tex hit 0.1% - it re-reads from DRAM the 67MB the conv wrote microseconds earlier; gn_silu_nhwc 80.3% DRAM / 1.94% L2 hit; gn_silu_add 87.1% DRAM / 1.72% L2 hit. Root cause: the conv-output tensor is evicted from L2 by the surrounding streaming traffic before its two consumers read it, so the same bytes cross DRAM three times per stage. Prior-attempt classification: round 7 (atomic_privatize) is case (a) - its predicted metrics DID move (grid 64->656, occupancy 16.2%->60.3%) yet the kernel got SLOWER (13.5us->16.7us/launch, DRAM 70.7%->57.4%), proving gn_partial is DRAM-traffic-limited, not occupancy-limited; more parallelism is a dead end, removing its DRAM reads is not. Round 6 is case (b): it predicted lts hit >20% and measured 1.9% - it only resized chunks and never issued any cache policy, so the residency mechanism never engaged; this plan fixes that specific defect with an explicit persisting/streaming access-policy window and gates it by window size. Refuted alternative: the CUTLASS conv (90.1%) - 1.546e11 FLOP / 104.8 TF32 TFLOPS = 1.475ms vs 1.613ms wall = 91% of SOL, and two direct conv changes (rounds 5,6) regressed, so conv math is not accessible headroom. This composes with stream_pipeline_overlap: the window is a per-stream attribute set inside the existing chunk loop; no kernel, chunking, event or join logic changes.",
+        "expected_metric_change": "(1) lts__t_sector_hit_rate on gn_partial/gn_silu_nhwc/gn_silu_add rises from 1.36/1.94/1.72% to >30%, and their gpu__dram_throughput drops (70.7%->~45%, 80.3%->~55%, 87.1%->~60%) with per-launch durations falling 13.5->~9us, 12.0->~9us, 17.4->~13us. (2) Total per-forward DRAM bytes fall by ~134MB (the two moment-pass reads), pushing the mid-shape wall from 1.613ms toward the 1.50ms conv-bound floor. Anti-regression constraints: kernel launch count must stay 456 and the CUTLASS conv per-launch duration must not rise (if conv time increases, the persisting carve-out is starving the conv's own working set -> lower persistingL2CacheSize or drop hitRatio to 0.5); the large shape 4x256x256x256 must take the disabled-gate path and stay bit-for-bit schedule-identical (>=1.33x); two concurrent worker streams must still appear in the timeline for N>=8; outputs allclose at atol 2.8e-3 on all four shapes.",
+        "headroom": "medium",
+        "structural_rewrite": false
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-06T09:36:50.703258",
+      "paired_verdict": {
+        "rel_pct": 0.023138249226195562,
+        "se_pct": 0.1555188902142355,
+        "t": 0.14878095641185754,
+        "reps": 3,
+        "resolved": true
+      }
     }
   },
   "scores": [
     1.206261914743255,
-    1.2084090661786366
+    1.2084090661786366,
+    1.2084090661786366,
+    1.129786270006812,
+    1.2684202744377366,
+    1.2590095863518127,
+    1.264890722152103,
+    1.2630038990669714,
+    1.2690348902425717
   ],
   "err_flags": [
     false,
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
     false
   ],
-  "last_score_for_curve": 1.2084090661786366,
-  "rounds_since_improvement": 1,
+  "last_score_for_curve": 1.2690348902425717,
+  "rounds_since_improvement": 4,
   "structural_debt": null,
   "stop_reason": null,
   "opt_history_files": {
-    "1": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931/opt_round_001.json"
+    "1": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931/opt_round_001.json",
+    "2": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931/opt_round_002.json",
+    "4": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260805_144931/opt_round_004.json",
+    "5": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_070840/opt_round_005.json",
+    "6": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_070840/opt_round_006.json",
+    "7": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_070840/opt_round_007.json",
+    "8": "/home/otter77/git_project/KernelMem/run/20260805_132337_vae_block_002_lineages/own_gemm/20260805_132340_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260806_070840/opt_round_008.json"
   },
-  "next_individual_id": 4,
-  "timestamp": "2026-08-05T16:05:28.490237"
+  "next_individual_id": 11,
+  "timestamp": "2026-08-06T09:37:11.318448"
 }

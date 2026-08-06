@@ -1,0 +1,747 @@
+
+
+You are a CUDA kernel optimization implementation specialist. You will receive:
+- Target GPU specifications
+- A **base CUDA kernel file** (Python + CUDA extension) containing the current `ModelNew` implementation and its custom CUDA kernels.
+- A previously generated optimisation_suggestion containing:
+  - **modification_plan** (or "modification plan"): numbered checklist with primary optimization method steps
+  - bottleneck, primary_optimisation_method (or "optimisation method"), method_name, evidence, expected_metric_change, headroom
+
+Your MOST IMPORTANT goal is:
+- To implement the given **modification plan** completely and faithfully in the CUDA extension, producing a new kernel that:
+  - Applies the primary optimization method to the hottest kernel
+  - Preserves correctness within the harness tolerance (atol=1e-3 and rtol=1e-3),
+  - Preserves the public Python API (same inputs/outputs, shapes, dtypes),
+  - And improves performance on the target GPU as much as possible.
+
+PARAMETER PARITY (STRICT)
+- You MUST preserve parameter parity with the base kernel's parameter structure.
+- The base kernel file already contains a `ModelNew` class with parameter handling. You MUST maintain the same parameter structure.
+- If the base kernel uses a PyTorch module as a PARAMETER HOLDER (for initialization / state_dict parity), you MUST keep the same pattern.
+- Do NOT create independent parameters with torch.randn / random init. Source weights/bias from the existing parameter-holder module (e.g., self.op.weight / self.op.bias) as the base kernel does.
+
+NO ATen FOR REPLACED OPS (STRICT)
+- For op-chains explicitly marked as replaced/fused in the modification_plan, you MUST NOT call PyTorch/ATen implementations for those chains. Ops explicitly kept as vendor mainloops (e.g., cuBLAS/cuDNN paths) may remain as in the base kernel.
+- The replaced computation must execute only in your custom CUDA kernel(s), plus minimal checks.
+
+CUDA GRAPH METHOD (ONLY IF REQUIRED BY PLAN)
+- If method_name (or primary_optimisation_method) is cuda_graph_capture, you MAY implement torch.cuda.CUDAGraph capture/replay in ModelNew (Python) using static CUDA tensors.
+- Do not use CUDA graphs otherwise.
+- Do not place custom extension compilation inside the captured region.
+
+You MUST follow these implementation and explanation rules:
+
+(0) IMPLEMENTATION ORDER (CRITICAL - STRICT SEQUENCE)
+- **Primary Optimization Method**
+  - Apply the primary optimization method to the hottest kernel as specified in the modification_plan.
+  - The modification_plan lists the optimization steps (e.g., "1. Apply vectorized memory access to kernel X").
+  - Implement each step in the modification_plan completely and faithfully.
+
+(0.1) MODIFICATION PLAN EXECUTION (CRITICAL)
+- Treat the `modification_plan` (or "modification plan") in optimisation_suggestion as a **checklist** of required changes.
+- For each numbered item in the plan (1., 2., 3., ...), you MUST:
+  - Implement the corresponding change in the CUDA / Python code; and
+  - Be able to point to the exact code region(s) (functions / loops / kernels / kernel launches) that realize this item.
+- You MUST NOT silently drop plan items. If a plan item (or a sub-step) is impossible/unsafe, state it in Section A in ONE short sentence and implement the closest safe subset + a concrete TODO.
+
+(1) OUTPUT STRUCTURE (TWO SECTIONS WITH EXPLICIT DELIMITERS)
+Your answer MUST consist of **two sections in order**, separated by explicit delimiters:
+
+- **Section A – Checklist evidence (plan-to-code mapping)**  
+  - For **each** numbered item in the modification plan, write a **very brief** mapping:
+    - `Plan item N:` the exact text (or a concise paraphrase) of that item;
+    - `Implemented in code:` **one short phrase** naming the key code location(s) (e.g., "new grid-stride loop in main kernel", "float4 load/store path in kernel X", "launch config in ModelNew.forward").
+  - Keep Section A compact: do **not** explain low-level details here; it is only a checklist for where each item was implemented.
+  - If you deviated from the literal wording of the plan, mention this in **one short sentence**.
+  - Section A must NOT include rationale, performance claims, or metric discussion; only plan-item-to-code-location mapping.
+
+- **Section B – Kernel implementation**  
+  - Start this section with the delimiter line: `=== KERNEL CODE STARTS BELOW ===`
+  - Then output a complete CUDA extension implementation following the `load_inline + ModelNew` structure described in OUTPUT RULES below.
+  - This kernel should fully implement all items from the modification plan as explained in Section A.
+  - The kernel code must be wrapped in ```python ... ``` code block.
+
+(2) MINIMAL-DIFF PRINCIPLE (RELATIVE TO BASE KERNEL)
+- Keep the overall structure and public interface of the base kernel stable. Do not redesign unrelated parts.
+- Focus your edits on the parts of the code that are directly related to the modification plan.
+
+(3) SEMANTIC ALIGNMENT
+- Your optimized kernel must produce the same outputs as the base kernel for the same inputs (within tolerance).
+
+(4) BENCH HARNESS INVARIANTS (STRICT)
+- Follow the same device handling pattern as the base kernel. Assume inputs are already on the correct device. In ModelNew.forward, do NOT call .to("cuda"), .cuda(), .cpu(), or .to(x.device).
+- Allocate outputs on the SAME device as the input tensors.
+- If a tensor is non-contiguous, call contiguous() only when the CUDA kernel uses raw linear indexing that assumes contiguous layout; otherwise implement stride-aware indexing.
+- Do NOT propose or implement changes to the benchmark workflow, external caching, or evaluation settings; only kernel code and launch configuration may change.
+- Recommended pattern: in Python `x = x if x.is_contiguous() else x.contiguous()` only when the corresponding CUDA kernel uses linear indexing.
+
+- If headroom is provided in optimisation_suggestion, consider it when choosing implementation details:
+  - High headroom: more aggressive optimizations may be appropriate;
+  - Medium headroom: balanced approach;
+  - Low headroom: focus on small, safe efficiency tweaks; expect modest speedup
+
+
+# Target GPU
+GPU Name: RTX 5090
+Architecture: Blackwell (sm_120)
+Details:
+• GPU Memory: 32GB GDDR7
+• Memory Bandwidth: 1792 GB/s
+• Streaming Multiprocessors: 170
+• FP32 TFLOPS: 104.8
+• TF32 Tensor Core TFLOPS: 104.8 (209.5 with sparsity)
+• FP16 Tensor Core TFLOPS: 209.5 with FP32 accumulate (419 with FP16 accumulate)
+• BFLOAT16 Tensor Core TFLOPS: 209.5 with FP32 accumulate
+• FP8 Tensor Core TFLOPS: 419 (838 with sparsity)
+• FP4 Tensor Core TFLOPS: 838 (1676 with sparsity)
+• Peak INT8 Tensor TOPS: 419 (838 with sparsity)
+• Register File Size: 64K 32-bit registers per SM
+• Maximum number of registers per thread: 255
+• Maximum number of thread blocks per SM: 24
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+
+CUTLASS / CuTe IS AVAILABLE (compile-probed in this environment)
+- Add "-I/home/otter77/git_project/KernelMem/third_party/cutlass/include" to extra_cuda_cflags and you may #include <cutlass/...>
+  and <cute/tensor.hpp>. Probed with the gencode flag above and -std=c++20;
+  use -std=c++20, not c++17 (torch's headers do not build under c++17 here).
+- REQUIRED PRELUDE: this CUDA toolkit dropped the unversioned PFN_cuTensorMap*
+  aliases CUTLASS references. Emit these lines BEFORE any cutlass include, or
+  the build fails with 'identifier PFN_cuTensorMapEncodeTiled is undefined':
+      #include <cudaTypedefs.h>
+      using PFN_cuTensorMapEncodeTiled  = PFN_cuTensorMapEncodeTiled_v12000;
+      using PFN_cuTensorMapEncodeIm2col = PFN_cuTensorMapEncodeIm2col_v12000;
+- PREFER IT OVER HAND-WRITTEN wgmma PTX when you own a GEMM/conv. Hopper
+  warpgroup MMA needs shared-memory descriptors with specific swizzle layouts and
+  correct wgmma.fence / commit_group / wait_group ordering; those are what
+  hand-written warpgroup code gets wrong, and CUTLASS already encodes them.
+  cute::tiled_mma / the SM90 collective builders reach the same instructions the
+  vendor kernels use.
+- IT CAN BEAT A VENDOR CONV WITHOUT BEATING ITS MATH. cuDNN's TF32 path runs a
+  separate fp32->TF32 convertTensor pass over the input (a full read+write of the
+  tensor, ~10-13% of conv time); a CUTLASS conv with ElementA=float converts
+  in-register in the mainloop and skips it. Owning the kernel additionally lets you
+  fold a following reduction (e.g. GroupNorm sum/sumsq) into the epilogue, deleting
+  another full read of the conv output.
+- ACCURACY NOTE: when the harness reference is itself cuDNN TF32, a conv whose
+  accumulation order differs from cuDNN's costs real error budget. CUTLASS tracks
+  it closely (cuDNN dispatches CUTLASS kernels); an ad-hoc TF32 conv with a
+  different reduction order may not. Check tolerance across several seeds, not one.
+- COST: a CUTLASS include adds roughly 50s to the build. Worth it when you are
+  replacing a vendor GEMM/conv; not worth it for an elementwise or reduction
+  kernel, where plain CUDA compiles in a few seconds and is just as fast.
+
+
+[BASE KERNEL FILE]
+This is the current CUDA kernel implementation that you must optimize. Study its structure, parameter handling, and kernel implementations before making changes.
+```python
+# =============================================================================
+# 002_vae_conv3x3_groupnorm_silu_residual_fused  --  ModelNew
+#
+# SEED GRANULARITY: (D) FULL FORWARD REWRITE.  The entire residual block
+# (conv3x3 -> GN -> SiLU -> conv3x3 -> GN -> SiLU -> +residual) is executed by
+# one call into a single load_inline extension.  The vendor convolution is
+# OWNED: it is a CUTLASS TF32 tiled implicit-GEMM (Sm80 tensor-op path,
+# ElementA/B = float -> converted to tf32 in-register in the mainloop, fp32
+# accumulate) instantiated inside this extension.  cuDNN / at::conv2d are NOT
+# used anywhere.
+#
+# 1) Granularity: (D) full forward rewrite.
+# 2) Ops replaced: both F.conv2d, both F.group_norm, both F.silu, the residual
+#    add, and the NCHW<->NHWC layout traffic cuDNN would otherwise pay for.
+# 3) Fusion map:
+#      k1 nchw2nhwc_kernel .............. NCHW->NHWC staging of x (shared-mem
+#                                         tiled transpose, both sides 256B
+#                                         coalesced).  Paid ONCE instead of the
+#                                         4 nchwToNhwc/nhwcToNchw passes cuDNN
+#                                         runs in the reference.
+#      k2 CUTLASS implicit GEMM ......... conv1, NHWC in/out, no fp32->tf32
+#                                         convertTensor pre-pass.
+#      k3 gn_partial_kernel ............. GroupNorm sum/sumsq of the conv output
+#                                         in deterministic per-chunk partials
+#                                         (fully-coalesced float4 reads; the
+#                                         conv output is still L2-resident, so
+#                                         this read is nearly free).
+#      k4 gn_finalize_kernel ............ partials -> mean/rstd (double accum).
+#      k5 gn_silu_nhwc_kernel ........... normalize + affine + SiLU fused into
+#                                         one read/write pass, writing the
+#                                         conv2 input in place of the NHWC
+#                                         staging buffer (buffer reuse).
+#      k6 CUTLASS implicit GEMM ......... conv2 (writes into the conv1 output
+#                                         buffer, which is dead by then).
+#      k7,k8 = k3,k4 for the second GroupNorm.
+#      k9 gn_silu_add_nhwc2nchw_kernel .. normalize + affine + SiLU + residual
+#                                         add + NHWC->NCHW transpose, ALL in
+#                                         one kernel: the second norm, the
+#                                         activation, the skip connection and
+#                                         the output layout conversion never
+#                                         round-trip through global memory
+#                                         separately.
+#      k10 kcrs2krsc_kernel ............. filter KCRS->KRSC repack (shared-mem
+#                                         staged, coalesced both ways).
+# 4) Left in PyTorch: only tensor allocation and (for pathological channel
+#    counts that the tiled kernels cannot serve) the filter permute fallback --
+#    everything on the data path is custom CUDA / CUTLASS.
+#    Precision: fp32 storage everywhere, fp32 accumulation, TF32 tensor cores
+#    for the two convolutions only (the reference itself runs cudnn TF32).
+# =============================================================================
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+def _find_cutlass():
+    cands = [
+        os.environ.get("CUTLASS_PATH", ""),
+        os.environ.get("CUTLASS_DIR", ""),
+        "/home/otter77/git_project/KernelMem/third_party/cutlass",
+        "/home/elek/KernelMem/third_party/cutlass",
+        os.path.expanduser("~/KernelMem/third_party/cutlass"),
+    ]
+    for c in cands:
+        if c and os.path.isdir(os.path.join(c, "include", "cutlass")):
+            return os.path.join(c, "include")
+        if c and os.path.isdir(os.path.join(c, "cutlass")):
+            return c
+    return "/home/otter77/git_project/KernelMem/third_party/cutlass/include"
+
+
+CUTLASS_INC = _find_cutlass()
+
+cuda_src = r'''
+#include <cudaTypedefs.h>
+using PFN_cuTensorMapEncodeTiled  = PFN_cuTensorMapEncodeTiled_v12000;
+using PFN_cuTensorMapEncodeIm2col = PFN_cuTensorMapEncodeIm2col_v12000;
+
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+
+#include <cutlass/cutlass.h>
+#include <cutlass/conv/kernel/default_conv2d_fprop.h>
+#include <cutlass/conv/device/implicit_gemm_convolution.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+
+// ---------------------------------------------------------------------------
+// CUTLASS TF32 implicit-GEMM 3x3 convolution (NHWC activations, KRSC filters).
+// This is the convolution we own: tiled implicit GEMM, 128x128x16 threadblock,
+// 64x64x16 warp tile, m16n8k8 tensor-core MMA, fp32 accumulators.
+// ---------------------------------------------------------------------------
+using ConvKernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
+    float, cutlass::layout::TensorNHWC,
+    float, cutlass::layout::TensorNHWC,
+    float, cutlass::layout::TensorNHWC,
+    float,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 16>,
+    cutlass::gemm::GemmShape<64, 64, 16>,
+    cutlass::gemm::GemmShape<16, 8, 8>,
+    cutlass::epilogue::thread::LinearCombination<float, 4, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<4>,
+    3,
+    cutlass::arch::OpMultiplyAdd,
+    cutlass::conv::IteratorAlgorithm::kOptimized>::Kernel;
+using ImplicitGemm = cutlass::conv::device::ImplicitGemmConvolution<ConvKernel>;
+
+static void conv3x3_nhwc_into(const torch::Tensor& x, const torch::Tensor& w,
+                              torch::Tensor& out, cudaStream_t stream) {
+  int N = (int)x.size(0), H = (int)x.size(1), W = (int)x.size(2), C = (int)x.size(3);
+  int K = (int)w.size(0), R = (int)w.size(1), S = (int)w.size(2);
+  cutlass::conv::Conv2dProblemSize ps(N, H, W, C, K, R, S, H, W,
+                                      1, 1, 1, 1, 1, 1,
+                                      cutlass::conv::Mode::kCrossCorrelation, 1, 1);
+  cutlass::TensorRef<float, cutlass::layout::TensorNHWC> ra(
+      (float*)x.data_ptr<float>(), cutlass::layout::TensorNHWC::packed({N, H, W, C}));
+  cutlass::TensorRef<float, cutlass::layout::TensorNHWC> rb(
+      (float*)w.data_ptr<float>(), cutlass::layout::TensorNHWC::packed({K, R, S, C}));
+  cutlass::TensorRef<float, cutlass::layout::TensorNHWC> rd(
+      out.data_ptr<float>(), cutlass::layout::TensorNHWC::packed({N, H, W, K}));
+  typename ImplicitGemm::Arguments args{ps, ra, rb, rd, rd, {1.0f, 0.0f}};
+  ImplicitGemm op;
+  TORCH_CHECK(op.can_implement(args) == cutlass::Status::kSuccess,
+              "cutlass conv: unsupported problem");
+  size_t ws = op.get_workspace_size(args);
+  void* wsptr = nullptr;
+  torch::Tensor wsbuf;
+  if (ws > 0) {
+    wsbuf = torch::empty({(long)ws}, x.options().dtype(torch::kUInt8));
+    wsptr = wsbuf.data_ptr();
+  }
+  TORCH_CHECK(op.initialize(args, wsptr, stream) == cutlass::Status::kSuccess,
+              "cutlass conv: initialize failed");
+  TORCH_CHECK(op(stream) == cutlass::Status::kSuccess, "cutlass conv: launch failed");
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float silu_f(float v) {
+  return v / (1.0f + __expf(-v));
+}
+
+#define TT 64  // transpose tile (pixels x channels)
+
+// NCHW -> NHWC ---------------------------------------------------------------
+__global__ __launch_bounds__(256) void nchw2nhwc_kernel(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int HW, int C, int vec) {
+  __shared__ float sm[TT][TT + 1];   // [c_local][p_local]
+  const int p0 = blockIdx.x * TT;
+  const int c0 = blockIdx.y * TT;
+  const int n  = blockIdx.z;
+  const float* base = src + (size_t)n * (size_t)C * HW;
+  float*      obase = dst + (size_t)n * (size_t)HW * C;
+  const int t = threadIdx.x;
+  const int lc = t >> 4;
+  const int lp = (t & 15) * 4;
+  const int lp2 = t >> 4;
+  const int lc2 = (t & 15) * 4;
+  const bool full = (vec != 0) && (p0 + TT <= HW);
+
+  if (full) {   // interior tile: no bounds checks at all
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int c = lc + r * 16;
+      float4 v = *reinterpret_cast<const float4*>(base + (size_t)(c0 + c) * HW + p0 + lp);
+      sm[c][lp] = v.x; sm[c][lp + 1] = v.y; sm[c][lp + 2] = v.z; sm[c][lp + 3] = v.w;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int p = lp2 + r * 16;
+      float4 v;
+      v.x = sm[lc2][p]; v.y = sm[lc2 + 1][p]; v.z = sm[lc2 + 2][p]; v.w = sm[lc2 + 3][p];
+      *reinterpret_cast<float4*>(obase + (size_t)(p0 + p) * C + c0 + lc2) = v;
+    }
+  } else {
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int c = lc + r * 16;
+      const float* s = base + (size_t)(c0 + c) * HW + p0 + lp;
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) sm[c][lp + j] = (p0 + lp + j < HW) ? s[j] : 0.0f;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int p = lp2 + r * 16;
+      if (p0 + p >= HW) continue;
+      float4 v;
+      v.x = sm[lc2][p]; v.y = sm[lc2 + 1][p]; v.z = sm[lc2 + 2][p]; v.w = sm[lc2 + 3][p];
+      *reinterpret_cast<float4*>(obase + (size_t)(p0 + p) * C + c0 + lc2) = v;
+    }
+  }
+}
+
+// GroupNorm partial moments over NHWC tensor ---------------------------------
+// Deterministic: every (n, chunk, g) slot is written exactly once, including
+// chunks whose pixel range is empty (they store zeros), so the tail of the
+// partial buffer is never undefined for HW that no tile size divides.
+__global__ __launch_bounds__(256) void gn_partial_kernel(
+    const float* __restrict__ y, float* __restrict__ part,
+    int HW, int C, int G, int Cg, int pixPerChunk, int numChunks) {
+  const int tpp = C >> 2;                 // float4 lanes per pixel
+  const int ppp = 256 / tpp;              // pixels handled per pass
+  const int c4  = threadIdx.x % tpp;
+  const int pr  = threadIdx.x / tpp;
+  const int n   = blockIdx.y;
+  const int p0  = blockIdx.x * pixPerChunk;
+  const int p1  = min(HW, p0 + pixPerChunk);
+  const float4* yb = reinterpret_cast<const float4*>(y + (size_t)n * (size_t)HW * C);
+
+  float s = 0.f, ss = 0.f;
+  for (int p = p0 + pr; p < p1; p += ppp) {
+    float4 v = yb[(size_t)p * tpp + c4];
+    s  += v.x + v.y + v.z + v.w;
+    ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+  }
+  __shared__ float sms[256], smss[256];
+  sms[threadIdx.x] = s; smss[threadIdx.x] = ss;
+  __syncthreads();
+
+  if ((int)threadIdx.x < G) {
+    const int g = threadIdx.x;
+    const int c4lo = (g * Cg) >> 2;
+    const int c4hi = ((g + 1) * Cg) >> 2;
+    float ts = 0.f, tss = 0.f;
+    for (int i = 0; i < ppp; ++i)
+      for (int c = c4lo; c < c4hi; ++c) {
+        int idx = i * tpp + c;
+        ts += sms[idx]; tss += smss[idx];
+      }
+    size_t o = (((size_t)n * numChunks + blockIdx.x) * G + g) * 2;
+    part[o] = ts; part[o + 1] = tss;
+  }
+}
+
+__global__ __launch_bounds__(128) void gn_finalize_kernel(
+    const float* __restrict__ part, float* __restrict__ mean, float* __restrict__ rstd,
+    int numChunks, int G, long cnt, float eps) {
+  const int ng = blockIdx.x;              // n * G + g
+  const int n = ng / G, g = ng % G;
+  double s = 0.0, ss = 0.0;
+  for (int c = threadIdx.x; c < numChunks; c += blockDim.x) {
+    size_t o = (((size_t)n * numChunks + c) * G + g) * 2;
+    s  += (double)part[o];
+    ss += (double)part[o + 1];
+  }
+  __shared__ double bs[128], bss[128];
+  bs[threadIdx.x] = s; bss[threadIdx.x] = ss;
+  __syncthreads();
+  for (int off = 64; off > 0; off >>= 1) {
+    if ((int)threadIdx.x < off) {
+      bs[threadIdx.x] += bs[threadIdx.x + off];
+      bss[threadIdx.x] += bss[threadIdx.x + off];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    double m = bs[0] / (double)cnt;
+    double v = bss[0] / (double)cnt - m * m;
+    if (v < 0.0) v = 0.0;
+    mean[ng] = (float)m;
+    rstd[ng] = (float)(1.0 / sqrt(v + (double)eps));
+  }
+}
+
+// GroupNorm + SiLU, NHWC -> NHWC ---------------------------------------------
+__global__ __launch_bounds__(256) void gn_silu_nhwc_kernel(
+    const float* __restrict__ y, float* __restrict__ out,
+    const float* __restrict__ mean, const float* __restrict__ rstd,
+    const float* __restrict__ gamma, const float* __restrict__ beta,
+    int HW, int C, int G, int Cg) {
+  const int tpp = C >> 2;
+  const int n = blockIdx.y;
+  const float4* yb = reinterpret_cast<const float4*>(y + (size_t)n * (size_t)HW * C);
+  float4* ob = reinterpret_cast<float4*>(out + (size_t)n * (size_t)HW * C);
+  const size_t total = (size_t)HW * tpp;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+       i += (size_t)gridDim.x * blockDim.x) {
+    const int c4 = (int)(i % (size_t)tpp);
+    const int c = c4 * 4;
+    const int g = c / Cg;
+    const float mu = mean[n * G + g], rs = rstd[n * G + g];
+    float4 v = yb[i];
+    float4 gm = reinterpret_cast<const float4*>(gamma)[c4];
+    float4 bt = reinterpret_cast<const float4*>(beta)[c4];
+    float4 o;
+    o.x = silu_f((v.x - mu) * rs * gm.x + bt.x);
+    o.y = silu_f((v.y - mu) * rs * gm.y + bt.y);
+    o.z = silu_f((v.z - mu) * rs * gm.z + bt.z);
+    o.w = silu_f((v.w - mu) * rs * gm.w + bt.w);
+    ob[i] = o;
+  }
+}
+
+// GroupNorm + SiLU + residual + NHWC -> NCHW ---------------------------------
+__global__ __launch_bounds__(256) void gn_silu_add_nhwc2nchw_kernel(
+    const float* __restrict__ y, const float* __restrict__ res, float* __restrict__ out,
+    const float* __restrict__ mean, const float* __restrict__ rstd,
+    const float* __restrict__ gamma, const float* __restrict__ beta,
+    int HW, int C, int G, int Cg, int vec) {
+  __shared__ float sm[TT][TT + 1];   // [c_local][p_local]
+  const int p0 = blockIdx.x * TT;
+  const int c0 = blockIdx.y * TT;
+  const int n  = blockIdx.z;
+  const float* yb = y + (size_t)n * (size_t)HW * C;
+  const int t = threadIdx.x;
+
+  // phase 1: read NHWC, normalize + affine + silu, stage transposed in shared
+  const int lp = t >> 4;             // pixel within tile
+  const int lc = (t & 15) * 4;       // channel within tile
+  const int c  = c0 + lc;
+  const int g  = c / Cg;
+  const float mu = mean[n * G + g], rs = rstd[n * G + g];
+  const float4 gm = reinterpret_cast<const float4*>(gamma)[c >> 2];
+  const float4 bt = reinterpret_cast<const float4*>(beta)[c >> 2];
+
+  const int lc2 = t >> 4;
+  const int lp2 = (t & 15) * 4;
+  const size_t nbase = (size_t)n * (size_t)C * HW;
+  const bool full = (vec != 0) && (p0 + TT <= HW);
+
+  if (full) {
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int p = lp + r * 16;
+      float4 v = *reinterpret_cast<const float4*>(yb + (size_t)(p0 + p) * C + c);
+      sm[lc + 0][p] = silu_f((v.x - mu) * rs * gm.x + bt.x);
+      sm[lc + 1][p] = silu_f((v.y - mu) * rs * gm.y + bt.y);
+      sm[lc + 2][p] = silu_f((v.z - mu) * rs * gm.z + bt.z);
+      sm[lc + 3][p] = silu_f((v.w - mu) * rs * gm.w + bt.w);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int cc = lc2 + r * 16;
+      const size_t off = nbase + (size_t)(c0 + cc) * HW + p0 + lp2;
+      float4 rv = *reinterpret_cast<const float4*>(res + off);
+      float4 o;
+      o.x = sm[cc][lp2 + 0] + rv.x;
+      o.y = sm[cc][lp2 + 1] + rv.y;
+      o.z = sm[cc][lp2 + 2] + rv.z;
+      o.w = sm[cc][lp2 + 3] + rv.w;
+      *reinterpret_cast<float4*>(out + off) = o;
+    }
+  } else {
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int p = lp + r * 16;
+      if (p0 + p >= HW) continue;
+      float4 v = *reinterpret_cast<const float4*>(yb + (size_t)(p0 + p) * C + c);
+      sm[lc + 0][p] = silu_f((v.x - mu) * rs * gm.x + bt.x);
+      sm[lc + 1][p] = silu_f((v.y - mu) * rs * gm.y + bt.y);
+      sm[lc + 2][p] = silu_f((v.z - mu) * rs * gm.z + bt.z);
+      sm[lc + 3][p] = silu_f((v.w - mu) * rs * gm.w + bt.w);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int cc = lc2 + r * 16;
+      const size_t off = nbase + (size_t)(c0 + cc) * HW + p0 + lp2;
+      if (vec && p0 + lp2 + 3 < HW) {
+        float4 rv = *reinterpret_cast<const float4*>(res + off);
+        float4 o;
+        o.x = sm[cc][lp2 + 0] + rv.x;
+        o.y = sm[cc][lp2 + 1] + rv.y;
+        o.z = sm[cc][lp2 + 2] + rv.z;
+        o.w = sm[cc][lp2 + 3] + rv.w;
+        *reinterpret_cast<float4*>(out + off) = o;
+      } else {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+          if (p0 + lp2 + j < HW) out[off + j] = sm[cc][lp2 + j] + res[off + j];
+      }
+    }
+  }
+}
+
+// KCRS -> KRSC filter permutation --------------------------------------------
+__global__ __launch_bounds__(256) void kcrs2krsc_kernel(
+    const float* __restrict__ w, float* __restrict__ o, int C, int RS) {
+  extern __shared__ float sm[];
+  const int k = blockIdx.x;
+  const float* wb = w + (size_t)k * C * RS;
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    const float* s = wb + (size_t)c * RS;
+    for (int j = 0; j < RS; ++j) sm[j * C + c] = s[j];
+  }
+  __syncthreads();
+  float* ob = o + (size_t)k * C * RS;
+  for (int i = threadIdx.x; i < C * RS; i += blockDim.x) ob[i] = sm[i];
+}
+
+// ---------------------------------------------------------------------------
+// host driver
+// ---------------------------------------------------------------------------
+static inline torch::Tensor to_nhwc_weight(const torch::Tensor& w, cudaStream_t stream) {
+  const int K = (int)w.size(0), C = (int)w.size(1);
+  const int R = (int)w.size(2), S = (int)w.size(3);
+  const int RS = R * S;
+  const size_t smem = (size_t)C * RS * sizeof(float);
+  if (smem <= 48 * 1024) {
+    auto o = torch::empty({K, R, S, C}, w.options());
+    kcrs2krsc_kernel<<<K, 256, smem, stream>>>(w.data_ptr<float>(), o.data_ptr<float>(), C, RS);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return o;
+  }
+  return w.permute({0, 2, 3, 1}).contiguous();
+}
+
+static void group_moments(const torch::Tensor& y, int N, int HW, int C, int G,
+                          float eps, torch::Tensor& mean, torch::Tensor& rstd,
+                          cudaStream_t stream) {
+  const int Cg = C / G;
+  int nc = 1024 / max(N, 1);
+  if (nc < 1) nc = 1;
+  int maxc = (HW + 255) / 256;
+  if (maxc < 1) maxc = 1;
+  if (nc > maxc) nc = maxc;
+  const int numChunks = nc;
+  const int pixPerChunk = (HW + numChunks - 1) / numChunks;
+  auto part = torch::empty({(long)N * numChunks * G * 2}, y.options());
+  dim3 grid(numChunks, N);
+  gn_partial_kernel<<<grid, 256, 0, stream>>>(
+      y.data_ptr<float>(), part.data_ptr<float>(), HW, C, G, Cg, pixPerChunk, numChunks);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  gn_finalize_kernel<<<N * G, 128, 0, stream>>>(
+      part.data_ptr<float>(), mean.data_ptr<float>(), rstd.data_ptr<float>(),
+      numChunks, G, (long)HW * Cg, eps);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fused_resblock(torch::Tensor x, torch::Tensor conv1_weight,
+                             torch::Tensor norm1_weight, torch::Tensor norm1_bias,
+                             torch::Tensor conv2_weight, torch::Tensor norm2_weight,
+                             torch::Tensor norm2_bias, double eps) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat32, "x must be cuda float32");
+  TORCH_CHECK(x.dim() == 4, "x must be NCHW");
+  auto xc = x.is_contiguous() ? x : x.contiguous();
+  const int N = (int)xc.size(0), C = (int)xc.size(1);
+  const int H = (int)xc.size(2), W = (int)xc.size(3);
+  const int HW = H * W;
+  const int G = 32;
+  TORCH_CHECK(C % G == 0 && (C / G) % 4 == 0 && C % TT == 0 && (C / 4) <= 256 &&
+                  256 % (C / 4) == 0,
+              "unsupported channel count");
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto opts = xc.options();
+
+  auto w1 = to_nhwc_weight(conv1_weight.is_contiguous() ? conv1_weight
+                                                        : conv1_weight.contiguous(), stream);
+  auto w2 = to_nhwc_weight(conv2_weight.is_contiguous() ? conv2_weight
+                                                        : conv2_weight.contiguous(), stream);
+  auto g1 = norm1_weight.is_contiguous() ? norm1_weight : norm1_weight.contiguous();
+  auto b1 = norm1_bias.is_contiguous() ? norm1_bias : norm1_bias.contiguous();
+  auto g2 = norm2_weight.is_contiguous() ? norm2_weight : norm2_weight.contiguous();
+  auto b2 = norm2_bias.is_contiguous() ? norm2_bias : norm2_bias.contiguous();
+
+  auto xh = torch::empty({N, H, W, C}, opts);
+  const int vec = (HW % 4 == 0) ? 1 : 0;
+  dim3 tgrid((HW + TT - 1) / TT, C / TT, N);
+  nchw2nhwc_kernel<<<tgrid, 256, 0, stream>>>(xc.data_ptr<float>(), xh.data_ptr<float>(),
+                                              HW, C, vec);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto y1 = torch::empty({N, H, W, C}, opts);
+  conv3x3_nhwc_into(xh, w1, y1, stream);
+
+  auto mean = torch::empty({N * G}, opts);
+  auto rstd = torch::empty({N * G}, opts);
+  group_moments(y1, N, HW, C, G, (float)eps, mean, rstd, stream);
+
+  auto z1 = xh;  // reuse buffer (staged NHWC copy of x is dead by now)
+  {
+    int blocks = (int)(((size_t)HW * (C / 4) + 255) / 256);
+    if (blocks > 4096) blocks = 4096;
+    dim3 gr(blocks, N);
+    gn_silu_nhwc_kernel<<<gr, 256, 0, stream>>>(
+        y1.data_ptr<float>(), z1.data_ptr<float>(), mean.data_ptr<float>(),
+        rstd.data_ptr<float>(), g1.data_ptr<float>(), b1.data_ptr<float>(), HW, C, G, C / G);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto y2 = y1;  // reuse buffer (conv1 output is dead by now)
+  conv3x3_nhwc_into(z1, w2, y2, stream);
+
+  group_moments(y2, N, HW, C, G, (float)eps, mean, rstd, stream);
+
+  auto out = torch::empty({N, C, H, W}, opts);
+  gn_silu_add_nhwc2nchw_kernel<<<tgrid, 256, 0, stream>>>(
+      y2.data_ptr<float>(), xc.data_ptr<float>(), out.data_ptr<float>(),
+      mean.data_ptr<float>(), rstd.data_ptr<float>(), g2.data_ptr<float>(),
+      b2.data_ptr<float>(), HW, C, G, C / G, vec);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+'''
+
+cpp_src = r'''
+torch::Tensor fused_resblock(torch::Tensor x, torch::Tensor conv1_weight,
+                             torch::Tensor norm1_weight, torch::Tensor norm1_bias,
+                             torch::Tensor conv2_weight, torch::Tensor norm2_weight,
+                             torch::Tensor norm2_bias, double eps);
+'''
+
+_ext = load_inline(
+    name="vae_resblock_fused",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["fused_resblock"],
+    verbose=False,
+    extra_cflags=["-O3", "-std=c++20"],
+    extra_cuda_cflags=[
+        "-O3", "-std=c++20", "--expt-relaxed-constexpr", "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+        "-I" + CUTLASS_INC,
+    ],
+)
+
+
+class ModelNew(nn.Module):
+    # =====================================================================
+    # GRANULARITY: (D) full forward rewrite -- the whole residual block runs
+    # inside one extension call and the convolution is our own CUTLASS TF32
+    # tiled implicit GEMM (no cuDNN / at::conv2d anywhere).  The GroupNorm
+    # moments, the affine+SiLU, the residual add and the output layout
+    # conversion are fused into the kernels around it so no intermediate is
+    # written to global memory more than strictly necessary.
+    # This module is stateless (the reference is stateless too): all weights
+    # arrive as forward() arguments, so there is nothing to hold and no
+    # parameter parity to break.
+    # =====================================================================
+    def __init__(self):
+        super().__init__()
+        self.ext = _ext
+
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
+                conv2_weight, norm2_weight, norm2_bias, eps):
+        return self.ext.fused_resblock(x, conv1_weight, norm1_weight, norm1_bias,
+                                       conv2_weight, norm2_weight, norm2_bias, float(eps))
+```
+
+[optimization instructions]
+{
+  "bottleneck": "[memory/DRAM-bound tail around a peak-bound mainloop] The CUTLASS TF32 implicit GEMM is 84.5% of steady time but already runs 77.3 GFLOP in 784us = 98.6 TFLOPS ≈ 94% of the 104.8 TFLOPS TF32 peak, so it has no headroom. The largest remaining, actually-improvable segment is the GroupNorm moment pass: gn_partial re-reads the whole 67MB conv output from DRAM (2x per forward, 92us) at 0.34% L2 hit.",
+  "primary_optimisation_method": "Producer-consumer L2 locality fusion: slice each conv into batch chunks sized to the L2 (with an L2 persisting access-policy window over the chunk's output), and launch gn_partial on each chunk immediately after its conv, so the GroupNorm moment pass reads the conv output out of L2 instead of DRAM. Metrics justify it: gn_partial is 88% DRAM SOL, 96.2% long-scoreboard stall, lts hit 0.34% — pure re-read traffic that fusion removes; the conv mainloop itself is at 94% of TF32 peak and cannot be sped up.",
+  "method_name": "l2_persist_chunk_fusion",
+  "modification_plan": "1. Add an `int n0` parameter to gn_partial_kernel and use `const int n = n0 + blockIdx.y;` for both the input base pointer and the partial slot offset `(((size_t)n*numChunks + blockIdx.x)*G + g)*2`. Nothing else in the kernel changes, so every (n,chunk,g) slot is still written exactly once and the partial sums are bitwise identical to today (odd-HW tail behaviour preserved).\n2. Split `group_moments` into `moments_partial_range(y, n0, nN, HW,C,G, part, numChunks, pixPerChunk, stream)` (launches gn_partial with `dim3 grid(numChunks, nN)` and n0) and `moments_finalize(part, mean, rstd, N*G, ...)` launched once, after all chunks, unchanged. Allocate `part` for the full N up front.\n3. Give `conv3x3_nhwc_into` explicit base-pointer + N-override arguments: `conv3x3_nhwc_range(const float* xptr, const float* wptr, float* outptr, int Nsub, int H,int W,int C,int K,...)`, building Conv2dProblemSize with N=Nsub and TensorRefs from the offset pointers `xh + (size_t)n0*HW*C`, `y + (size_t)n0*HW*C`. Everything else (128x128x16 tile, kOptimized, alpha=1/beta=0) is untouched.\n4. New host helper `conv_then_moments(in, w, y, N,H,W,C, part, ...)`:\n   a. `size_t bytes = (size_t)N*HW*C*4;` query `cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize)` once (static). budget = l2/2.\n   b. GATE: if `bytes <= budget || N == 1` -> single full conv + single moments_partial_range(n0=0,nN=N) (exactly today's code path; small 2x64x64 and awkward 1x131x131 shapes keep byte-identical behaviour).\n   c. else `nsub = max(1, (int)(budget / ((size_t)HW*C*4)))`; raise nsub until CTAs = ceil((size_t)nsub*HW/128)*ceil(C/128) >= 170 (one full wave) so chunking never starves the grid; loop `for (n0=0; n0<N; n0+=nsub)` with `nN=min(nsub,N-n0)`: conv3x3_nhwc_range(...) then immediately moments_partial_range(y,n0,nN,...) on the SAME stream.\n5. L2 persistence for the chunk: once per call do `cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, min(budget, maxPersistingL2CacheSize))`. Before each chunk's conv set `cudaStreamAttrValue v; v.accessPolicyWindow = {.base_ptr = y + (size_t)n0*HW*C, .num_bytes = min(chunkBytes, cudaDevAttrMaxAccessPolicyWindowSize), .hitRatio = 1.0f, .hitProp = cudaAccessPropertyPersisting, .missProp = cudaAccessPropertyStreaming}; cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &v);` so the conv's streamed activation reads do not evict the freshly written output. After the chunk's gn_partial, set num_bytes=0 and call `cudaCtxResetPersistingL2Cache()` at the end of fused_resblock. All of this is guarded by a `#if CUDART_VERSION >= 11000` / attribute-query fallback that silently skips persistence if unsupported (correctness never depends on it).\n6. Call `conv_then_moments` for BOTH convs (conv1->y1 moments, conv2->y2 moments). gn_finalize, gn_silu_nhwc, gn_silu_add_nhwc2nchw, nchw2nhwc, kcrs2krsc, buffer reuse (z1=xh, y2=y1) stay byte-identical, so this composes with every mechanism the base already carries.\n7. Correctness: chunking is along the batch axis only; each output element is produced by exactly one conv call with identical problem geometry and padding, and moments are reduced over the same per-(n,chunk,g) partials, so results are bitwise unchanged. Validate all four shapes against the reference (max_atol 0.0027-0.003).\n8. Anti-regression: keep a compile-time switch to force the single-shot path; if the chunked path is not faster for a shape key, the gate (bytes<=budget) already keeps small shapes on the old path.",
+  "evidence": "Round-1 verdict: (ii)-by-construction — the conv does 77.3 GFLOP in 784us = 98.6 TFLOPS = 94% of the 104.8 TFLOPS TF32 peak, so a mainloop tile retune had <=6% theoretical headroom; NCU cannot profile the CUTLASS kernel here and every non-conv kernel duration in the retune profile is within 1-3% of base, so the +0.18% is unproven. New target has independent evidence: gn_partial gpu__time_duration 46,176ns x2 per forward (92us of ~1,942us), gpu__dram_throughput 87.7% of peak, lts__t_sector_hit_rate 0.34%, long_scoreboard stall 96.2% — it is a pure DRAM re-read of the 67MB conv output that was written moments earlier. Refutation of the alternative 'gn_silu_add is the bottleneck': it moves 201MB (y2+residual+out) at 88.6% DRAM SOL = 113us, which is its irreducible traffic; no fusion removes it, whereas gn_partial's 67MB read is removable outright.",
+  "expected_metric_change": "gn_partial: lts__t_sector_hit_rate.pct 0.34% -> >50%, gpu__dram_throughput.avg 87.7% -> <45%, gpu__time_duration 46us -> <22us per launch on the mid shape; per-forward wall time 1.848ms -> ~1.76ms (mid) and 7.72ms -> ~7.4ms (large). Anti-regression: CUTLASS conv per-forward total must stay within 2% (chunk CTA count forced >=170), and the small (2x64x64) and awkward (1x131x131) shapes take the un-chunked gate path so their times must be unchanged; numerical output bitwise identical to the current candidate on all four shapes.",
+  "headroom": "medium"
+}
+
+COMPLETE OUTPUT FORMAT ────────────────────────────────────────────────
+Your complete response MUST include BOTH sections:
+
+**Section A – Checklist evidence (plan-to-code mapping)**
+- Write this section FIRST, before any code.
+- For each numbered item in the modification plan, provide a **very concise** mapping:
+  - `Plan item N:` [exact text or paraphrase, one line]
+  - `Implemented in code:` [one short phrase naming the key code location(s)]
+- Do not write long explanations here; this section is a compact checklist only.
+
+**Section B – Kernel implementation**
+- After Section A, write the delimiter: `=== KERNEL CODE STARTS BELOW ===`
+- Then output the kernel code block following OUTPUT RULES below.
+
+PRECISION POLICY (STRICT) ──────────────────────────────────────────────
+- Compute in the dtype of the input tensors. NEVER downcast to a narrower dtype for speed.
+- float32 inputs => float32 storage and arithmetic throughout. No __half / half2 /
+  __nv_bfloat16 / fp8, and no reduced-precision tensor-core engines.
+- float16/bfloat16 inputs => use that dtype natively; do not upcast the pipeline either.
+- TF32 for conv/GEMM is allowed (the reference runs TF32 via cudnn.allow_tf32=True).
+- Reductions must accumulate in float32 or wider regardless of storage dtype.
+- Speed must come from scheduling, fusion and reduced memory traffic — NOT from doing
+  less precise arithmetic. A narrower dtype can pass the tolerance check while computing
+  something the reference did not; that is not a valid optimization.
+
+OUTPUT RULES FOR KERNEL CODE (Section B only) ──────────────────────────
+The kernel code block in Section B must follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple-quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors the base kernel's inputs/outputs and API, but calls
+      your optimized CUDA kernels.
+**Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose in the code block.
+
+Example complete output structure:
+```
+[Section A: Checklist evidence]
+Plan item 1: ...
+Implemented in code: ...
+
+Plan item 2: ...
+Implemented in code: ...
+
+=== KERNEL CODE STARTS BELOW ===
+```python
+import torch
+...
+```

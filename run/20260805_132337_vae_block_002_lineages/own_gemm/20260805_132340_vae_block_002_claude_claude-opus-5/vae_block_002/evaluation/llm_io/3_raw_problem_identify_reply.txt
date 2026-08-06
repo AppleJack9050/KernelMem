@@ -1,0 +1,19 @@
+```json
+{
+  "critical_issue": "Persisting-L2 device limit raised once from static flag and never restored",
+  "evidence": [
+    "Candidate leaked device-global state.",
+    "persisting_l2_bytes: 18874368 -> 50331648"
+  ],
+  "root_cause": "set_persist_window() calls cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, l2_size/2) behind a static one-shot `limit_set` flag. This is device-global, outlives forward(), and is never lowered back; reset_persist() only clears the window and cache contents, not the reservation. The harness detects the 18MB->48MB residual change after the candidate runs.",
+  "trigger_condition": "Any forward() call on a device where l2_info().ok is true and the chunked path calls set_persist_window; the raised limit persists after fused_resblock returns.",
+  "must_hold_invariants": [
+    "persisting L2 limit queried and restored to its prior value before forward returns",
+    "access-policy window cleared and cudaCtxResetPersistingL2Cache() called at exit",
+    "no device-global state configured from static/one-shot initializers"
+  ],
+  "minimal_fix": "In fused_resblock, query prior limit with cudaDeviceGetLimit(cudaLimitPersistingL2CacheSize) at entry and restore it in reset_persist(); delete the static `limit_set` one-shot guard.",
+  "patch_anchor": "cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, budget);",
+  "confidence": "high"
+}
+```
