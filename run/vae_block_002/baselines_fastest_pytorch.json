@@ -1,0 +1,342 @@
+{
+  "a4c930bb-4694-570b-8d51-97ba053f74ac": {
+    "t_b_ms": 0.5614682879092968,
+    "t_sol_ms": 0.368843,
+    "baseline": "out_compile_cudagraph",
+    "workload": "b1 128x128",
+    "maxautotune_t_b_ms": 0.5758239924907684,
+    "tighten_ratio": 1.0255681485323545,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 0.7948263707350913,
+      "out_compile_default": 0.5694601671907361,
+      "out_compile_cudagraph": 0.5614682879092968,
+      "out_compile_unlimited": 0.5639120210564939,
+      "out_compile_maxautotune": 0.5623301817026907,
+      "out8_maxautotune": 0.5758239924907684
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "f1b799bf-831f-5434-98be-68e897f6a219": {
+    "t_b_ms": 0.5634474258341756,
+    "t_sol_ms": 0.386335,
+    "baseline": "out_compile_maxautotune",
+    "workload": "b1 131x131",
+    "maxautotune_t_b_ms": 0.5816959738731384,
+    "tighten_ratio": 1.0323873128215044,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 0.8165121364280007,
+      "out_compile_default": 0.5702405779514766,
+      "out_compile_cudagraph": 0.5649505535075067,
+      "out_compile_unlimited": 0.5733620657663372,
+      "out_compile_maxautotune": 0.5634474258341756,
+      "out8_maxautotune": 0.5816959738731384
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "102b9359-8f90-5a29-a5a5-dd7bce9f32c3": {
+    "t_b_ms": 2.645055545019371,
+    "t_sol_ms": 1.932664,
+    "baseline": "out_compile_maxautotune",
+    "workload": "b1 293x293",
+    "maxautotune_t_b_ms": 2.6877440214157104,
+    "tighten_ratio": 1.0161389716282978,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 4.572654708535973,
+      "out_compile_default": 4.546858115551907,
+      "out_compile_cudagraph": 4.545736937552999,
+      "out_compile_unlimited": 2.806332601008395,
+      "out_compile_maxautotune": 2.645055545019371,
+      "out8_maxautotune": 2.6877440214157104
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "8de1dc63-b34a-5618-ba36-abaa79de54cf": {
+    "t_b_ms": 19.71593299504978,
+    "t_sol_ms": 13.278334,
+    "baseline": "out_compile_maxautotune",
+    "workload": "b1 768x768",
+    "maxautotune_t_b_ms": 20.147791862487793,
+    "tighten_ratio": 1.0219040543273525,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 36.22108097623388,
+      "out_compile_default": 35.940048066644046,
+      "out_compile_cudagraph": 34.53189220438459,
+      "out_compile_unlimited": 24.4315987876129,
+      "out_compile_maxautotune": 19.71593299504978,
+      "out8_maxautotune": 20.147791862487793
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "38357eec-a997-567f-a5e4-07cb993c02f9": {
+    "t_b_ms": 35.89604603487055,
+    "t_sol_ms": 23.605927,
+    "baseline": "out_compile_maxautotune",
+    "workload": "b1 1024x1024",
+    "maxautotune_t_b_ms": 36.1531982421875,
+    "tighten_ratio": 1.0071638031405226,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 105.93472192247181,
+      "out_compile_default": 107.13086595651883,
+      "out_compile_cudagraph": 101.4091995548337,
+      "out_compile_unlimited": 43.617241481575306,
+      "out_compile_maxautotune": 35.89604603487055,
+      "out8_maxautotune": 36.1531982421875
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "8d631edd-1bc9-5142-9253-b0378a890e67": {
+    "t_b_ms": 0.282482032145613,
+    "t_sol_ms": 0.184421,
+    "baseline": "out_compile_maxautotune",
+    "workload": "b2 64x64",
+    "maxautotune_t_b_ms": 0.2945760041475296,
+    "tighten_ratio": 1.0428132434125312,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 0.40048400490191166,
+      "out_compile_default": 0.4022736781167609,
+      "out_compile_cudagraph": 0.40636558653708127,
+      "out_compile_unlimited": 0.3389725393153243,
+      "out_compile_maxautotune": 0.282482032145613,
+      "out8_maxautotune": 0.2945760041475296
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "697db7ab-bed6-5b19-a6d9-ee56785b0031": {
+    "t_b_ms": 0.9328313674981696,
+    "t_sol_ms": 0.737685,
+    "baseline": "out_compile_unlimited",
+    "workload": "b2 128x128",
+    "maxautotune_t_b_ms": 0.9546879827976227,
+    "tighten_ratio": 1.023430403458743,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 1.3643348857577728,
+      "out_compile_default": 0.9344023323879157,
+      "out_compile_cudagraph": 0.9393381737534873,
+      "out_compile_unlimited": 0.9328313674981696,
+      "out_compile_maxautotune": 0.9368159187702412,
+      "out8_maxautotune": 0.9546879827976227
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "c318e734-9c16-5ca9-8379-1ebdd11da8c0": {
+    "t_b_ms": 2.9604559494238654,
+    "t_sol_ms": 2.213056,
+    "baseline": "out_compile_maxautotune",
+    "workload": "b2 256x192",
+    "maxautotune_t_b_ms": 2.9875839948654175,
+    "tighten_ratio": 1.0091634687038094,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 4.769488701817244,
+      "out_compile_default": 4.773907604521701,
+      "out_compile_cudagraph": 4.305602820734031,
+      "out_compile_unlimited": 3.0164443042941786,
+      "out_compile_maxautotune": 2.9604559494238654,
+      "out8_maxautotune": 2.9875839948654175
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "d6d0256b-9fcc-58e1-b170-418468a285ff": {
+    "t_b_ms": 3.9527926876122144,
+    "t_sol_ms": 2.950741,
+    "baseline": "out_compile_default",
+    "workload": "b2 256x256",
+    "maxautotune_t_b_ms": 4.034111976623535,
+    "tighten_ratio": 1.0205726167390894,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 5.956603651649971,
+      "out_compile_default": 3.9527926876122144,
+      "out_compile_cudagraph": 4.081717454137645,
+      "out_compile_unlimited": 3.9849326946147685,
+      "out_compile_maxautotune": 4.260250386244509,
+      "out8_maxautotune": 4.034111976623535
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "69ceed6e-126b-5583-8bba-fabb3a09f4db": {
+    "t_b_ms": 0.5206921296163447,
+    "t_sol_ms": 0.368843,
+    "baseline": "out_compile_cudagraph",
+    "workload": "b4 64x64",
+    "maxautotune_t_b_ms": 0.5439840257167816,
+    "tighten_ratio": 1.044732568010196,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 0.7268339160383157,
+      "out_compile_default": 0.5326357727840374,
+      "out_compile_cudagraph": 0.5206921296163447,
+      "out_compile_unlimited": 0.5326574778409,
+      "out_compile_maxautotune": 0.5238850285384646,
+      "out8_maxautotune": 0.5439840257167816
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "7a72b3ef-ddf9-5788-bcda-d4e310ffbc2a": {
+    "t_b_ms": 1.3699995030219363,
+    "t_sol_ms": 1.106528,
+    "baseline": "out_compile_unlimited",
+    "workload": "b4 96x128",
+    "maxautotune_t_b_ms": 1.4246400594711304,
+    "tighten_ratio": 1.0398836323142222,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 2.004555040183797,
+      "out_compile_default": 2.027446415198546,
+      "out_compile_cudagraph": 2.046367650369874,
+      "out_compile_unlimited": 1.3699995030219363,
+      "out_compile_maxautotune": 1.4036809002125261,
+      "out8_maxautotune": 1.4246400594711304
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "d6339761-5f71-58dc-b823-4b5caf913838": {
+    "t_b_ms": 1.2325942205962144,
+    "t_sol_ms": 1.106528,
+    "baseline": "out_compile_maxautotune",
+    "workload": "b4 128x96",
+    "maxautotune_t_b_ms": 1.4195200204849243,
+    "tighten_ratio": 1.1516523416751805,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 1.996504442585397,
+      "out_compile_default": 2.0374021862333893,
+      "out_compile_cudagraph": 1.9982969406757367,
+      "out_compile_unlimited": 1.3213122961706367,
+      "out_compile_maxautotune": 1.2325942205962144,
+      "out8_maxautotune": 1.4195200204849243
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "c27f80fd-cda1-5e21-9a89-61e03f7fab92": {
+    "t_b_ms": 1.920692797505397,
+    "t_sol_ms": 1.47537,
+    "baseline": "out_compile_default",
+    "workload": "b4 128x128",
+    "maxautotune_t_b_ms": 2.006880044937134,
+    "tighten_ratio": 1.0448729997549202,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 2.8413767064289965,
+      "out_compile_default": 1.920692797505397,
+      "out_compile_cudagraph": 1.9907281746335157,
+      "out_compile_unlimited": 1.9590207998392561,
+      "out_compile_maxautotune": 1.9794820113563953,
+      "out8_maxautotune": 2.006880044937134
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "952fec71-f323-5dab-9340-dad59ad7a3f1": {
+    "t_b_ms": 8.613759994506836,
+    "t_sol_ms": 5.901482,
+    "baseline": "out8_maxautotune",
+    "workload": "b4 256x256",
+    "maxautotune_t_b_ms": 8.613759994506836,
+    "tighten_ratio": 1.0,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 12.961882986424124,
+      "out_compile_default": 12.220353037523175,
+      "out_compile_cudagraph": 12.6608951283753,
+      "out_compile_unlimited": 8.696579903341831,
+      "out_compile_maxautotune": 8.729517006499629,
+      "out8_maxautotune": 8.613759994506836
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "99881f0c-5281-5728-a4fa-de56d6c2bbe0": {
+    "t_b_ms": 0.9509788395506553,
+    "t_sol_ms": 0.737685,
+    "baseline": "out_compile_unlimited",
+    "workload": "b8 64x64",
+    "maxautotune_t_b_ms": 0.9792799949645996,
+    "tighten_ratio": 1.029760026445296,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 1.2874100937715125,
+      "out_compile_default": 1.2907599327362207,
+      "out_compile_cudagraph": 1.292248445789678,
+      "out_compile_unlimited": 0.9509788395506553,
+      "out_compile_maxautotune": 0.9523765910105272,
+      "out8_maxautotune": 0.9792799949645996
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "cdb231f0-8b76-5b89-a93b-21af0627e037": {
+    "t_b_ms": 1.9191769077874146,
+    "t_sol_ms": 1.47537,
+    "baseline": "out_compile_unlimited",
+    "workload": "b8 64x128",
+    "maxautotune_t_b_ms": 1.9562240242958069,
+    "tighten_ratio": 1.0193036485370717,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 2.6891857409330124,
+      "out_compile_default": 2.6992397319490293,
+      "out_compile_cudagraph": 2.6796621923549933,
+      "out_compile_unlimited": 1.9191769077874146,
+      "out_compile_maxautotune": 1.9440184996296348,
+      "out8_maxautotune": 1.9562240242958069
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "7b00c2c8-1eaa-55ec-a575-64639d605881": {
+    "t_b_ms": 1.868144845916635,
+    "t_sol_ms": 1.47537,
+    "baseline": "out_compile_default",
+    "workload": "b16 64x64",
+    "maxautotune_t_b_ms": 1.943455994129181,
+    "tighten_ratio": 1.0403133345774338,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 2.652568974461944,
+      "out_compile_default": 1.868144845916635,
+      "out_compile_cudagraph": 1.8959087939289272,
+      "out_compile_unlimited": 1.8926164985031397,
+      "out_compile_maxautotune": 1.912874707117798,
+      "out8_maxautotune": 1.943455994129181
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "6284bbd2-bc2e-5002-856a-c4f2c7582254": {
+    "t_b_ms": 3.9034022591434163,
+    "t_sol_ms": 2.950741,
+    "baseline": "out_compile_unlimited",
+    "workload": "b32 64x64",
+    "maxautotune_t_b_ms": 4.009903907775879,
+    "tighten_ratio": 1.027284312904977,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 5.5949095125722605,
+      "out_compile_default": 5.514504190783574,
+      "out_compile_cudagraph": 5.3787577555398185,
+      "out_compile_unlimited": 3.9034022591434163,
+      "out_compile_maxautotune": 3.9652837643232943,
+      "out8_maxautotune": 4.009903907775879
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "b7c12247-9822-5484-b556-12272c60c95b": {
+    "t_b_ms": 16.7754114332455,
+    "t_sol_ms": 11.802964,
+    "baseline": "out_compile_unlimited",
+    "workload": "b32 128x128",
+    "maxautotune_t_b_ms": 16.98076820373535,
+    "tighten_ratio": 1.0122415340635327,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 23.70522456627757,
+      "out_compile_default": 16.883056487434498,
+      "out_compile_cudagraph": 18.17851548029355,
+      "out_compile_unlimited": 16.7754114332455,
+      "out_compile_maxautotune": 18.141887702427617,
+      "out8_maxautotune": 16.98076820373535
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  },
+  "144fdf2b-0296-5d64-819b-eab16d18c752": {
+    "t_b_ms": 8.441794545872515,
+    "t_sol_ms": 5.901482,
+    "baseline": "out_compile_unlimited",
+    "workload": "b64 64x64",
+    "maxautotune_t_b_ms": 8.480815887451172,
+    "tighten_ratio": 1.0046223988710712,
+    "normalized_ms_by_impl": {
+      "out_nhwc_eager": 12.44487442878135,
+      "out_compile_default": 12.173287836914373,
+      "out_compile_cudagraph": 12.266500726538066,
+      "out_compile_unlimited": 8.441794545872515,
+      "out_compile_maxautotune": 9.036762202910248,
+      "out8_maxautotune": 8.480815887451172
+    },
+    "note": "latencies drift-normalized into the out8_maxautotune session via t*(ref_base/ref_cand) on the co-measured eager reference"
+  }
+}
