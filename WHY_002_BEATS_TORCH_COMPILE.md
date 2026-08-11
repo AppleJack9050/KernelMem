@@ -32,19 +32,19 @@ workloads, min-of-3 repeats, all variants passing 20/20.
                                       contribution to speed
                                       0%      5%      10%     15%
                                       |-------|-------|-------|
-   Own the convolution (CUTLASS)      ##################################   1.1161x
-   Two-stream pipelining              #########################            1.0869x
-   CTA tile 128x128x16                :::::::::::::::::::::::::            1.0865x
-   CTA-occupancy chunk gate           ::::::::::::::::::::                 1.0694x
-   Fused GN+SiLU+add+transpose        ############                         1.0420x
-   Buffer aliasing                    ######                               1.0201x
-   float4 full-tile path              #####                                1.0156x
+   Own the convolution (CUTLASS)     ###################        1.1161x
+   Two-stream pipelining             ##############             1.0869x
+   CTA tile 128x128x16               ::::::::::::::             1.0865x
+   CTA-occupancy chunk gate          :::::::::::                1.0694x
+   Fused GN+SiLU+add+transpose       #######                    1.0420x
+   Buffer aliasing                   ###                        1.0201x
+   float4 full-tile path             ##                         1.0156x
 
    #  independent lever      :  nested (already counted inside its parent)
-   noise floor on these geomeans is +/-0.5%  =  under 1 char wide
+   scale: 1.6 chars per 1%.  the +/-0.5% geomean noise floor is under 1 char
 ```
 
-**`1.0869 × 1.1161 × 1.0420 = 1.264`**, slightly above the whole 1.237× margin over max-autotune —
+**`1.0869 × 1.1161 × 1.0420 = 1.264`**, slightly above the whole 1.238× margin over max-autotune —
 so levers 1–3 account for essentially the entire win, and 4–5 are refinements.
 
 ### Nested levers — already counted inside their parent, do not multiply
@@ -62,6 +62,97 @@ so levers 1–3 account for essentially the entire win, and 4–5 are refinement
 | **9** | [Two-pass split-chunk GroupNorm reduction](#9-two-pass-groupnorm-reduction-not-measurable) | UNKNOWN — the only natural ablation is pathological |
 
 ---
+
+---
+
+# The computation graph
+
+## What the problem specifies — 7 operations
+
+```mermaid
+flowchart LR
+  X["x<br/>N×256×H×W"] --> C1["conv2d 3×3<br/>256→256"]
+  C1 --> G1["group_norm<br/>32 groups"] --> S1["silu"]
+  S1 --> C2["conv2d 3×3<br/>256→256"]
+  C2 --> G2["group_norm<br/>32 groups"] --> S2["silu"] --> A["add"] --> O["out<br/>N×256×H×W"]
+  X -. "residual" .-> A
+```
+
+PyTorch executes those 7 operations as **15 kernel launches**, 2374.7 µs on the mid shape:
+
+| Kernel | Calls | µs | % |
+|---|---:|---:|---:|
+| `sm80_xmma_fprop_implicit_gemm_tf32f32…` — the convolutions | 2 | 1701.7 | **71.7%** |
+| `cudnn::engines_precompiled::nchwToNhwcKernel` | 4 | 196.0 | 8.3% |
+| `vectorized_elementwise_kernel` | 1 | 125.9 | 5.3% |
+| `vectorized_elementwise_kernel` | 2 | 122.1 | 5.1% |
+| `RowwiseMomentsCUDAKernel` | 2 | 119.4 | 5.0% |
+| `elementwise_kernel` | 2 | 105.8 | 4.5% |
+| `ComputeFusedParamsCUDA` | 2 | 3.7 | 0.2% |
+
+> **This table is why lever 1 exists.** The convolution is **71.7%** of runtime, so leaving it to
+> cuDNN caps the achievable speedup at **1 / 0.717 = 1.39×** by Amdahl's law — and only if every
+> other kernel is driven to zero. The measured 1.238× against `max-autotune` is already 89% of that
+> ceiling. Owning the convolution is the only way past it.
+>
+> Note also the **4** `nchwToNhwc` launches: cuDNN's fastest fprop engine is NHWC-internal, but the
+> caller hands it NCHW, so both the activations and the filters are re-laid-out before every conv.
+
+## What the kernel actually runs — 9 launches per chunk
+
+Solid arrows are data dependencies; italics name the reference operations each kernel absorbs.
+
+```mermaid
+flowchart TB
+  X["x — NCHW"] --> K1["K1 · nchw2nhwc"]
+  K1 -->|"xh — NHWC"| CV1["CUTLASS conv1<br/>TF32 implicit GEMM"]
+  CV1 -->|"y1"| K2["K2 · gn_partial<br/>sum, sumsq"]
+  K2 -->|"partials"| K3["K3 · gn_finalize<br/>mean, rstd (fp64)"]
+  CV1 -->|"y1"| K4["K4 · gn_silu<br/><i>group_norm + silu</i>"]
+  K3 -->|"scale, shift"| K4
+  K4 -->|"z1 ≡ xh buffer"| CV2["CUTLASS conv2<br/>TF32 implicit GEMM"]
+  CV2 -->|"y2 ≡ y1 buffer"| K2b["K2 · gn_partial"]
+  K2b --> K3b["K3 · gn_finalize"]
+  CV2 -->|"y2"| K5["K5 · gn_silu_add_nhwc2nchw<br/><i>group_norm + silu + add + NHWC→NCHW</i>"]
+  K3b -->|"scale, shift"| K5
+  X -. "residual, read from the original NCHW input" .-> K5
+  K5 --> O["out — NCHW"]
+```
+
+| | Reference | This kernel |
+|---|---:|---:|
+| Layout conversions | 4 | **1** (the return leg is fused into K5) |
+| GroupNorm + SiLU + add kernels | 9 | **6** |
+| Convolutions | 2 (cuDNN) | 2 (**owned**) |
+| **Total launches** | **15** | **9 per chunk** |
+
+`K5` is where the fusion pays: it reads conv2's NHWC output and, in one pass, applies the affine,
+applies SiLU, adds the residual read straight from the original NCHW input, and writes NCHW — four
+reference operations and a layout change in a single trip through memory.
+
+## How chunks are scheduled across two streams
+
+```mermaid
+flowchart LR
+  W["weight repack<br/>kcrs2krsc ×2<br/><i>main stream</i>"] --> E0(("event"))
+  E0 --> A0["chunk 0<br/>8 launches"]
+  E0 --> A1["chunk 1<br/>8 launches"]
+  subgraph S0["stream 0"]
+    A0 --> A2["chunk 2"]
+  end
+  subgraph S1["stream 1"]
+    A1 --> A3["chunk 3"]
+  end
+  A2 --> J(("join<br/>events"))
+  A3 --> J
+  J --> OUT["caller's stream"]
+```
+
+The event fence after the weight repack is required because both workers read the repacked weights.
+The join re-synchronises onto the caller's stream so the kernel remains a drop-in replacement.
+Chunk count comes from the [occupancy gate](#7-cta-occupancy-chunk-gate-10694x-nested-in-2) — the
+mid shape gives `chunkN = 2`, 4 chunks; a batch-1 shape gives 1 chunk and the whole two-stream path
+is skipped.
 
 # The changes explained
 
@@ -83,9 +174,10 @@ cutlass::conv::kernel::DefaultConv2dFprop<
 ```
 
 **Why it wins.** Not by better arithmetic — cuDNN dispatches CUTLASS kernels itself. It wins by
-deleting a pass: cuDNN's TF32 path runs a separate `fp32→TF32 convertTensor` over the input, a full
-read+write of the tensor. A CUTLASS conv with `ElementA=float` converts **in-register in the
-mainloop** and skips it entirely. Owning the conv is also what makes levers 2, 3 and 8 possible at
+owning the layout contract and the epilogue outright. (The long-term-memory note that motivated this
+lineage also claims cuDNN's TF32 path runs a separate `fp32→TF32 convertTensor` pre-pass worth
+10–13%; no such kernel appears in this machine's reference profile, so treat it as the hypothesis
+that prompted the attempt, not a measured cause here.) Owning the conv is also what makes levers 2, 3 and 8 possible at
 all — you cannot fuse an epilogue into, or stream-schedule around, a call you do not own.
 
 fp32 accumulators throughout, so the reference's numeric class is preserved.
@@ -117,10 +209,16 @@ c10::cuda::CUDAStreamGuard guard(s);
 // chunk k: nchw2nhwc -> conv1 -> moments -> gn_silu -> conv2 -> moments -> gn_silu_add_nhwc2nchw
 ```
 
-**Why it wins.** The profile is the whole argument. On the mid shape the convolution takes 1475 µs
-of an 1848 µs forward at **~105 TFLOPS — the 104.8 TFLOPS TF32 peak** — while moving only ~180 GB/s,
-about 10% of the 1792 GB/s available. Meanwhile 373 µs of GroupNorm and transpose work sits behind
-it, and those kernels already run at **1.86–1.94 TB/s, at or above the DRAM roofline**.
+**Why it wins.** The profile is the whole argument, and it is measurable without any circularity.
+Run the kernel with pipelining disabled (ablation A) and the forward is strictly serial at
+**1761.6 µs**. The NCU table below puts the GroupNorm and transpose tail at 89.4 µs per chunk ×
+4 chunks = **357.7 µs**, leaving **~1404 µs of convolution**. That is 154.6 GFLOP in 1404 µs =
+**110 TFLOPS, 105% of the 104.8 TFLOPS nominal TF32 peak** — the conv is at the hardware limit, with
+boost clocks carrying it just past the nominal figure.
+
+Meanwhile the conv moves only 268 MB (two convs, read + write) in that time = **191 GB/s, 11% of the
+1792 GB/s available**, and the tail kernels run at **70–86% of the DRAM roofline** (1.26–1.54 TB/s,
+NCU table below).
 
 So neither side can be made faster. Two complementary resources — tensor pipe and DRAM — are simply
 being used one after the other. Overlapping chunk *k*'s convolution with chunk *k−1*'s memory-bound
@@ -131,20 +229,22 @@ and `max-autotune`'s CUDA graphs remove *launch overhead* while faithfully prese
 *serialization*.
 
 ```
-   mid shape (b8 64x128), 1 char ~ 95 us       # busy   . idle
+   mid shape (b8 64x128), all figures measured, min-of-3    # busy   . idle
+   1 char ~ 90 us
 
-   BEFORE - one stream, everything serialized
-     tensor  ################....
-     DRAM    ................####
-             |<-- conv 1475us -->|<- tail ->|
-             ~105 TFLOPS (TF32 peak)   1.86-1.94 TB/s (DRAM roofline)
-             DRAM ~10% busy            tensor pipe idle
-             total 1848 us
+   BEFORE - one stream (ablation A)
+     tensor  ###############....
+     DRAM    ...............####
+             |<- conv ~1404us ->|<- tail ->|
+             110 TFLOPS = 105% of nominal    1.26-1.54 TB/s
+             TF32 peak; DRAM 11% busy        = 70-86% of DRAM peak
+             total 1761.6 us
 
    AFTER - two streams, chunk k's conv overlaps chunk k-1's tail
-     tensor  #################
-     DRAM    #################
-             total 1613 us    14.6% faster; 236 of the 373us tail hidden
+     tensor  ################
+     DRAM    ################
+             total 1479.1 us   19.1% faster (1.191x)
+                               283 of the 358us tail hidden = 79%
 ```
 
 No work is removed. Both resources are simply busy at the same time.
@@ -155,12 +255,14 @@ It does nothing at batch 1 — there is nothing to chunk — and is faintly nega
 
 **Cross-validated.** Ablation A (a one-line `pipelined = false` edit) and the **actual r0 seed
 binary** compiled from its own source are two independent code paths that must measure the same
-quantity. They agree to **0.15%** (1.0869× vs 1.0853×), and within 1% per-workload on 18 of 20.
+quantity. They agree to **0.15%** on the geomean (1.0869× vs 1.0853×), and within 1% per-workload on
+16 of 20 — the exceptions are `b32 64×64` 4.4%, `b1 1024×1024` 3.6%, `b1 768×768` 2.1%,
+`b4 256×256` 1.5%.
 
 > The winner's parent in `optimization_tree.json` is the **r0 seed, not r1** — the winner is exactly
 > *seed + `stream_pipeline_overlap`*, every CUDA kernel body byte-identical to the seed. The
 > lineage's 4-shape metric bounds this at 1.2063 → 1.2684 = **1.0515×**; the true 20-workload value
-> is **1.0869×**. The 4-shape proxy understated it by 3.4 points.
+> is **1.0869×**. The 4-shape proxy understated it by 3.5 points.
 
 ---
 
@@ -174,28 +276,13 @@ transposes back to NCHW for the caller. Four reference operations and a layout c
 __shared__ float sm[TT][TT + 1];   // 64x65 padded tile — transposed staging, no bank conflicts
 ```
 
-One chunk's chain, with the fusion boundaries shown:
-
-```mermaid
-flowchart LR
-  X["x — NCHW"] --> K1["nchw2nhwc"]
-  K1 --> C1["conv1<br/>CUTLASS TF32"]
-  C1 --> M1["gn_partial<br/>gn_finalize"]
-  M1 --> K4["gn_silu"]
-  K4 --> C2["conv2<br/>CUTLASS TF32"]
-  C2 --> M2["gn_partial<br/>gn_finalize"]
-  M2 --> K5["gn_silu_add_nhwc2nchw<br/>affine + SiLU + residual + transpose"]
-  X -. "residual, read from the original NCHW input" .-> K5
-  K5 --> O["out — NCHW"]
-```
-
 **Why it wins.** Pure traffic: **3 tensor passes instead of 7**. Inductor will not fuse across a
 convolution — the conv is an extern/template call, so everything downstream of it starts a fresh
 kernel and a fresh DRAM round trip. `max-autotune` fuses `group_norm → silu → add` into one Triton
 kernel at best, and cannot fold the NHWC→NCHW transpose into that epilogue at all.
 
-**Where it pays.** Scales cleanly with DRAM-boundness, and it is the **only ablation positive on all
-20 workloads**: `b1 1024×1024` 1.099×, `b16 64×64` 1.093×, `b1 768×768` 1.093×, `b4 256×256` 1.088×.
+**Where it pays.** Scales cleanly with DRAM-boundness, and it is one of only two ablations positive on all
+20 workloads (the other is the `float4` path, lever 5): `b1 1024×1024` 1.099×, `b16 64×64` 1.093×, `b1 768×768` 1.093×, `b4 256×256` 1.088×.
 Small shapes ~1.01×.
 
 ---
@@ -272,8 +359,9 @@ the GPU, losing more than the overlap gains. The gate picks the smallest chunk t
 lever 2 never regresses** and why the kernel wins 20/20 rather than trading wins for losses.
 
 **Where it pays.** Concentrated exactly where predicted — the `64×64` shapes, where the gate coarsens
-the chunk to 3 images: `b64 64×64` 1.316×, `b16 64×64` 1.288×, `b32 64×64` 1.284×. It is ~1.00× on
-every shape where the gate already picks `chunkN = 1`.
+the chunk to 3 images: `b64 64×64` 1.316×, `b16 64×64` 1.288×, `b32 64×64` 1.284×. It should be exactly 1.00× on the 13 shapes where the gate already picks `chunkN = 1`, and is on 9 of
+them; `b1 768×768` (1.060), `b32 128×128` (1.055), `b1 1024×1024` (1.034) and `b4 256×256` (1.032)
+move anyway — the clearest evidence that the per-shape noise floor is wider than ±2.6%.
 
 ---
 
@@ -316,7 +404,7 @@ longer means that change matters more on that shape. 1 char ≈ 0.9%.
 
 ```
    workload            pipelining <--       --> owning the conv
-   ------------------------------------|---------------------------
+   -----------------------------------------|---------------------------
    b2 128x128          PPPPPPPPPPPPPPPPPPPPP|CCCCCCCCC          1.188 / 1.082
    b64 64x64              PPPPPPPPPPPPPPPPPP|CCCCCCCCCCC        1.164 / 1.102
    b32 64x64              PPPPPPPPPPPPPPPPPP|CCCCCCCCCCC        1.162 / 1.102
@@ -337,13 +425,14 @@ longer means that change matters more on that shape. 1 char ≈ 0.9%.
    b2 64x64                                 |CCCCCCCCCCCCC      1.004 / 1.114
    b1 1024x1024                             |CCCCCCCCCCC        0.974 / 1.101
    b1 293x293                               |CCCCCCCCCCCCCCCC   1.000 / 1.144
-   ------------------------------------|---------------------------
+   -----------------------------------------|---------------------------
    P = slowdown without pipelining     C = slowdown with cuDNN instead of CUTLASS
 ```
 
 **Two regimes, and they barely overlap.**
 
-- **Many-image shapes** (`b2`–`b64` at 64×64 / 128×128) are carried by **pipelining**. There are
+- **Many-image shapes** (`b2`–`b64` at 64×64 / 128×128, except `b2 64×64` and `b4 64×64` where the
+  gate declines to pipeline) are carried by **pipelining**. There are
   enough images to chunk, and the conv is short enough that hiding the tail matters most.
 - **Large single-image shapes** (`b1 293×293`, `b1 768×768`, `b1 1024×1024`, `b2 256×256`,
   `b4 256×256`) are carried by **owning the conv**. Pipelining does nothing at batch 1 — there is
@@ -363,21 +452,23 @@ Durations are **per chunk** — the shape runs 4 chunks — so they are ~¼ of a
 
 | Kernel | Launches | Dur (µs) | SM % | **DRAM %** | L2 % | Occupancy % | Waves/SM | Bound by |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| CUTLASS conv ×2 | 2/chunk | ~369 | **~100** | 10.2 | — | — | — | **tensor pipe** |
+| CUTLASS conv ×2 | 2/chunk | ~351 | **~105** | 11 | — | — | — | **tensor pipe** |
 | `nchw2nhwc` | 6 | 14.1 | 12.1 | **83.9** | 41.6 | 68.7 | 1.20 | DRAM |
 | `gn_partial` | 6 | 13.5 | 2.5 | **70.5** | 37.6 | 16.0 | 0.06 | DRAM |
 | `gn_finalize` | 6 | 4.1 | 5.9 | 0.5 | 1.6 | 5.7 | 0.03 | **launch latency** |
 | `gn_silu_nhwc` | 6 | 14.0 | 28.1 | **81.7** | 41.7 | 79.6 | 4.02 | DRAM |
 | `gn_silu_add_nhwc2nchw` | 6 | 26.0 | 10.6 | **86.2** | 39.4 | 67.0 | 1.20 | DRAM |
 
-The convolution row is derived from the traffic accounting rather than a per-kernel NCU row
-(the CUTLASS kernel is not profiled under its own name): 154.6 GFLOP / 1475 µs = **105 TFLOPS = 100%
-of the 104.8 TFLOPS TF32 peak**, while moving 268 MB (two convs, read + write) = **182 GB/s = 10.2%
-of the 1792 GB/s peak**.
+The convolution row is **derived, not profiled** — the ncu and nsys runs filtered to the six custom
+kernel names, so the CUTLASS kernel appears in neither. It is obtained by subtraction: ablation A
+(pipelining off, therefore strictly serial) measures 1761.6 µs; the tail above sums to 89.4 µs per
+chunk × 4 = 357.7 µs; the remainder is ~1404 µs of convolution, ~351 µs per chunk. That gives
+154.6 GFLOP / 1404 µs = **110 TFLOPS = 105% of the 104.8 TFLOPS nominal TF32 peak**, and 268 MB /
+1404 µs = **191 GB/s = 11% of the 1792 GB/s peak**.
 
 ```
                  SM / tensor pipe            DRAM
-   conv          ####################(100%)  ##(10%)
+   conv          #####################(105%) ##(11%)
    gn_silu_add   ##(11%)                     #################(86%)
    nchw2nhwc     ##(12%)                     ################(84%)
    gn_silu       #####(28%)                  ################(82%)
@@ -385,9 +476,9 @@ of the 1792 GB/s peak**.
    gn_finalize   #(6%)                       (0.5%)
 ```
 
-**This table is the reason the kernel is shaped the way it is.** Every custom kernel sits at
-70–86% of DRAM peak with SM throughput of 2.5–28%. The convolution is the exact mirror: ~100% of the
-tensor pipe, ~10% of DRAM. Neither side can be made faster on its own — they are each already
+**This table is the reason the kernel is shaped the way it is.** Every custom kernel except
+`gn_finalize` sits at 70–86% of DRAM peak with SM throughput of 2.5–28%. The convolution is the
+exact mirror: ~105% of nominal tensor-pipe peak, ~11% of DRAM. Neither side can be made faster on its own — they are each already
 against a different wall — which is why the winning change was to run them **at the same time**
 rather than to optimize either.
 
@@ -409,14 +500,17 @@ rebuilt and re-measured in the same session.
 Two things that would have silently corrupted this:
 
 - **Extension cache collision.** Each ablated copy got its own `load_inline(name=...)` and its own
-  `.so`, verified distinct in every build log. Reusing the name serves the *unmodified* binary and
+  `.so` — all eight present and distinct under `run/vae_block_002/prebuilt/`. Reusing the name serves
+  the *unmodified* binary and
   produces clean-looking, meaningless results.
 - **Drift normalization made things worse.** The stored trace's co-measured `reference_latency_ms`
   is noisier than the kernel latency itself — on `b16 64×64` the kernel reproduced to 0.2% while the
   normalized ratio moved 11.6%. In-session min-of-3 controls were used instead.
 
 **Noise floor, measured not assumed.** The 6 workloads ablation A provably cannot affect give geomean
-**1.0003×** (range 0.974 – 1.022). Treat any per-workload ratio inside **±2.6%** as noise;
+**1.0003×** (range 0.974 – 1.022). Treat any per-workload ratio inside **±2.6%** as noise on the levers ablation A can reach; a second
+null control (ablation F on shapes the gate leaves untouched) excurses to +6.0%, so read single-shape
+differences conservatively;
 20-workload geomeans are good to about **±0.5%**.
 
 **All seven ablations passed 20/20 workloads.** No number is quoted from a failed run.
@@ -425,13 +519,14 @@ Two things that would have silently corrupted this:
 
 # Where the remaining headroom is
 
-Three workloads would be **faster with cuDNN** than with the owned convolution:
+Only **one** workload is faster with cuDNN by default. Two more flip only when cuDNN is given
+`benchmark = True`:
 
-| Workload | own conv vs cuDNN |
-|---|---:|
-| b4 64×64 | **0.969×** (0.892× against cuDNN with `benchmark=True`) |
-| b1 128×128 | ~0.99× |
-| b1 131×131 | ~0.99× |
+| Workload | vs default cuDNN | vs cuDNN `benchmark=True` |
+|---|---:|---:|
+| b4 64×64 | **0.969×** | 0.932× |
+| b1 128×128 | 1.084× | 0.991× |
+| b1 131×131 | 1.084× | 0.995× |
 
 The halved-tile ablation (lever 6) loses on exactly the same shapes, which says the `128×128×16` tile
 is too coarse for small problems. A shape-dependent tile choice — or falling back to cuDNN below a
@@ -442,9 +537,11 @@ move.
 
 # What did not help
 
-- **Three lineage rounds after round 4 all regressed** and were correctly discarded:
+- **Four lineage rounds followed round 4 and none was promoted.** Three regressed —
   `cta_tile_quantization_retune` 1.2590, `l2_resident_chunk_sizing` 1.2649, `atomic_privatize`
-  1.2630 — against round 4's 1.2684.
+  1.2630, against round 4's 1.2684. A later round reached 1.2690 (`checkpoint.json`
+  `last_score_for_curve`), 0.05% above round 4 and far inside the ±0.5% noise floor; the ratchet did
+  not promote it, and `optimization_tree.json` still records round 4 as best.
 - **Round 2 (`l2_persist_chunk_fusion`) failed to run at all.** Its successor deliberately chose a
   mechanism-distinct approach — concurrency rather than L2 residency — needing no
   `cudaStreamSetAttribute` or persisting-L2 machinery.
