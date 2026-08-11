@@ -32,6 +32,13 @@ import json, math
 import pandas as pd
 import numpy as np
 
+try:
+    from utils import run_timing as _timing
+except Exception:  # standalone use outside the repo root: timing is optional
+    class _timing:  # type: ignore[no-redef]
+        @staticmethod
+        def record(*_a, **_k) -> None: ...
+
 
 __all__ = [
     "METRICS",
@@ -159,6 +166,7 @@ def profile_bench(
     device_idx: Optional[int] = None,
     timeout_override: Optional[int] = None,  # New: override timeout for specific tasks (in seconds)
 ) -> Path:
+    _profile_t0 = time.perf_counter()
     ncu_bin = os.environ.get("NCU_BIN") or shutil.which("ncu") or "ncu"
     csv_path = Path(out_csv).resolve()
 
@@ -248,12 +256,21 @@ def profile_bench(
     
     def run_ncu_with_timeout(cmd: List[str], phase: str, timeout: int, output_csv: Optional[Path] = None) -> bool:
         """Run the ncu command with timeout protection (using the given timeout)
-        
+
+        Every exit path reports its own elapsed seconds. Without that the only way to
+        cost an ncu pass was to subtract two artifact mtimes, which also counts any
+        time the harness was stopped -- see utils/run_timing for the 52-minute
+        "profiler stall" that was really a paused run.
+
         Returns:
             bool: True if successful, False if timeout or error
         """
         print(f"[ncu] [{phase}] running:", " ".join(cmd), flush=True)
-        
+        _t0 = time.perf_counter()
+
+        def _elapsed() -> float:
+            return time.perf_counter() - _t0
+
         try:
             # Use Popen rather than run so the whole process tree can be force-killed on timeout
             # NOTE: stderr is redirected to subprocess.STDOUT so error messages show up live
@@ -280,11 +297,13 @@ def profile_bench(
                         sys.stderr.write("=" * 80 + "\n")
                     raise SystemExit(proc.returncode)
                 # Finished successfully
-                print(f"[ncu] [{phase}] completed successfully", flush=True)
+                print(f"[ncu] [{phase}] completed successfully in {_elapsed():.1f}s", flush=True)
+                _timing.record(f"ncu_invocation:{phase}", _elapsed(), detail="ok")
                 return True
             except subprocess.TimeoutExpired:
                 # Timed out: kill the entire process group
-                print(f"[ncu] [{phase}] Timeout after {timeout} seconds, terminating process group...", flush=True)
+                print(f"[ncu] [{phase}] Timeout after {timeout} seconds "
+                      f"({_elapsed():.1f}s elapsed), terminating process group...", flush=True)
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                     proc.wait(timeout=5)
@@ -308,8 +327,9 @@ def profile_bench(
                 
                 error_msg = f"[ncu] [{phase}] Profiling timed out after {timeout} seconds"
                 print(error_msg, flush=True)
+                _timing.record(f"ncu_invocation:{phase}", _elapsed(), detail=f"timeout@{timeout}s")
                 raise RuntimeError(error_msg)
-                
+
         except RuntimeError:
             raise
         except Exception as e:
@@ -319,6 +339,9 @@ def profile_bench(
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
                 pass
+            print(f"[ncu] [{phase}] failed after {_elapsed():.1f}s "
+                  f"({e.__class__.__name__})", flush=True)
+            _timing.record(f"ncu_invocation:{phase}", _elapsed(), detail=f"error:{e.__class__.__name__}")
             raise
     
     # ========== Strategy: single kernel vs multiple kernels ==========
@@ -438,7 +461,14 @@ def profile_bench(
             # Clean up the temp file
             if temp_csv.exists():
                 temp_csv.unlink()
-    
+
+    _total = time.perf_counter() - _profile_t0
+    _n_names = len(kernel_names) if kernel_names else 1
+    print(f"[ncu] profile_bench finished in {_total:.1f}s "
+          f"({_n_names} kernel name(s), {2 * _n_names} invocation(s), "
+          f"{_total / max(_n_names, 1):.1f}s per name)", flush=True)
+    _timing.record("ncu_profile_total", _total,
+                   detail=f"names={_n_names} csv={csv_path.name}")
     return csv_path
 
 

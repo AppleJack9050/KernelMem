@@ -33,6 +33,7 @@ from prompts.judger_repair_memory import build_correctness_prompts
 from prompts.judger_optimization_memory_latest import build_judger_optimization_prompts
 from utils.gpu_lock import gpu_section
 from utils.torch_ext_cache import sweep_stale_batons, sweep_unheld_batons
+from utils import run_timing
 
 # ---------------------------------------------------------------------------
 # Serialize every GPU-touching entry point behind one cross-process mutex.
@@ -295,6 +296,11 @@ def _ncu_profile_cached(
     the reason a round dies.
     """
     out_path = Path(out_csv)
+    # "rejected" profiles are advisory context for the judge; "base" profiles are the
+    # measurement the round's decision rests on. Labelling them apart here is what
+    # lets a reader see which of the two actually costs time.
+    _site = "rejected" if "rejected" in out_path.name else "base"
+    _t0 = time.perf_counter()
     key = None
     try:
         h = hashlib.sha256()
@@ -313,20 +319,29 @@ def _ncu_profile_cached(
             shutil.copy2(cached, out_path)
             print(f"[ncu] cache hit ({key[:8]}): source unchanged since a previous "
                   f"profile, skipping ncu run", flush=True)
+            run_timing.record(f"ncu:{_site}", time.perf_counter() - _t0,
+                              detail="cache_hit")
             return out_path.resolve()
     except Exception as exc:
         print(f"[ncu] cache lookup skipped ({exc.__class__.__name__}: {exc})", flush=True)
         key = None
 
-    result = profile_bench(
-        bench_py=bench_py,
-        kernel_names=kernel_names,
-        kernel_file=kernel_file,
-        out_csv=out_csv,
-        device_idx=device_idx,
-        repeat=repeat,
-        timeout_override=timeout_override,
-    )
+    try:
+        result = profile_bench(
+            bench_py=bench_py,
+            kernel_names=kernel_names,
+            kernel_file=kernel_file,
+            out_csv=out_csv,
+            device_idx=device_idx,
+            repeat=repeat,
+            timeout_override=timeout_override,
+        )
+    except BaseException as exc:
+        run_timing.record(f"ncu:{_site}", time.perf_counter() - _t0,
+                          detail=f"failed:{exc.__class__.__name__}")
+        raise
+    run_timing.record(f"ncu:{_site}", time.perf_counter() - _t0,
+                      detail=f"names={len(kernel_names or []) or 1}")
     produced = Path(result) if result else out_path.resolve()
     if key:
         try:
@@ -349,19 +364,23 @@ def _make_llm_caller(args):
         round_idx: int = -1,
     ) -> str:
         sp = default_system_prompt if sys_prompt is None else sys_prompt
-        res = query_server(
-            prompt=prompt,
-            system_prompt=sp,
-            server_type=args.server_type,
-            model_name=args.model_name,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            server_address=args.server_address,
-            server_port=args.server_port,
-            log_path=str(log_path) if log_path else None,
-            call_type=call_type,
-            round_idx=round_idx,
-        )
+        # Timed here rather than at each call site: this is the single choke point for
+        # every model call, including judge_gate, which passes log_path=None and so
+        # never reaches usage.csv at all.
+        with run_timing.phase_timer(f"llm:{call_type}", round_idx=round_idx):
+            res = query_server(
+                prompt=prompt,
+                system_prompt=sp,
+                server_type=args.server_type,
+                model_name=args.model_name,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                server_address=args.server_address,
+                server_port=args.server_port,
+                log_path=str(log_path) if log_path else None,
+                call_type=call_type,
+                round_idx=round_idx,
+            )
         if isinstance(res, list):
             return res[0] if res else ""
         return str(res)
@@ -543,6 +562,7 @@ def _bench_and_score(
     import torch
     from multiprocessing import get_context
 
+    _bench_t0 = time.perf_counter()
     ctx = get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
 
@@ -688,6 +708,13 @@ def _bench_and_score(
             torch.cuda.empty_cache()
         except Exception:
             pass
+
+    # Covers compile + correctness + the timed loop, i.e. everything the 1200s join
+    # above bounds. A timed-out bench is recorded too -- that is 20 minutes spent.
+    _bench_dt = time.perf_counter() - _bench_t0
+    print(f"[{phase}] bench took {_bench_dt:.1f}s", flush=True)
+    run_timing.record(f"bench:{phase}", _bench_dt,
+                      detail="timeout" if timeout_occurred else "ok")
 
 
 
@@ -999,11 +1026,17 @@ def _install_stop_handler() -> None:
     def _handler(signum, _frame):
         global _STOP_REQUESTED
         if _STOP_REQUESTED:
+            # The in-flight round dies here: the checkpoint is only written at the end
+            # of a round, so everything this round has spent is about to be replayed.
+            # Recorded before the re-raise so the log says the round was abandoned
+            # rather than leaving a silent gap for a later reader to misread as work.
+            run_timing.event("abort_signal", detail=f"signum={signum} round_abandoned")
             print("\n[stop] Second signal - aborting immediately.", flush=True)
             signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
             return
         _STOP_REQUESTED = True
+        run_timing.event("stop_signal", detail=f"signum={signum} graceful")
         print(f"\n[stop] Signal {signum} received. Finishing the current round, then writing "
               f"artifacts and a resumable checkpoint. Signal again to abort now.", flush=True)
 
@@ -1306,6 +1339,13 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     io_dir.mkdir(parents=True, exist_ok=True)
     profile_dir.mkdir(parents=True, exist_ok=True)
     log_path = task_root / "usage.csv"
+    # Durations, beside the token log. Opened before anything else can spend time, and
+    # bounded by process_start/process_exit rows so a reader can tell a gap between
+    # rows apart from work -- see utils/run_timing for why that distinction matters.
+    run_timing.set_timing_log(task_root / "timing.csv")
+    run_timing.event("process_start",
+                     detail=f"pid={os.getpid()} subproc_id={args.subproc_id} "
+                            f"task={task_path.stem}")
 
     # === Write the contents of task_path into root/ref.py ===
     root_dir = Path(__file__).resolve().parent
@@ -1353,6 +1393,10 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     err_flags: List[bool] = []
     last_score_for_curve = 0.0  # default baseline for plotting on early failures
     rounds_since_improvement = 0  # consecutive rounds not beating best_score by --base_margin
+    # Bound here, not in the loop: a resume that starts past --round never enters the
+    # body, and the process_exit timing row below reads both.
+    _plateau_stop = False
+    _rounds_run = 0  # rounds this process actually completed (not rounds planned)
     # Outstanding structural-rewrite debt, or None. Holds the kernel the rewrite
     # displaced so it can be restored if the rewrite never pays off.
     structural_debt: Optional[Dict[str, Any]] = None
@@ -1397,6 +1441,10 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                             KernelIndividual._next_id)
             start_round = int(ckpt.get("next_round") or 0)
             _best_txt = f"{best_score:.4f}" if best_score != float("-inf") else "none"
+            # The row that makes downtime legible: paired with the previous session's
+            # process_exit, it bounds a gap that is emphatically not work.
+            run_timing.event("resume", round_idx=start_round,
+                             detail=f"start_round={start_round} best={_best_txt}")
             print(f"[resume] Restored {task_root/_CHECKPOINT_NAME}: continuing at round "
                   f"{start_round}/{args.round}, best={_best_txt}", flush=True)
             if rounds_since_improvement:
@@ -1441,6 +1489,10 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         # the round's start against its end catches every path -- including the
         # repair rounds, which burn wall clock without advancing the search.
         best_score_at_round_start = best_score
+        # Attribute every row written from here on -- including the ones emitted deep
+        # inside run_ncu_memory, which has no notion of a round -- to this round.
+        run_timing.set_round(round_idx)
+        _round_t0 = time.perf_counter()
 
         if round_idx == 0:
             print("[Seed] Generating the initial kernel ...")
@@ -2123,6 +2175,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         nsys_csv_path = None
                         try:
                             print(f"[nsys] Starting nsys profiling after ncu...", flush=True)
+                            _nsys_t0 = time.perf_counter()
                             nsys_rep_path = nsys_profile_bench(
                                 bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
                                 kernel_names=kernel_names,
@@ -2131,6 +2184,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 device_idx=args.device,
                                 timeout=300,  # 5 minutes timeout
                             )
+                            run_timing.record("nsys", time.perf_counter() - _nsys_t0)
                             # Extract and save launch counts
                             nsys_csv_path = Path(f"nsys_temp_{args.subproc_id}.csv")
                             nsys_df = load_nsys_stats(
@@ -2815,6 +2869,16 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         rounds_since_improvement = 0 if _improved else rounds_since_improvement + 1
         _plateau_stop = bool(args.patience and rounds_since_improvement >= args.patience)
 
+        # Written before the checkpoint so that a round total exists even if the
+        # checkpoint write is what fails.
+        _round_dt = time.perf_counter() - _round_t0
+        _rounds_run += 1
+        print(f"[{task_path.name}] Round {round_idx} took {_round_dt / 60:.1f} min "
+              f"({_round_dt:.0f}s)", flush=True)
+        run_timing.record("round_total", _round_dt, round_idx=round_idx,
+                          detail=f"best={best_score:.4f}" if best_score != float("-inf")
+                                 else "best=none")
+
         # Round finished (whatever its outcome) -- snapshot so a stop or a crash
         # after this point resumes from the NEXT round rather than replaying this one.
         _save_checkpoint(
@@ -2899,6 +2963,14 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             pass
                     except Exception:
                         continue
+
+    # Closes the session. A timing.csv whose last row is process_exit ended cleanly;
+    # one that just stops was killed, and the gap before the next resume is downtime,
+    # not work.
+    run_timing.event("process_exit", round_idx=-1,
+                     detail=f"stopped={'yes' if _STOP_REQUESTED else 'no'} "
+                            f"plateau={'yes' if _plateau_stop else 'no'} "
+                            f"rounds_run={_rounds_run}")
 
     return {
         "task": str(task_path),
