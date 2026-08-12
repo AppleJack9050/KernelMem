@@ -312,6 +312,14 @@ def query_server(
     # temperature/top_p/top_k, budget_tokens, num_completions, and the server_*
     # params are accepted for caller compatibility but have no Agent SDK
     # equivalent; the CLI controls sampling and output length itself.
+    #
+    # `is_reasoning_model` was the last parameter in this signature that was
+    # neither honoured nor listed above -- the same defect `reasoning_effort` had.
+    # A caller passing False got high-effort thinking anyway and nothing said so.
+    # It DOES have an Agent SDK equivalent: effort is the thinking dial, so
+    # "not a reasoning model" is the bottom of it. Honoured as a DEFAULT only, so
+    # the precedence rule stays the same everywhere in this function -- an
+    # explicit reasoning_effort still wins.
     model = _resolve_model(model_name)
     # Per-call effort, because the calls are not alike. The MCGS rollout (the
     # `optimization` call that writes the next kernel) runs on a cheaper model at
@@ -323,7 +331,7 @@ def query_server(
     # that overrode explicit choices would defeat the routing without saying so.
     effort = (reasoning_effort
               or os.environ.get("KERNELMEM_CLAUDE_EFFORT")
-              or DEFAULT_EFFORT)
+              or (DEFAULT_EFFORT if is_reasoning_model else "low"))
 
     use_tools = _tools_enabled(call_type)
     workdir: Optional[str] = None

@@ -93,6 +93,22 @@ def main() -> None:
         else:
             os.environ["KERNELMEM_CLAUDE_EFFORT"] = prev
 
+    print("\n[rollout] no parameter in the signature silently lies")
+    # Precedence, pinned in one place: explicit > env > (default | low if not a
+    # reasoning model). Both `reasoning_effort` and `is_reasoning_model` used to be
+    # accepted and discarded, which is how a routing change can look applied while
+    # doing nothing.
+    def _effort(explicit, env, is_reasoning=True):
+        return (explicit or env or (qs.DEFAULT_EFFORT if is_reasoning else "low"))
+
+    _check(_effort("high", "low") == "high", "explicit effort beats the env var")
+    _check(_effort(None, "low") == "low", "the env var applies when nothing is explicit")
+    _check(_effort(None, None) == qs.DEFAULT_EFFORT, "otherwise the module default applies")
+    _check(_effort(None, None, is_reasoning=False) == "low",
+           "is_reasoning_model=False lowers the default instead of being ignored")
+    _check(_effort("max", None, is_reasoning=False) == "max",
+           "and an explicit effort still overrides it -- one precedence rule, not two")
+
     print("\n[rollout] subscription credit, not API billing")
     _check(qs._SUBSCRIPTION_ENV.get("ANTHROPIC_API_KEY") == "",
            "ANTHROPIC_API_KEY is blanked for every call")
