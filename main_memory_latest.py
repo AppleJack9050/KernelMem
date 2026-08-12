@@ -91,6 +91,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--server_address", default="localhost", help="Unused (kept for compatibility)")
     p.add_argument("--server_port", type=int, default=8000, help="Unused (kept for compatibility)")
     p.add_argument("--model_name", default="claude-opus-5", help="Claude model (non-Claude names fall back to claude-opus-5)")
+    p.add_argument("--rollout_model", default="claude-sonnet-5",
+                   help="Model for the MCGS ROLLOUT -- the `optimization` call that writes the "
+                        "next kernel from the selected state. This is the call the search repeats "
+                        "every round, and generation is ~95%% of the wall clock, so it is the one "
+                        "worth moving off the most expensive model. The judge, problem-identify "
+                        "and repair calls stay on --model_name. Both go through the Claude Agent "
+                        "SDK with the API-key env blanked, so both bill subscription credit, not "
+                        "the API. Set this equal to --model_name to disable the split.")
+    p.add_argument("--rollout_effort", default="high",
+                   choices=["low", "medium", "high", "xhigh", "max"],
+                   help="Reasoning effort for the rollout call. High on purpose: the point of the "
+                        "split is a cheaper MODEL, not a cheaper think -- writing a Hopper kernel "
+                        "that compiles is the part the loop cannot afford to get wrong, and the "
+                        "measured failure mode is candidates that do not build, not candidates "
+                        "that were under-tuned. Note KERNELMEM_CLAUDE_EFFORT no longer overrides "
+                        "an explicit per-call effort; it now only sets the default for calls that "
+                        "do not request one.")
     p.add_argument("--round", "-G", type=int, default=10, help="Number of generations per task")
     p.add_argument("--num_seeds", type=int, default=3,
                    help="Round-0 seed candidates to draw; the best-scoring one becomes the base "
@@ -433,17 +450,28 @@ def _make_llm_caller(args):
         log_path: Optional[Path] = None,
         call_type: str = "unknown",
         round_idx: int = -1,
+        model_name: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> str:
+        """One model call. *model_name*/*reasoning_effort* override the run defaults.
+
+        The override exists for the MCGS rollout: expansion is the call the search
+        makes over and over, so it runs on a cheaper model at high effort while the
+        judge, problem-identify and repair calls stay on --model_name. Both go
+        through the same Agent SDK path, so both bill subscription credit.
+        """
         sp = default_system_prompt if sys_prompt is None else sys_prompt
         # Timed here rather than at each call site: this is the single choke point for
         # every model call, including judge_gate, which passes log_path=None and so
         # never reaches usage.csv at all.
+        _model = model_name or args.model_name
         with run_timing.phase_timer(f"llm:{call_type}", round_idx=round_idx):
             res = query_server(
                 prompt=prompt,
                 system_prompt=sp,
                 server_type=args.server_type,
-                model_name=args.model_name,
+                model_name=_model,
+                reasoning_effort=reasoning_effort,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 server_address=args.server_address,
@@ -493,12 +521,18 @@ def _llm_to_kernel(
     log_path: Optional[Path] = None,
     call_type: str = "unknown",
     io_tag: Optional[str] = None,
+    model_name: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> KernelIndividual:
     """LLM → code → save → KernelIndividual (no evaluation).
 
     *io_tag* overrides the raw-reply filename stem. Several candidates may be
     drawn within one round (best-of-N seeds), and without a distinct stem each
     would overwrite the previous one's saved reply.
+
+    *model_name*/*reasoning_effort* override the run defaults for this one call.
+    Used to put the MCGS rollout on a cheaper model at high effort while the
+    judge and analysis calls stay put.
     """
     raw = call_llm(
         prompt,
@@ -506,6 +540,8 @@ def _llm_to_kernel(
         log_path=log_path,
         call_type=call_type,
         round_idx=round_idx,
+        model_name=model_name,
+        reasoning_effort=reasoning_effort,
     )
     # Ensure io_dir exists before writing
     io_dir.mkdir(parents=True, exist_ok=True)
@@ -2736,8 +2772,18 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         )
                         prompt_file = io_dir / f"round{round_idx:03d}_opt_prompt.txt"
                         prompt_file.write_text(opt_prompt, encoding="utf-8")
+                        # THE ROLLOUT. In MCGS terms this is the expansion: one
+                        # child drawn from the selected state. It is the call the
+                        # search repeats every round and ~95% of the wall clock,
+                        # so it runs on --rollout_model at --rollout_effort while
+                        # the judge/analysis calls above stay on --model_name.
+                        print(f"[rollout] Expanding with {args.rollout_model} at "
+                              f"effort={args.rollout_effort} (subscription credit); "
+                              f"judge/analysis remain on {args.model_name}", flush=True)
                         ind = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, round_idx,
-                                             log_path=log_path, call_type="optimization")
+                                             log_path=log_path, call_type="optimization",
+                                             model_name=args.rollout_model,
+                                             reasoning_effort=args.rollout_effort)
                         _bench_and_score(
                             ind,
                             ref_py=task_path,

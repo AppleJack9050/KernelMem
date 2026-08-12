@@ -236,16 +236,29 @@ def _write_usage_row(
     input_tokens: int,
     output_tokens: int,
     total_tokens: int,
+    model: str = "",
+    effort: str = "",
 ) -> None:
+    """Append one call to usage.csv.
+
+    `model`/`effort` are recorded because calls no longer all use the same ones:
+    the MCGS rollout runs on --rollout_model and the judge stays on --model_name,
+    and a token log that does not say which model spent them cannot answer "did
+    the split actually take effect". Appended at the END of the row so a usage.csv
+    written before this change stays readable -- _append_usage_totals reads by
+    name off the file's own header, and older rows stay positionally aligned.
+    """
     if not log_path:
         return
     try:
         file_exists = os.path.exists(log_path)
         with open(log_path, "a", encoding="utf-8") as f:
             if not file_exists:
-                f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
+                f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,"
+                        "total_tokens,model,effort\n")
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
+            f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},"
+                    f"{total_tokens},{model},{effort}\n")
     except Exception as e:
         print(f"Warning: Failed to write usage log to {log_path}: {e}")
 
@@ -291,7 +304,7 @@ def query_server(
     model_name: str = "default",
     is_reasoning_model: bool = True,
     budget_tokens: int = 0,
-    reasoning_effort: str = "medium",
+    reasoning_effort: Optional[str] = None,
     log_path: Optional[str] = None,
     call_type: str = "unknown",
     round_idx: int = -1,
@@ -300,7 +313,17 @@ def query_server(
     # params are accepted for caller compatibility but have no Agent SDK
     # equivalent; the CLI controls sampling and output length itself.
     model = _resolve_model(model_name)
-    effort = os.environ.get("KERNELMEM_CLAUDE_EFFORT", DEFAULT_EFFORT)
+    # Per-call effort, because the calls are not alike. The MCGS rollout (the
+    # `optimization` call that writes the next kernel) runs on a cheaper model at
+    # high effort, while the judge and analysis calls stay where they were; before
+    # this, `reasoning_effort` was accepted and then silently discarded, so every
+    # call got the same env-or-default value and per-call routing was impossible.
+    # An explicit request therefore WINS over KERNELMEM_CLAUDE_EFFORT, which is
+    # now the default for calls that do not ask for anything -- a global env var
+    # that overrode explicit choices would defeat the routing without saying so.
+    effort = (reasoning_effort
+              or os.environ.get("KERNELMEM_CLAUDE_EFFORT")
+              or DEFAULT_EFFORT)
 
     use_tools = _tools_enabled(call_type)
     workdir: Optional[str] = None
@@ -355,7 +378,8 @@ def query_server(
         output_tokens = usage.get("output_tokens", 0)
         total_tokens = input_tokens + output_tokens
         print(f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}")
-        _write_usage_row(log_path, round_idx, call_type, input_tokens, output_tokens, total_tokens)
+        _write_usage_row(log_path, round_idx, call_type, input_tokens, output_tokens,
+                         total_tokens, model=model, effort=effort)
 
     finish_reason = getattr(result, "stop_reason", None) or getattr(result, "subtype", None)
     print(colorize_finish_reason(finish_reason))
