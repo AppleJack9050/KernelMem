@@ -34,6 +34,8 @@ from prompts.judger_optimization_memory_latest import build_judger_optimization_
 from utils.gpu_lock import gpu_section
 from utils.torch_ext_cache import sweep_stale_batons, sweep_unheld_batons
 from utils import run_timing
+from utils.mcgs import (MonteCarloGraphSearch, load_code_features, reward_from_gain,
+                        state_key)
 
 # ---------------------------------------------------------------------------
 # Serialize every GPU-touching entry point behind one cross-process mutex.
@@ -177,6 +179,66 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "rewrite has not beaten the displaced kernel within this many rounds, "
                         "the old base is restored. best_kernel is never affected, so a run can "
                         "only report a kernel that genuinely measured best. Try 3.")
+    # ---- search policy: what the next round branches from -------------------
+    p.add_argument("--search", default="mcgs", choices=["ratchet", "mcgs"],
+                   help="How the parent for each round is chosen. 'ratchet' is the original "
+                        "hill-climber: keep one incumbent, branch from it forever, discard every "
+                        "rejected candidate. Measured over the 18 saved trees in run/, that left "
+                        "113 of 169 nodes (66.9%%) visited exactly once and never revisited. "
+                        "'mcgs' (default on this branch) runs Monte Carlo Graph Search over kernel "
+                        "STATES instead: transpositions merge, so two edit orders that reach the "
+                        "same structure pool their statistics rather than splitting a budget that "
+                        "only affords ~30 evaluations per run. Keep 'ratchet' available for A/B -- "
+                        "cross-method claims on this codebase have been overturned before.")
+    p.add_argument("--mcgs_state_key", default="mechanisms",
+                   choices=["mechanisms", "features", "code"],
+                   help="What makes two kernels the SAME state, i.e. what may merge. Measured by "
+                        "replaying the 145 scored kernels in run/ that still have sources: "
+                        "'mechanisms' (order-independent MULTISET of method_names along the path) "
+                        "gives 85 states, 1.71 kernels/state -- the default. 'features' (the "
+                        "code_features_used vector) gives 11 states for 145 kernels, one holding 47 "
+                        "kernels across a 457%% speedup range against a 516%% total range: it pools "
+                        "nearly everything, because is_aligned_vector_access and is_pointwise never "
+                        "vary and three more are ~constant, so the vector carries about two bits. "
+                        "'code' gives 104 states, 1.39/state, and is effectively a tree -- keep it "
+                        "as the A/B control for whether merging is what helped. NOTE: genuine "
+                        "commuting transpositions are ~absent from the recorded history; the "
+                        "merging you actually get is re-derivation of an identical recipe.")
+    p.add_argument("--mcgs_merge_tol", type=float, default=0.15,
+                   help="Refuse to pool a kernel into a state whose representative differs from it "
+                        "by more than this relative amount; it is split into its own state instead. "
+                        "Exists because of the 'features' measurement above: without it a coarse "
+                        "key makes Q an average over kernels 5x apart in speed. With it, a bad "
+                        "abstraction degrades toward a tree rather than corrupting the values. "
+                        "Set 0 to trust the key completely.")
+    p.add_argument("--mcgs_c_puct", type=float, default=0.8,
+                   help="Exploration weight in Q + c*sqrt(ln N_parent / N_child). Rewards are "
+                        "mapped into [0,1] so this is comparable across tasks. Low because the "
+                        "budget is ~30 evaluations: a large c spends all of it on first visits.")
+    p.add_argument("--mcgs_lam", type=float, default=0.7,
+                   help="Weight on the MAX term in Q = (1-lam)*mean + lam*max. High on purpose. "
+                        "The measured gain distribution is bimodal -- 42%% of edges regress past "
+                        "-1%%, 33%% win past +1%%, only 25%% land inside the +-1%% noise band -- and "
+                        "the loop keeps the best kernel, not the average one. Mean-backup buries a "
+                        "state that produced one +6%% child among four regressions, which is the "
+                        "shape of every real win in the data.")
+    p.add_argument("--mcgs_widen_k", type=float, default=1.0,
+                   help="Progressive widening: a state may have ceil(k * N**alpha) children. The "
+                        "action space is LLM-generated and unbounded, so there is no move list to "
+                        "argmax over; a state earns another child only by being visited.")
+    p.add_argument("--mcgs_widen_alpha", type=float, default=0.5)
+    p.add_argument("--mcgs_max_depth", type=int, default=10,
+                   help="Edits from the seed after which selection expands sideways instead of "
+                        "deeper. Measured, not chosen: win rate over the saved runs is 41%% for "
+                        "rounds 0-4 and 5-9, then 0%% for rounds 10-14, 15-19 and 20-24 -- zero "
+                        "wins in 22 edges past round 10. Calibrated on vae_block_002; re-derive it "
+                        "before trusting it on a task whose kernels have more structural room.")
+    p.add_argument("--mcgs_reward_scale", type=float, default=3.0,
+                   help="Percent gain that maps to a near-saturated reward via tanh(rel/scale). "
+                        "At 3.0: 0%% -> 0.50, +1%% -> 0.58, +3%% -> 0.88. The reward is the PAIRED "
+                        "relative gain, never the blocked score -- score carries +0.9..+1.7%% "
+                        "cross-round drift and a corruptible T_ref denominator, and backing a max "
+                        "over that up a graph compounds the bias at every level.")
     p.add_argument("--patience", type=int, default=4,
                    help="Stop after this many consecutive rounds that fail to improve best_score "
                         "by more than --base_margin (0 disables). Late rounds are where a run "
@@ -1147,6 +1209,10 @@ def _save_checkpoint(task_root: Path, eval_dir: Path, *, task_path: Path,
             if state.get("structural_debt") else None
         ),
         "stop_reason": state.get("stop_reason"),
+        # Visit counts are the only part of the MCGS state that cannot be
+        # recomputed from artifacts on disk, so they must survive a restart or a
+        # resumed run restarts its exploration with the budget already spent.
+        "mcgs": state.get("mcgs"),
         "opt_history_files": {str(k): str(v) for k, v in (state.get("opt_history_files") or {}).items()},
         # Ids name the eval_XXXX.json files; rewinding this would overwrite
         # results from rounds that already finished.
@@ -1413,6 +1479,81 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # displaced so it can be restored if the rewrite never pays off.
     structural_debt: Optional[Dict[str, Any]] = None
 
+    # ---- Monte Carlo Graph Search state -------------------------------------
+    # Replaces the ratchet's rule for choosing what the next round branches from.
+    # `graph` owns SELECTION only: measurement (paired verdict), repair, ncu and
+    # reporting are untouched, so a regression here cannot silently corrupt the
+    # numbers -- it can only send the loop to a worse parent, which shows up in
+    # the score curve rather than hiding in it.
+    _use_mcgs = (getattr(args, "search", "ratchet") == "mcgs")
+    graph = MonteCarloGraphSearch(
+        c_puct=args.mcgs_c_puct, lam=args.mcgs_lam,
+        widen_k=args.mcgs_widen_k, widen_alpha=args.mcgs_widen_alpha,
+        max_depth=args.mcgs_max_depth, reward_scale=args.mcgs_reward_scale,
+        state_key_mode=args.mcgs_state_key, merge_tolerance=args.mcgs_merge_tol)
+    # Live objects for the graph's state representatives. The graph stores kernel
+    # NAMES (it has to be JSON-serialisable for the checkpoint), and selection
+    # needs `.code`/`.code_path`, so names are resolved through here and fall
+    # back to reading the file when a resume has no live object.
+    _kernel_registry: Dict[str, KernelIndividual] = {}
+    # The state the current round was selected from, and its value: needed at
+    # backup time, one full round after selection happened.
+    _mcgs_sel = None
+    _mcgs_parent_key: Optional[str] = None
+
+    def _register(ind: Optional[KernelIndividual]) -> None:
+        if ind is not None and getattr(ind, "code_path", None):
+            _kernel_registry[Path(ind.code_path).stem] = ind
+
+    def _resolve(name: Optional[str], path: Optional[str]) -> Optional[KernelIndividual]:
+        """A graph state's representative as a live KernelIndividual."""
+        if not name:
+            return None
+        got = _kernel_registry.get(name)
+        if got is not None:
+            return got
+        if path and Path(path).exists():
+            ind = KernelIndividual(Path(path).read_text(encoding="utf-8"))
+            ind.code_path = Path(path)
+            ind.metrics = {"runnable": True}
+            _kernel_registry[name] = ind
+            return ind
+        return None
+
+    def _state_key_for(ind: Optional[KernelIndividual], *, round_idx: int,
+                       mechanisms: Optional[List[str]] = None) -> str:
+        """State identity for a kernel, under --mcgs_state_key.
+
+        Features come from the kernel's OWN code via the heuristic extractor, not
+        from round*_machine_check_result.json. That file records the features of
+        the kernel machine_check PROFILED, which is the round's PARENT (see the
+        `cuda_code=parent_kernel_code` call site) -- keying a child by its
+        parent's features would merge every child of a parent into one state
+        regardless of what the edit did. The heuristic extractor needs no LLM
+        call and is deterministic, so it can run on a kernel the same round it is
+        produced; the profiled vector is only a fallback.
+        """
+        name = (Path(ind.code_path).stem
+                if (ind is not None and getattr(ind, "code_path", None)) else f"r{round_idx}")
+        feats = None
+        if args.mcgs_state_key == "features":
+            code = getattr(ind, "code", None)
+            if code:
+                try:
+                    from prompts.machine_check_ver2 import extract_code_features_from_cuda
+                    feats = extract_code_features_from_cuda(code)
+                except Exception as _exc:
+                    print(f"[mcgs] feature extraction failed ({_exc}); falling back to the "
+                          f"profiled vector for this kernel.", flush=True)
+            if not feats:
+                feats = load_code_features(io_dir, round_idx)
+        return state_key(
+            mode=args.mcgs_state_key,
+            features=feats,
+            mechanisms=mechanisms,
+            code=getattr(ind, "code", None),
+            fallback=name)
+
     # ---- resume: rebuild the loop's state from the last completed round ----
     start_round = 0
     if getattr(args, "resume", None):
@@ -1447,6 +1588,22 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                       f"round(s) of grace left.", flush=True)
             rounds_since_improvement = int(ckpt.get("rounds_since_improvement") or 0)
             opt_history_files = {int(k): Path(v) for k, v in (ckpt.get("opt_history_files") or {}).items()}
+            # The graph carries the visit counts, which are the only thing in this
+            # method that cannot be recomputed from artifacts on disk. Dropping
+            # them on resume would reset every Q to zero and restart exploration
+            # from scratch with the budget already spent.
+            if ckpt.get("mcgs"):
+                graph = MonteCarloGraphSearch.from_dict(ckpt["mcgs"])
+                _g = graph.stats()
+                print(f"[mcgs] Restored the search graph: {_g['states']} states over "
+                      f"{_g['kernels']} kernels, {_g['merged_states']} merged, "
+                      f"mean N={_g['mean_N']:.2f}, {_g['total_visits']} visits.", flush=True)
+            elif _use_mcgs:
+                print("[mcgs] WARNING: this checkpoint predates --search mcgs and carries no "
+                      "graph. Rebuilding from the best kernel as a fresh root; the earlier "
+                      "rounds' visit statistics are not recoverable.", flush=True)
+            for _ind in (base_kernel, best_kernel, current_kernel):
+                _register(_ind)
             # Restoring individuals bumps the id counter, so set it afterwards;
             # rewinding would overwrite eval_XXXX.json files already on disk.
             KernelIndividual._next_id = max(int(ckpt.get("next_individual_id") or 0),
@@ -1496,6 +1653,17 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         # Reset every round: only a round whose judge JSON asks for it may take
         # structural grace, and a stale True would hand it to an unrelated round.
         _structural_declared = False
+        # Same hazard, worse consequence. The selection is made in the OPT branch
+        # but consumed in the accept block outside it, so a round that goes to
+        # repair instead would otherwise still be holding the previous round's
+        # selection -- and would back its result up that stale path, crediting a
+        # state that had nothing to do with it. Cleared here so a round with no
+        # selection of its own records nothing.
+        _mcgs_sel = None
+        _mcgs_parent_key = None
+        # Assigned only on the opt path; read by the MCGS mechanism key. Reset so
+        # a repair round cannot inherit the previous round's method name.
+        strategy_json = None
         # Snapshot for the plateau test. best_score is updated from several
         # places (opt accept, repair accept, statistics-only bump), so comparing
         # the round's start against its end catches every path -- including the
@@ -1610,6 +1778,18 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     "method_matched": False,  # Seed doesn't have optimization method matching
                     "timestamp": datetime.now().isoformat(),
                 }
+                # Root of the search graph. Seeded with the measured score as the
+                # chain anchor: every later value is this number times a product
+                # of PAIRED relative gains, so the whole ledger stays on the basis
+                # the accept decisions are actually made on.
+                if _use_mcgs and speedup is not None:
+                    _register(ind)
+                    _rk = _state_key_for(ind, round_idx=round_idx, mechanisms=[])
+                    graph.observe(key=_rk, kernel_name=kernel_name,
+                                  kernel_path=str(ind.code_path), value=float(speedup),
+                                  parent_key=None, runnable=True, note="seed")
+                    print(f"[mcgs] Root state {_rk} <- {kernel_name} at {speedup:.4f} "
+                          f"(key mode: {args.mcgs_state_key})", flush=True)
 
         else:
             is_runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False)) if current_kernel else False
@@ -1843,6 +2023,44 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 # ========== Determine the kernel to optimize: it should be base_kernel (the baseline kernel that met the update criteria) ==========
                 # The optimization phase should keep iterating on base_kernel rather than current_kernel,
                 # because current_kernel may have been generated in the previous round, yet is not as good as base_kernel.
+                # ---- choose what this round branches from --------------------
+                # Under --search mcgs the graph decides, and it decides by moving
+                # base_kernel rather than by bypassing it. Everything downstream
+                # (ncu naming, the `parent_kernel == base_kernel` repair path, the
+                # paired verdict, prompt construction) keeps working unchanged,
+                # and the paired comparison then measures the candidate against
+                # exactly the state it was branched from -- which is precisely the
+                # reward the backup needs. Under 'ratchet' this block is inert.
+                _mcgs_sel = None
+                _mcgs_parent_key = None
+                if _use_mcgs and graph.root is not None:
+                    _mcgs_sel = graph.select()
+                    if _mcgs_sel is not None:
+                        _sel_ind = _resolve(_mcgs_sel.node.rep, _mcgs_sel.node.rep_path)
+                        if _sel_ind is not None:
+                            _mcgs_parent_key = _mcgs_sel.node.key
+                            _switched = (base_kernel is not _sel_ind)
+                            base_kernel = _sel_ind
+                            base_score = float(_mcgs_sel.node.rep_value)
+                            _g = graph.stats()
+                            print(f"[mcgs] Round {round_idx}: branching from state "
+                                  f"{_mcgs_sel.node.key} (depth {_mcgs_sel.node.depth}, "
+                                  f"N={_mcgs_sel.node.N}, Q={_mcgs_sel.node.q(args.mcgs_lam):.3f}, "
+                                  f"value {base_score:.4f}) via {_mcgs_sel.node.rep}"
+                                  f"{' [SWITCHED parent]' if _switched else ''}", flush=True)
+                            print(f"[mcgs]   why: {_mcgs_sel.reason}", flush=True)
+                            print(f"[mcgs]   graph: {_g['states']} states / "
+                                  f"{_g['kernels']} kernels, {_g['merged_states']} merged, "
+                                  f"mean N={_g['mean_N']:.2f}, depth seen "
+                                  f"{_g['max_depth_seen']}", flush=True)
+                        else:
+                            # The representative's file is gone (hand-cleaned run
+                            # dir, or a resume against moved artifacts). Fall through
+                            # to the incumbent rather than dying mid-run.
+                            print(f"[mcgs] WARNING: could not resolve the code for state "
+                                  f"{_mcgs_sel.node.key} (rep {_mcgs_sel.node.rep}); "
+                                  f"falling back to the incumbent for this round.", flush=True)
+                            _mcgs_sel = None
                 # parent_kernel is base_kernel_temp; it only counts as a real base_kernel once ncu profiling passes
                 parent_kernel = base_kernel if base_kernel is not None else current_kernel
                 
@@ -2756,7 +2974,74 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     should_update_base = this_score >= base_score * (1.0 + args.base_margin)
                     _paired_note = None
 
-            if should_update_base:
+            # ---- MCGS: record the candidate and back its result up ------------
+            # This replaces the ratchet's one-way base mutation. The reward is the
+            # PAIRED relative gain against the state we branched from, so the value
+            # chain is `seed x prod(1 + verified gain)` -- one basis end to end.
+            # Falling back to the blocked delta only when no verdict exists keeps
+            # --base_max_reps 0 working, and is flagged in the log because that
+            # number carries the drift the paired path removes.
+            if _use_mcgs and _mcgs_sel is not None and _mcgs_parent_key:
+                _cand_name = (Path(ind.code_path).stem
+                              if (ind and getattr(ind, "code_path", None)) else None)
+                if _cand_name:
+                    _register(ind)
+                    if _verdict is not None:
+                        _rel = float(_verdict["rel_pct"])
+                        _basis = "paired"
+                    elif base_score > 0 and this_score > 0:
+                        _rel = (this_score / base_score - 1.0) * 100.0
+                        _basis = "blocked (drift-contaminated; no paired verdict)"
+                    else:
+                        _rel, _basis = 0.0, "unmeasurable"
+                    _parent_node = graph.nodes.get(_mcgs_parent_key)
+                    _parent_value = float(_parent_node.rep_value) if _parent_node else 1.0
+                    _child_value = _parent_value * (1.0 + _rel / 100.0)
+                    _failed = not runnable
+                    # Mechanism set: the path's applied methods plus this round's,
+                    # so 'mechanisms' keying can recognise a commuting reorder.
+                    _mech = (strategy_json.get("method_name")
+                             if isinstance(strategy_json, dict) else None)
+                    _mechs = None
+                    if args.mcgs_state_key == "mechanisms":
+                        # Path-accumulated and order-preserving: graph.path_mechanisms
+                        # walks the `via` edge labels root-to-leaf. Repeats are kept,
+                        # so applying one method twice stays distinct from once.
+                        _mechs = graph.path_mechanisms(_mcgs_sel.path) + (
+                            [_mech] if _mech else [])
+                    _ck = _state_key_for(ind, round_idx=round_idx, mechanisms=_mechs)
+                    graph.observe(key=_ck, kernel_name=_cand_name,
+                                  kernel_path=str(ind.code_path) if ind.code_path else None,
+                                  value=_child_value, parent_key=_mcgs_parent_key,
+                                  runnable=bool(runnable), mechanism=_mech,
+                                  note=f"round {round_idx}, {_rel:+.2f}% {_basis}")
+                    _r = reward_from_gain(_rel, scale=args.mcgs_reward_scale, failed=_failed)
+                    _path = list(_mcgs_sel.path)
+                    if _ck not in _path:
+                        _path.append(_ck)
+                    graph.backup(_path, _r, failed=_failed)
+                    _merged = len(graph.nodes[_ck].members) > 1
+                    print(f"[mcgs] Child state {_ck}: {_rel:+.2f}% ({_basis}) -> reward "
+                          f"{_r:.3f}, value {_child_value:.4f}, N={graph.nodes[_ck].N}"
+                          f"{'  [TRANSPOSITION: merged into an existing state]' if _merged else ''}",
+                          flush=True)
+                    _bn = graph.best()
+                    if _bn is not None:
+                        print(f"[mcgs] Best state so far: {_bn.key} at {_bn.rep_value:.4f} "
+                              f"via {_bn.rep} (N={_bn.N}, Q={_bn.q(args.mcgs_lam):.3f})",
+                              flush=True)
+
+            # The ratchet's base MUTATION is MCGS's job now -- base_kernel is set at
+            # selection time from the chosen state, and re-deciding it here would
+            # overwrite that choice one round later and collapse the graph back to a
+            # hill-climber. But `should_update_base` is deliberately left intact:
+            # it is the accept EVIDENCE (paired, margin-and-significance gated) and
+            # the best_kernel gate below reads it. Zeroing it would leave best
+            # promoted only by the blocked-score branch, i.e. exactly the
+            # drift-driven path that shipped a non-reproducing number before.
+            _mcgs_base_frozen = bool(_use_mcgs and _mcgs_sel is not None)
+
+            if should_update_base and not _mcgs_base_frozen:
                 if base_score == float("-inf"):
                     print(f"[base] Setting initial base_kernel: {this_score:.4f}", flush=True)
                 else:
@@ -2770,7 +3055,12 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 with open(test_kernel, "w") as f:
                     f.write(base_kernel.code)
             elif (args.structural_grace > 0 and structural_debt is None
-                  and _structural_declared and base_score > 0 and this_score > 0):
+                  and _structural_declared and base_score > 0 and this_score > 0
+                  and not _mcgs_base_frozen):
+                # Inert under MCGS by design. structural_debt is a one-slot,
+                # N-round-grace hand-rolled version of "keep a worse node around
+                # because it may lead somewhere" -- which is what the graph does
+                # natively for every node, without a grace clock or a restore.
                 # Declared structural rewrite, rejected by the ratchet. Adopt it
                 # anyway and remember what it displaced: a rewrite is slower
                 # until it is finished, so judging it on its first version is
@@ -2796,8 +3086,16 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             elif base_score not in (float("-inf"), 0):
                 delta = (this_score / base_score - 1.0) * 100.0 if base_score > 0 else float("nan")
                 _how = _paired_note or f"stored-score {delta:+.2f}%"
-                print(f"[base] Keeping base_kernel {base_score:.4f} ({this_score:.4f}: "
-                      f"{_how}, below the {args.base_margin * 100:.1f}% margin)", flush=True)
+                if _mcgs_base_frozen:
+                    # Not "kept" -- the graph will re-pick next round, possibly this
+                    # very candidate. Saying "keeping base_kernel" here would read as
+                    # a rejection and the state was in fact recorded and is selectable.
+                    print(f"[base] MCGS holds selection ({this_score:.4f}: {_how}); the "
+                          f"candidate is a graph state and may be branched from later",
+                          flush=True)
+                else:
+                    print(f"[base] Keeping base_kernel {base_score:.4f} ({this_score:.4f}: "
+                          f"{_how}, below the {args.base_margin * 100:.1f}% margin)", flush=True)
 
             # ---- settle any outstanding structural-rewrite debt -------------
             if structural_debt is not None:
@@ -2931,6 +3229,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 "rounds_since_improvement": rounds_since_improvement,
                 "structural_debt": structural_debt,
                 "stop_reason": "plateau" if _plateau_stop else None,
+                "mcgs": graph.to_dict() if _use_mcgs else None,
                 "opt_history_files": opt_history_files,
             },
         )
