@@ -18,6 +18,7 @@ from pathlib import Path
 from string import Template
 from textwrap import dedent
 import importlib.util
+import os
 import sys
 from typing import Optional, Tuple, Dict, Any, Callable
 import pandas as pd
@@ -28,6 +29,89 @@ import csv
 ROOT = Path(__file__).resolve().parents[1]
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 YAML_RULES_PATH = ROOT / "memorybank" / "bottleneck_headroom_kernelstructure.yaml"
+
+# ---------------------------------------------------------------------------
+# Memory-bank enforcement mode
+#
+# The decision table gates method selection through `allowed_methods`. Binding
+# that list only helps when the table's vocabulary covers the methods a problem
+# actually rewards, and on vae_block_002 it does not: the best kernel to date
+# used `stream_pipeline_overlap`, which is not among the catalog's 26 entries,
+# and it was found in a round where the table matched nothing and the judge was
+# free to invent.
+#
+# Advisory mode keeps the machine_check diagnosis in the prompt and records
+# what the table would have permitted, without forbidding anything, so the
+# in-table and invented populations can be scored against each other before the
+# constraint is allowed to bind. Set MEMORYBANK_ENFORCEMENT=hard to bind it.
+# ---------------------------------------------------------------------------
+ENFORCEMENT_MODE = os.environ.get("MEMORYBANK_ENFORCEMENT", "advisory").strip().lower()
+if ENFORCEMENT_MODE not in ("advisory", "hard"):
+    raise ValueError(
+        "MEMORYBANK_ENFORCEMENT must be 'advisory' or 'hard', "
+        f"got {ENFORCEMENT_MODE!r}"
+    )
+
+# Each pair rewrites one binding clause into its advisory form. Both prompts
+# are rewritten as a unit -- see _apply_enforcement_mode, which refuses to
+# return a partially-softened prompt.
+_ADVISORY_REWRITES_SYSTEM = (
+    (
+        "   - The `allowed_methods` list in MACHINE_CHECK RESULT is a HARD CONSTRAINT.\n"
+        "   - You MUST select your method from this list. You CANNOT choose a method outside this list.",
+        "   - The `allowed_methods` list in MACHINE_CHECK RESULT is ADVISORY.\n"
+        "   - Prefer a method from that list when one genuinely fits the measured bottleneck.\n"
+        "   - You MAY choose a method outside the list when none of them addresses what the\n"
+        "     numbers show; if you do, say so explicitly in `evidence` and name the mechanism.",
+    ),
+    (
+        "  * The allowed_methods list is NOT empty, and you MUST select your method from this list (HARD CONSTRAINT).",
+        "  * The allowed_methods list is NOT empty. Treat it as a ranked suggestion, not a gate.",
+    ),
+    (
+        "- You MUST select your method from the allowed_methods list (HARD CONSTRAINT).",
+        "- Prefer the allowed_methods list; departing from it is permitted when justified by the metrics.",
+    ),
+    (
+        '  "method_name": "<MUST be one of the allowed_methods from MACHINE_CHECK RESULT>",',
+        '  "method_name": "<one of the allowed_methods, or your own short snake_case name if none fit>",',
+    ),
+    (
+        '- The "method_name" field MUST exactly match one of the method IDs listed in the allowed_methods section of MACHINE_CHECK RESULT. You CANNOT choose a method that is not in that list.',
+        '- The "method_name" field SHOULD match one of the method IDs in the allowed_methods section.\n'
+        '  If no listed method fits the measured bottleneck, choose your own and give it a short\n'
+        '  snake_case name; the mismatch is recorded rather than rejected.',
+    ),
+)
+
+_ADVISORY_REWRITES_INSTRUCTION = (
+    (
+        '- Your "method_name" MUST be one of the allowed_methods listed above (this is a HARD CONSTRAINT from machine_check).',
+        '- Your "method_name" SHOULD be one of the allowed_methods listed above (advisory, not binding:\n'
+        '  machine_check records your choice either way).',
+    ),
+)
+
+
+def _apply_enforcement_mode(text: str, rewrites: Tuple[Tuple[str, str], ...]) -> str:
+    """Soften binding method-selection language when running advisory.
+
+    Raises if a clause is missing rather than returning a prompt that still
+    binds. A silent no-op here would look exactly like advisory mode while the
+    judge kept refusing anything outside the table, which is the one failure
+    that would quietly invalidate the comparison this mode exists to produce.
+    """
+    if ENFORCEMENT_MODE == "hard":
+        return text
+    for old, new in rewrites:
+        if old not in text:
+            raise RuntimeError(
+                "advisory rewrite failed: the prompt no longer contains the binding "
+                f"clause {old[:70]!r}...; update _ADVISORY_REWRITES_* to match the "
+                "current template before relying on advisory mode"
+            )
+        text = text.replace(old, new)
+    return text
 
 # Import machine_check ver2 module
 from prompts.machine_check_ver2 import run_machine_check
@@ -631,6 +715,12 @@ def build_judger_optimization_prompts(
                 except Exception:
                     pass
             
+            # Record whether allowed_methods actually bound this round. Without
+            # it a saved result is ambiguous after the fact: an in-table method
+            # could mean the judge agreed with the table or merely obeyed it.
+            if isinstance(machine_check_result, dict):
+                machine_check_result["enforcement"] = ENFORCEMENT_MODE
+
             # Save machine_check_result to JSON file if io_dir and round_idx are provided
             if io_dir is not None and round_idx is not None:
                 try:
@@ -1059,7 +1149,9 @@ already does, and you should say so explicitly in `evidence`.
         return (system_prompt, instruction)
     
     # For matched case, continue with full template preparation
-    system_prompt = system_prompt_tmpl.substitute()
+    system_prompt = _apply_enforcement_mode(
+        system_prompt_tmpl.substitute(), _ADVISORY_REWRITES_SYSTEM
+    )
     # Format forbidden methods section
     if forbidden_methods_list:
         forbidden_methods_section = f"""
@@ -1152,4 +1244,5 @@ The following are brief descriptions of the allowed methods. Use these to unders
         GLOBAL_FORBIDDEN_RULES_SECTION=global_forbidden_rules_section,
         METHOD_CATALOG_SECTION=method_catalog_section,
     )
+    instruction = _apply_enforcement_mode(instruction, _ADVISORY_REWRITES_INSTRUCTION)
     return system_prompt, instruction

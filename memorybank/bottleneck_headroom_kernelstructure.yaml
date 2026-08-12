@@ -419,6 +419,53 @@ machine_check:
             - SoftwarePrefetching
           expected_speedup: medium
 
+        # --- S4 (MultiKernel-Graph) -----------------------------------------
+        # A multi-kernel forward is bandwidth-bound because every intermediate
+        # is written to and re-read from global memory between kernels, so the
+        # byte-reducing remedy is to delete those round-trips. Cutting launch
+        # overhead does not reduce bytes; that lives in launch_overhead.
+        # Tier-L is deliberately absent: bytes_structurally_unavoidable pins
+        # kernel_structure_id to 0, so S4 can never be tiered Tier-L.
+        - id: MBW_S4_INTERMEDIATE_ROUNDTRIP
+          headroom: [Tier-H, Tier-M]
+          kernel_structure: S4
+          gate_when: "has_multiple_kernels_in_forward = true AND tc_eligible = false"
+          allowed_methods:
+            - KernelFusion
+            - MultiKernelScheduling
+            - Improve_Coalescing_and_TransactionSize
+          forbidden_methods:
+            - KernelFission
+            - CacheReuseBased
+            - __ldg_without_reuse
+          expected_speedup: medium
+          requirements:
+            KernelFusion:
+              - intermediate_is_fusible
+              - preserve_semantics
+              - memory_footprint_respected
+
+        # A tensor-core-eligible operator in the forward means the dominant
+        # kernel is a vendor GEMM/conv. When that kernel is already at its own
+        # roofline the reclaimable bytes are the intermediates around it, not
+        # anything inside it, so ownership-and-fusion is the lever.
+        - id: MBW_S4_VENDOR_OP_DOMINATES
+          headroom: [Tier-H, Tier-M]
+          kernel_structure: S4
+          gate_when: "has_multiple_kernels_in_forward = true AND tc_eligible = true"
+          allowed_methods:
+            - Own_And_Fuse_Vendor_Operator
+            - KernelFusion
+          forbidden_methods:
+            - KernelFission
+            - CacheReuseBased
+          expected_speedup: medium
+          requirements:
+            Own_And_Fuse_Vendor_Operator:
+              - vendor_operator_fraction_measured
+              - surrounding_work_fused_into_prologue_or_epilogue
+              - intermediate_never_written_to_global
+
 
     # NEW: GEMM / tiling-needed bucket (fixes NO_MATCH for GEMM-like kernels)
     gemm_tiling_needed:

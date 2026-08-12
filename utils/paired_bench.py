@@ -56,8 +56,82 @@ def _geo(xs: List[float]) -> float:
     return math.exp(sum(math.log(x) for x in xs) / len(xs))
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction for the incomplete beta function (Lentz's method)."""
+    MAXIT, EPS, FPMIN = 300, 3e-16, 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    if abs(d) < FPMIN:
+        d = FPMIN
+    d = 1.0 / d
+    h = d
+    for m in range(1, MAXIT + 1):
+        m2 = 2 * m
+        for aa in (m * (b - m) * x / ((qam + m2) * (a + m2)),
+                   -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))):
+            d = 1.0 + aa * d
+            if abs(d) < FPMIN:
+                d = FPMIN
+            c = 1.0 + aa / c
+            if abs(c) < FPMIN:
+                c = FPMIN
+            d = 1.0 / d
+            h *= d * c
+        if abs(d * c - 1.0) < EPS:
+            break
+    return h
+
+
+def _betai(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    lbeta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+    bt = math.exp(lbeta + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def _t_sf(t: float, dof: int) -> float:
+    """One-sided tail P(T > t) for Student's t with *dof* degrees of freedom.
+
+    Stdlib-only on purpose: this decides whether the ratchet advances, and it runs
+    inside the benchmark subprocess, so it must not depend on scipy being present.
+    Checked against scipy.stats.t.sf to 1e-12 over dof 1-30 -- see
+    ``utils/test_paired_stats.py``.
+    """
+    if dof <= 0:
+        return float("nan")
+    if t != t:                                  # NaN in, NaN out
+        return float("nan")
+    if math.isinf(t):
+        return 0.0 if t > 0 else 1.0
+    p = 0.5 * _betai(dof / 2.0, 0.5, dof / (dof + t * t))
+    return p if t > 0 else 1.0 - p
+
+
+def _sigma_to_p(sigma: float) -> float:
+    """One-sided normal tail for *sigma*, so "3 sigma" keeps its usual meaning."""
+    return st.NormalDist().cdf(-abs(sigma))
+
+
+def _p_to_sigma(p: float) -> float:
+    """Inverse of :func:`_sigma_to_p`, for reporting a t result on a sigma scale."""
+    if not (0.0 < p < 1.0):
+        return float("inf") if p <= 0.0 else 0.0
+    return -st.NormalDist().inv_cdf(p)
+
+
 def _welch(a: List[float], b: List[float]) -> Dict[str, float]:
     """Welch's t-test for two samples of possibly unequal variance.
+
+    Used by the CLI ``run()`` below, which compares N kernels against a common
+    baseline and therefore has no natural pairing to exploit. The ratchet's
+    two-kernel decision path uses :func:`_paired_stats` instead -- see its
+    docstring for why an unpaired formula is the wrong tool there.
 
     Returns the raw difference, its standard error, and t. With the small rep
     counts used here (3-5) the dof is tiny, so t is a rough guide rather than a
@@ -76,6 +150,56 @@ def _welch(a: List[float], b: List[float]) -> Dict[str, float]:
     }
 
 
+def _paired_stats(base_ms: List[float], cand_ms: List[float]) -> Dict[str, float]:
+    """Paired log-ratio statistics for interleaved base/candidate reps.
+
+    The reps are paired BY CONSTRUCTION -- ``adaptive_paired_verdict`` samples
+    base, cand, base, cand precisely so that whatever the GPU is doing at rep i
+    hits both members of pair i. The estimator has to use that. Welch's
+    two-sample formula, which this replaced, computes ``se = sqrt(var_b/n +
+    var_c/n)``: it cancels drift in the point estimate and then puts it straight
+    back into the error bar, because the two per-kernel variances each contain
+    the shared drift in full.
+
+    Working in logs makes the shared term exactly cancel: if a session-wide
+    factor d_i multiplies both timings of pair i, then
+    ``ln(base_i) - ln(cand_i) = ln(T_base/T_cand)`` with no d_i left in it.
+
+    Measured on the 22 stored verdicts in this repo, base and candidate correlate
+    at a median of +0.72 across reps and the paired standard error is a median
+    0.63x of the Welch one. It is NOT a uniform win: pairing beats Welch exactly
+    when the true correlation is positive (var of the difference is
+    ``s_b^2 + s_c^2 - 2*rho*s_b*s_c``), and 8 of those 22 samples estimated a
+    NEGATIVE correlation from 3 points -- which is a statement about how badly
+    3 points estimate a correlation, not evidence that the drift is not shared.
+    Pairing is the right estimator for how the data is collected; the small-n
+    noise is handled by the honest dof below, not by picking an estimator per run.
+
+    Returns the effect on a percentage scale, its standard error, t against zero,
+    and dof = n-1 (NOT Welch's fractional dof -- one difference per pair).
+    """
+    n = min(len(base_ms), len(cand_ms))
+    # r > 0 means the candidate took LESS time, i.e. the candidate is faster --
+    # the same sign convention the Welch-on-speed version had.
+    r = [math.log(b) - math.log(c) for b, c in zip(base_ms[:n], cand_ms[:n])]
+    mean_r = st.mean(r)
+    se_r = (st.stdev(r) / math.sqrt(n)) if n > 1 else 0.0
+    growth = math.exp(mean_r)
+    return {
+        "mean_log": mean_r,
+        "se_log": se_r,
+        # Delta method: d/dr[(e^r - 1) * 100] = 100 * e^r, so the percentage-scale
+        # error bar is the log-scale one scaled by the same factor. Keeping both on
+        # the same scale is what lets the caller compare rel_pct against se_pct.
+        "rel_pct": (growth - 1.0) * 100.0,
+        "se_pct": se_r * growth * 100.0,
+        "t": (mean_r / se_r) if se_r > 0 else (float("inf") if mean_r > 0
+                                               else -float("inf") if mean_r < 0 else 0.0),
+        "dof": n - 1,
+        "n": n,
+    }
+
+
 def adaptive_paired_verdict(
     reference: Path,
     base_py: Path,
@@ -86,9 +210,9 @@ def adaptive_paired_verdict(
     repeat: int = 100,
     tol: float = 1e-2,
     margin: float = 0.005,
-    min_reps: int = 3,
+    min_reps: int = 5,
     max_reps: int = 8,
-    escalate_k: float = 3.0,
+    sigma: float = 3.0,
     log: Optional[Callable[[str], None]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Decide whether ``cand_py`` beats ``base_py`` by ``margin``, measuring BOTH now.
@@ -119,6 +243,30 @@ def adaptive_paired_verdict(
     since +5% and -5% are both unambiguous against a 0.5% gate while +0.49% sits
     on the line. Only the genuinely close calls pay for ``max_reps``.
 
+    What "sigma" is allowed to mean
+    -------------------------------
+    ``sigma`` is a NORMAL-equivalent significance level (3.0 => one-sided
+    p = 0.00135), and it is enforced through the t distribution at dof = n-1.
+    That distinction is not pedantry, it is most of this function's behaviour.
+    The previous code divided the effect by its standard error and compared the
+    ratio to 3.0 directly, as though a t statistic from three reps were a
+    z score. It is not: at ``min_reps=3`` the paired dof is 2, where a genuine
+    3-sigma tail needs |t| >= 19.2, not 3.0. Replaying the 22 stored verdicts in
+    this repo through the honest test, 2 of the 7 historical base advances fail
+    it -- and they are the +1.40% and +1.87% ones, i.e. the same size as the
+    three advances (+0.90%, +1.12%, +1.18%) that ``utils.verify_chain`` later
+    re-measured at 0.09-0.17% by surgical ablation. The gate was calling noise
+    real, and it was doing so at exactly the magnitude the independent check
+    says was illusory.
+
+    That is also why ``min_reps`` is 5, not 3. dof=2 cannot support any
+    reasonable gate -- the threshold it demands (19.2) rejects effects that are
+    plainly real -- so the fix is not to lower the bar but to buy the dof:
+    dof=4 needs |t| >= 6.6 and dof=7 needs |t| >= 4.5. The extra reps are close
+    to free because ``_one`` no longer times the reference (see ``time_ref`` in
+    ``compile_and_run.compare_and_bench``), which was over half of each rep's GPU
+    time and was discarded unread.
+
     Returns None if measurement fails, so the caller can fall back to the stored
     score rather than lose the round.
 
@@ -132,21 +280,34 @@ def adaptive_paired_verdict(
     base_ms: List[float] = []
     cand_ms: List[float] = []
 
+    p_target = _sigma_to_p(sigma) if sigma > 0 else 1.0
+    log_margin = math.log1p(margin)
+
     def _one(path: Path) -> float:
         # Diagnostic path: measure and report a leaking kernel rather than refuse
         # it. compare_and_bench still restores device state after every call, so
         # one kernel's leak cannot reach the next one measured here.
+        #
+        # time_ref=False: only test_ms is read below, and timing the reference is
+        # the majority of the call's GPU time. Correctness still executes the
+        # reference -- that needs one forward pass, not warmup+repeat of them.
         res = compare_and_bench(reference, path, device_idx=device, warmup=warmup,
-                                repeat=repeat, tol=tol, reject_on_state_leak=False)
+                                repeat=repeat, tol=tol, reject_on_state_leak=False,
+                                time_ref=False)
         return _geo([p["test_ms"] for p in res["per_shape"]])
 
-    def _stats() -> tuple:
-        # Welch on speed (1/time) so "positive" keeps meaning "candidate better".
-        sb = [1.0 / t for t in base_ms]
-        sc = [1.0 / t for t in cand_ms]
-        w = _welch(sc, sb)
-        mean_b = st.mean(sb)
-        return w["rel_diff_pct"], (w["se"] / mean_b * 100.0 if mean_b else float("nan")), w["t"]
+    def _decision_p(s: Dict[str, float]) -> float:
+        """One-sided p for "the effect is on the far side of the margin from here".
+
+        The stopping question is about the DECISION, not the effect: +5% and -5%
+        are both unambiguous against a 0.5% gate, while +0.49% sits on it. So the
+        test statistic is centred on the margin, not on zero.
+        """
+        if s["dof"] < 1:
+            return 1.0
+        if not (s["se_log"] > 0):
+            return 0.0          # zero spread: more reps cannot change the call
+        return _t_sf(abs((s["mean_log"] - log_margin) / s["se_log"]), s["dof"])
 
     try:
         while len(base_ms) < max_reps:
@@ -154,10 +315,10 @@ def adaptive_paired_verdict(
             cand_ms.append(_one(cand_py))
             if len(base_ms) < min_reps:
                 continue
-            rel, se, _t = _stats()
-            if not (se > 0):        # zero variance -- more reps cannot help
+            s = _paired_stats(base_ms, cand_ms)
+            if not (s["se_log"] > 0):   # zero variance -- more reps cannot help
                 break
-            if abs(rel - margin * 100.0) >= escalate_k * se:
+            if _decision_p(s) <= p_target:
                 break
     except Exception as exc:
         say(f"[base] paired re-measure failed ({exc.__class__.__name__}: {exc}); "
@@ -167,11 +328,13 @@ def adaptive_paired_verdict(
     if len(base_ms) < min_reps:
         return None
 
-    rel, se, t = _stats()
+    s = _paired_stats(base_ms, cand_ms)
+    p_one_sided = (_t_sf(s["t"], s["dof"]) if s["dof"] >= 1 else float("nan"))
     return {
-        "rel_pct": rel,
-        "se_pct": se,
-        "t": t,
+        "rel_pct": s["rel_pct"],
+        "se_pct": s["se_pct"],
+        "t": s["t"],
+        "dof": s["dof"],
         "reps": len(base_ms),
         "escalated": len(base_ms) > min_reps,
         "base_ms": st.mean(base_ms),
@@ -179,13 +342,22 @@ def adaptive_paired_verdict(
         "base_ms_all": base_ms,
         "cand_ms_all": cand_ms,
         "margin_pct": margin * 100.0,
-        "beats_margin": rel >= margin * 100.0,
+        "beats_margin": s["rel_pct"] >= margin * 100.0,
+        # The honest significance of the gain against zero, on both the p scale
+        # and the sigma scale the caller's --base_sigma is expressed in. A caller
+        # that compares rel_pct/se_pct to a sigma threshold itself is redoing the
+        # z-score mistake this function exists to correct: use `sigma_ok`.
+        "p_one_sided": p_one_sided,
+        "sigma_equiv": _p_to_sigma(p_one_sided) if p_one_sided == p_one_sided else float("nan"),
+        "sigma_target": sigma,
+        "sigma_ok": (sigma <= 0) or (p_one_sided <= p_target),
+        "method": "paired_log_ratio_t",
         # "Resolved" is about the DECISION, not the effect: a +0.49% that cannot
         # be told apart from a 0.50% gate is unresolved even though the kernel
         # plainly changed something. Rounds 13-20 reported every such case to the
         # next round as a failure, which is why one of them re-ran a mechanism
         # that had in fact been the run's best kernel.
-        "resolved": abs(rel - margin * 100.0) >= 2.0 * se if se > 0 else True,
+        "resolved": _decision_p(s) <= p_target,
     }
 
 

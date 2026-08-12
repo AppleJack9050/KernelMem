@@ -190,7 +190,9 @@ fp32 accumulators throughout, so the reference's numeric class is preserved.
 pre-converted weight hoisted out of the chunk loop, the same TF32 numeric class, and its own
 allocated output so no extra copy is charged to it. Re-run with `cudnn.benchmark = True` — cuDNN's
 strongest configuration — it gives 1.1116×, so this is not an artifact of algorithm selection. The
-one unaccounted confound runs *in cuDNN's favour*, so **1.1161× is a mild lower bound**.
+one unaccounted confound runs *in cuDNN's favour*. Note the direction, though: measuring cuDNN at
+its strongest *lowers* the lever, so **1.1161× is the default-cuDNN figure and 1.1116× is the value
+against cuDNN's best configuration** — an upper and lower bracket, not a floor.
 
 ---
 

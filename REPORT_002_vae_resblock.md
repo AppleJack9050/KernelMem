@@ -10,7 +10,7 @@
 | **Precision** | fp32 in/out, TF32 convolutions |
 | **Test platform** | **NVIDIA GeForce RTX 5090** — 170 SM, 32 GB GDDR7, 1792 GB/s, 104.8 TFLOPS dense TF32. Every SOL evaluation in this report was measured on this GPU, unlocked clocks, torch 2.11.0+cu130 / CUDA 13.0. |
 
-> **Read [§8](#8-what-the-sol-score-actually-says) and [§9](#9-calibration-against-the-real-leaderboard)
+> **Read [§6](#6-what-the-sol-score-actually-says) and [§7](#7-calibration-against-the-real-leaderboard)
 > before quoting any number from this report.**
 > A framework score (e.g. 1.2684×) is a speedup ratio against eager PyTorch over 4 shapes. A SOL
 > score (e.g. 0.736) is anchored to the fastest PyTorch implementation per workload, over all 20.
@@ -18,32 +18,17 @@
 >
 > **Crucially, our 0.736 is NOT comparable to the leaderboard's scores.** Both of our anchors are
 > softer than NVIDIA's — their T_b is 1.96× stronger and their T_SOL 7.9× more aggressive. Scored
-> with their anchors this kernel gets **≈ 0.369**, below the 0.500 baseline. See §9.
+> with their anchors this kernel gets **≈ 0.369**, below the 0.500 baseline. See §7.
 
-*A note on older artifacts: a handful of 2026-07-28 → 2026-08-04 search runs recorded paths under a
-second account and their Nsight profiles carry `NVIDIA H100 PCIe` device IDs (114 SM, 50 MiB L2).
-Those runs are the source of the 1.897× figure and of the §5.04 / §7 profiling tables, and are kept
-here for the engineering analysis. **No SOL score in this report comes from them** — all 17 traced
-evaluations are RTX 5090.*
+> **Scope: RTX 5090 only.** The repository also contains older search runs recorded under a second
+> account, whose Nsight profiles carry `NVIDIA H100 PCIe` device IDs. Those runs — and the 1.897×
+> figure that came from them — are **excluded from this report**: different hardware, and their
+> reference measurements were contaminated by a process-wide persisting-L2 reservation that made the
+> baseline 1.64× slower (documented in `utils/paired_bench.py`). Every number here is RTX 5090.
 
 ---
 
 ## Verdict
-
-**Fastest kernel on the framework's own scoreboard**
-
-```
-run/20260731_134033_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260731_145417.py
-```
-
-Round 6 of a 10-round search. Method: `CUDA_Graph_Capture_Replay_StaticBuffers`, stacked on
-L2-resident batch chunking and cuDNN autotuning. It is the only kernel in the corpus above 1.87×.
-
-| Framework score | Best single shape | Max abs error | SOL score |
-|---|---|---|---|
-| **1.897×** geomean, 4 shapes | **2.32×** (1×256×131×131) | **2.8e-4** (tol 2.8e-3) | **none — never run through the harness** |
-
-### The best kernel, on both metrics
 
 `kernel_20260806_070840.py` — the `own_gemm` lineage, 2026-08-06, RTX 5090.
 
@@ -66,22 +51,13 @@ whichever of four PyTorch variants was fastest on that particular shape (see
 harder than any one of them.
 
 **But it is still ~2× softer than NVIDIA's.** Against the official anchors this kernel scores
-**≈ 0.369**, not 0.736 — see [§9](#9-calibration-against-the-real-leaderboard). The claim that
+**≈ 0.369**, not 0.736 — see [§7](#7-calibration-against-the-real-leaderboard). The claim that
 survives the comparison is about search cost, not score: **1.37× over the reference in ~1.5 hours,
 against a leaderboard SOTA of 4.26× built over 7–14 days — ~32% of SOTA speedup in ~1% of the
 wall-clock.**
 
-### Two other kernels also claim "best", on other metrics
-
-| Claim | Kernel | Value | SOL trace? |
-|---|---|---:|---|
-| **Best overall — framework + SOL** | `kernel_20260806_070840` | 1.2684× · **SOL 0.736** | **yes, 20/20** |
-| Highest framework score ever recorded | `kernel_20260731_145417` | 1.8972× | no — older H100 run |
-| Fastest in absolute time | `kernel_20260804_145432` | 1.028 ms mid shape | no — older H100 run |
-
-Rows 2 and 3 are eager-anchored geometric means over 4 shapes from the older search runs; §7 shows
-why the 1.897× in particular does not survive scrutiny. **Row 1 is the only kernel measured the way
-the benchmark defines**, and it is the number to quote.
+It is the only kernel in this repository measured the way the benchmark defines — 20 workloads,
+per-workload tolerances, an optimized-PyTorch anchor — and it is the number to quote.
 
 ---
 
@@ -280,7 +256,7 @@ Measured on this host: **2.294 ms with those flags vs 2.086 ms without — the b
 slower than plain eager PyTorch.** Meanwhile the winning candidate calls `at::cudnn_convolution`
 with `benchmark = true`. The candidate is allowed to autotune; the baseline is forbidden to.
 
-That is roughly a tenth of the reported 1.897×, given away for free.
+That handicap is given away for free, and it inflates every framework score in the repository.
 
 ### TF32 is *not* an unfairness
 
@@ -329,245 +305,92 @@ On the primary shape `8×256×64×128`, with `T` = one full activation tensor = 
 | Convolution work | 154.6 GFLOP | 2 × 77.3 GFLOP, 2304 MAC/output |
 | Irreducible DRAM traffic | 2 T = 128 MiB | read `x`, write `out` |
 | Eager PyTorch traffic | ≈ 17 T = 1.06 GiB | 7 ops, no fusion, GN reads twice |
-| H100 PCIe DRAM bandwidth | 2.0 TB/s | 17 T ⇒ ~0.55 ms floor from traffic alone |
-| Measured eager latency | 1.62 – 1.66 ms | clean H100 sessions |
+| RTX 5090 DRAM bandwidth | 1792 GB/s | 17 T = 1141 MB ⇒ ~0.64 ms floor from traffic alone |
+| Measured eager latency | 2.375 ms | `round000_reference_profile.txt`, RTX 5090 |
 
 That framing sets the whole strategy. The convolutions are near the tensor-core roofline and are
 not worth rewriting. Everything else — 15 of the 17 tensor passes — is bookkeeping the reference
 pays in DRAM bandwidth, and that is the entire opportunity.
 
 ---
+## 4. The best kernel — architecture and measured attribution
 
-## 4. Architecture of the winning kernel
+```
+run/20260805_132337_vae_block_002_lineages/own_gemm/…/code/kernel_20260806_070840.py
+```
 
-680 lines: five custom CUDA kernels, two vendor convolution calls, a host-side chunk planner, and a
-CUDA graph wrapped around the middle of the pipeline. Per batch chunk:
+593 lines: an owned CUTLASS convolution, five custom CUDA kernels, a host-side chunk planner, and a
+two-stream schedule. Per batch chunk, 9 kernel launches:
 
 ```mermaid
 flowchart LR
-    X["x — NCHW<br/>caller's tensor"] --> K1["K1<br/>NCHW→NHWC<br/>32×33 shared tile"]
-    K1 --> C1
-    subgraph G["CUDA graph — captured once per shape, replayed"]
-      direction LR
-      C1["conv1<br/>cuDNN v8<br/>NHWC TF32"] --> S1["K2 + K3<br/>GN moments fp64<br/>→ scale, shift"]
-      S1 --> K4["K4<br/>affine + SiLU"]
-      K4 --> C2["conv2<br/>cuDNN v8<br/>NHWC TF32"]
-      C2 --> S2["K2 + K3<br/>GN moments fp64<br/>→ scale, shift"]
-    end
-    S2 --> K5["K5 — one pass<br/>affine + SiLU + residual add<br/>+ NHWC→NCHW"]
-    X -. "residual, read from the original NCHW input" .-> K5
-    K5 --> OUT["out — NCHW<br/>freshly allocated"]
+  X["x — NCHW"] --> K1["K1 nchw2nhwc"]
+  K1 --> C1["CUTLASS conv1<br/>TF32 implicit GEMM"]
+  C1 --> M1["K2 gn_partial<br/>K3 gn_finalize"]
+  M1 --> K4["K4 gn_silu"]
+  C1 --> K4
+  K4 --> C2["CUTLASS conv2"]
+  C2 --> M2["K2 gn_partial<br/>K3 gn_finalize"]
+  M2 --> K5["K5 gn_silu_add_nhwc2nchw<br/>affine + SiLU + residual + transpose"]
+  C2 --> K5
+  X -. "residual" .-> K5
+  K5 --> O["out — NCHW"]
 ```
 
-The graph boundary is the load-bearing design choice. K1 and K5 stay **outside** it, so the graph
-never captures the caller's data pointers — the kernel reads the real `x` and writes a fresh `out`
-every call, and stays a correct function of its arguments.
+Each optimization has been measured by ablation — the same kernel with one thing switched off, over
+all 20 workloads, min-of-3, every variant passing 20/20:
 
-| Kernel | Role |
-|---|---|
-| `nchw2nhwc_kernel` (K1) | NCHW → NHWC, `[32][33]` padded shared tile |
-| `gn_partial_kernel` (K2) | per-(n, group) moments into `double2` partials |
-| `gn_finalize_kernel` (K3) | collapse partials, emit per-channel `scale` / `shift` |
-| `gn_silu_kernel` (K4) | affine + SiLU, `float4` vectorised, NHWC → NHWC |
-| `gn_silu_res_t_kernel` (K5) | affine + SiLU + residual + NHWC → NCHW, one pass |
+| Change | Contribution | Mechanism |
+|---|---:|---|
+| **Own the convolution** (CUTLASS vs `at::conv2d`) | **1.1161×** | owns the layout contract and the epilogue; cuDNN cannot be fused into |
+| **Two-stream batch pipelining** | **1.0869×** | conv is at ~105% of nominal TF32 peak while DRAM sits ~11% busy — the tail is recoverable only as concurrency |
+| **Fused GN + SiLU + residual + transpose** | **1.0420×** | 3 tensor passes instead of 7 |
+| Buffer aliasing by liveness | 1.0201× | 2 intermediates instead of 4 |
+| `float4` full-tile path | 1.0156× | removes per-element predication |
+| *CTA tile `128×128×16`* | *1.0865×* | *nested inside owning the conv* |
+| *CTA-occupancy chunk gate* | *1.0694×* | *nested inside pipelining — why pipelining never regresses* |
 
----
+`1.0869 × 1.1161 × 1.0420 = 1.264`, slightly above the whole 1.238× margin over max-autotune, so the
+first three account for essentially the entire win.
 
-## 5. Why it is good — six decisions, each with evidence
-
-### 01 · It does not rewrite the convolution
-
-Both convolutions go to `at::cudnn_convolution` with NHWC inputs, TF32 enabled and
-`benchmark = true`, wrapped in a SFINAE dispatch that falls back to `at::conv2d` if the ATen
-signature is unavailable. Two 256→256 3×3 convolutions at 154.6 GFLOP are already tensor-core work
-at high efficiency; hand-writing them was tried in a parallel lineage (`own_gemm`) and topped out at
-**1.27×** against 1.90× for the vendor path. Knowing which op *not* to touch is the single
-highest-leverage call in this problem.
-
-Autotuning alone — flipping cuDNN benchmark on and locking the plan with warm-up calls — moved the
-score from 1.572 to 1.615 for essentially zero risk.
-
-### 02 · Layout is converted twice, at the boundaries, and never again
-
-cuDNN wants NHWC; the caller hands over NCHW and expects NCHW back. Instead of paying
-`.contiguous(channels_last)` around each conv, the kernel transposes once on the way in (K1) and
-folds the transpose back into the final apply kernel (K5). Both use a `[32][33]` shared-memory tile
-— the padded stride kills bank conflicts — so both directions stay fully coalesced.
-
-K5 is where the fusion pays off: it reads the second convolution's NHWC output, applies the
-GroupNorm affine, applies SiLU, adds the residual read directly from the original NCHW input, and
-writes NCHW — **four reference ops and a layout change in one pass over memory**.
-
-### 03 · GroupNorm is split so the expensive part runs once
-
-A GroupNorm needs two passes by nature: one to reduce, one to apply. The naive structure costs three
-tensor passes (read for stats, read for apply, write). This kernel splits it into `gn_partial` (a
-deterministic fixed-partition reduction into per-chunk moments), `gn_finalize` (a tiny kernel that
-collapses partials and precomputes per-channel `scale = γ·rstd` and `shift = β − μ·γ·rstd`), and
-then an apply that is pure FMA. Because `scale`/`shift` are materialised, the apply fuses into
-whatever pass is already happening — K4 before conv2, K5 at the very end.
-
-> **Numerics — better than the reference, not merely within tolerance.**
-> Partial sums accumulate in `double2` and finalisation runs in fp64. The partition is fixed and
-> index-ordered, with no atomics, so results are **bit-reproducible run to run**. Measured error
-> against the reference is 2.8e-4 max / 5.4e-7 mean, against a 2.8e-3 tolerance — roughly a 10×
-> margin, and most of that gap is the TF32 convolution, not the norm.
-
-### 04 · The batch is chunked to make L2 the working memory
-
-This is the structural idea. `plan_chunk()` sizes a batch chunk so that two live intermediates fit
-in ~40 MiB — 80% of the H100's 50 MiB L2 — then runs the whole seven-stage pipeline on that chunk
-before moving on. On the mid shape a sample is 8 MiB, so `chunk = 2` and the block runs four times.
-
-```c
-// chunk sizing, with three guards that matter
-chunk = 40 MiB / (2 * per_sample_bytes);        // two intermediates live
-while (N % chunk) --chunk;                      // snap DOWN to a divisor of N
-while (chunk*HW < 16384 && chunk < N) ...       // don't starve the conv
-if (N*per_sample <= 40 MiB) chunk = N;          // small inputs: don't chunk at all
-```
-
-The effect is visible in the profiler. Before chunking, every elementwise kernel ran at 73–82% of
-DRAM peak — saturated, streaming everything from memory. After chunking, the same kernels sit at
-30–36% DRAM: the bytes are still moving, but they are moving through L2. Reference DRAM traffic of
-~17 T collapses to roughly 3–4 T of genuine DRAM traffic.
-
-| Kernel | seed dur | seed DRAM % | chunked dur | chunked DRAM % |
-|---|---:|---:|---:|---:|
-| `nchw2nhwc` (K1) | 68.5 µs | 81.6 | 44.5 µs | **32.0** |
-| `gn_partial` (K2) | 42.3 µs | 80.6 | 15.1 µs | 55.8 |
-| `gn_silu` (K4) | 69.2 µs | 80.6 | 19.7 µs | **45.8** |
-| `gn_silu_res_t` (K5) | 127.6 µs | 73.5 | 63.3 µs | **35.5** |
-
-*Nsight Compute, primary shape, H100. Chunked durations are per chunk of 2 samples versus 8, so the
-per-kernel work is 4× smaller — the point is the DRAM column, not the duration column.*
-
-**This decision does not survive [§7](#7-where-the-1897-does-not-hold-up).** It made the mid shape
-30% slower in absolute time; the DRAM drop is real but the score improvement was not.
-
-### 05 · A CUDA graph over the interior only
-
-Chunking multiplies launches: four chunks × seven kernels × two convolutions is roughly 500
-host-side launches per forward. The profiler showed exactly what that costs — `gn_finalize` reported
-2 084 active cycles inside 7 759 elapsed, i.e. **73% of its wall time was launch and tail latency**,
-at 0.04 waves per SM.
-
-An earlier attempt captured the *whole* forward into a graph and regressed on all four shapes,
-because a graph cannot see caller pointers, so it had to copy the entire input into a static buffer
-— 134 MB of added traffic on the mid shape. The winning kernel draws the boundary differently:
-capture `conv1 … gn_finalize2` only. K1 writes into the static buffer before replay; K5 reads from
-static scratch and writes to a fresh allocation after. Per call the only copies are the ~4.7 MB of
-weights.
-
-| Kernel | launches, chunked | launches, graph | Δ |
-|---|---:|---:|---|
-| `nchw2nhwc` (K1) | 48 | 48 | outside graph |
-| `gn_partial` (K2) | 96 | **6** | −94% |
-| `gn_finalize` (K3) | 96 | **6** | −94% |
-| `gn_silu` (K4) | 48 | **3** | −94% |
-| `gn_silu_res_t` (K5) | 48 | 48 | outside graph |
-
-*Nsight Systems, 12 benchmark iterations. The residual 3–6 launches are the warm-up and capture
-calls; every steady-state execution of those kernels is now a graph node.*
-
-The payoff scales inversely with problem size, which is exactly the signature of a launch-overhead
-fix rather than a throughput fix: **−12.5%** on the small shape, **−9.5%** on the awkward 131×131
-shape, **−2.8%** on the large shape, **−1.5%** on the mid shape.
-
-### 06 · It degrades instead of breaking
-
-Five independent fallbacks, all reached without an error: unsupported dtype/rank/channel-count drops
-to the eager reference; a failed graph capture drops to a monolithic C++ path; a missing ATen cuDNN
-signature drops to `at::conv2d`; the chunk planner snaps to a divisor of N so no chunk is ever
-partial; state is keyed by `(shape, dtype, device, eps)` and the cache clears at 8 entries. The
-131×131 shape — chosen by the harness precisely because `H·W = 17 161` is odd and divides by no tile
-size — is this kernel's **best** shape at 2.32×.
+**Full detail, including the computation graph, the utilization table and the per-workload
+breakdown, is in [`WHY_002_BEATS_TORCH_COMPILE.md`](WHY_002_BEATS_TORCH_COMPILE.md).**
 
 ---
 
-## 6. How the search got there
+## 5. How the search got there
 
-| Round | Kernel | Method | Score | Mid-shape test |
-|---:|---|---|---:|---:|
-| 0 | `kernel_20260731_134632` | seed | 1.5717 | 1.170 ms |
-| 2 | `kernel_20260731_141719` | `cudnn_algo_autotune` | 1.6149 | 1.118 ms |
-| 3 | `kernel_20260731_142829` | `stream_pipeline_overlap` | 1.6168 | **1.092 ms** |
-| 4 ⚠️ | `kernel_20260731_143719` | `l2_resident_batch_blocking` | 1.7448 | **1.419 ms** |
-| 6 ⚠️ | `kernel_20260731_145417` | `CUDA_Graph_Capture_Replay` | **1.8972** | 1.398 ms |
-| 9 ⚠️ | `kernel_20260731_152132` | `CUDA_Graph_Capture_Replay` | 1.8618 | 1.369 ms |
+The `own_gemm` lineage, run by `run_lineages.py` as one of three structurally distinct plans
+(`keep_vendor`, `own_gemm`, `own_winograd`). Each lineage is a separate process with its own base
+kernel and its own ratchet, so a structurally new kernel is compared only against its own history.
 
-⚠️ These rows share a defect described in [§7](#7-where-the-1897-does-not-hold-up). Note that round
-4's score rose while its absolute latency got 30% worse.
+| Round | Method | Score |
+|---:|---|---:|
+| 0 | seed | 1.2063 |
+| 1 | `mainloop_tile_retune` | 1.2084 |
+| 2 | `l2_persist_chunk_fusion` | failed to run |
+| 3 | re-seed | 1.1298 |
+| **4** | **`stream_pipeline_overlap`** | **1.2684** |
+| 5 | `cta_tile_quantization_retune` | 1.2590 |
+| 6 | `l2_resident_chunk_sizing` | 1.2649 |
+| 7 | `atomic_privatize` | 1.2630 |
 
-Per-shape detail for the winner:
+The winner's parent is the **r0 seed**, not r1 — it is exactly *seed + `stream_pipeline_overlap`*,
+with every CUDA kernel body byte-identical to the seed. The seed therefore carries the CUTLASS conv,
+the NHWC layout, the fused epilogue and the buffer aliasing as one bundle; only ablation can
+decompose it, which is what §4's table does.
 
-| Shape | Reference | Kernel | Speedup | Max abs err |
-|---|---:|---:|---:|---:|
-| 8×256×64×128 *(primary)* | 2.712 ms | 1.398 ms | 1.94× | 2.80e-4 |
-| 2×256×64×64 *(small)* | 0.365 ms | 0.237 ms | 1.54× | 2.19e-4 |
-| 4×256×256×256 *(large)* | 10.580 ms | 5.650 ms | 1.87× | 3.42e-4 |
-| 1×256×131×131 *(awkward)* | 1.021 ms | 0.440 ms | **2.32×** | 5.84e-4 |
+A later round reached 1.2690 (`checkpoint.json` `last_score_for_curve`) — 0.05% above round 4, far
+inside the ±0.5% noise floor. The ratchet did not promote it.
 
----
-
-## 7. Where the 1.897× does not hold up
-
-> **Finding.** Rounds 4–9 inflated their own scores by making the *reference* slower. The reference
-> latency on the primary shape sat at 1.638–1.662 ms for rounds 0–3, then jumped to 2.699–2.712 ms
-> for every round from 4 onward and never came back — a 1.64× step change in a measurement that
-> should be constant.
-
-The mechanism is in the source. Round 4 introduced the persisting-L2 machinery and calls, in a
-static initialiser that runs exactly once and is never undone:
-
-```c
-cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, p->persistingL2CacheMaxSize);
-// H100 PCIe: max_persisting_l2_cache_size = 32 768 000 B of a 52 428 800 B L2
-// = 31.25 MB of 50 MB carved out, process-wide, for the rest of the run
-```
-
-Round 6 compounds it. In the graph path the access-policy window is set on both the ambient and
-capture streams with `missProp = cudaAccessPropertyStreaming` — marking every access *outside* the
-window as evict-first — and, unlike the monolithic path, the graph path never clears it. The
-reference model is then benchmarked in the same process, on the same stream, with two thirds of L2
-reserved and its own accesses tagged evict-first.
-
-**This is already documented in the repo.** `utils/paired_bench.py` names this exact case:
-
-> *"on 2026-07-31 this tool reported vae_block_002 round 6 as +9.35%, t=+7.33, REAL over round 3,
-> when round 6 was in fact 1.28× SLOWER in absolute time."*
-
-The numbers reproduce exactly — round 3 at 1.092 ms against round 6 at 1.398 ms is 1.280×. That
-file's conclusion is the right one: **rank on absolute `test_ms`, never on `score`**, because each
-kernel's denominator is measured separately and a kernel that sabotages the reference outranks one
-that is genuinely faster.
-
-### What survives
-
-- **The graph gain is real.** Rounds 4 and 6 were measured under identical pollution, so comparing
-  them is fair: +8.7% geomean, concentrated in the small and awkward shapes exactly as a
-  launch-overhead fix should be.
-- **L2-resident chunking, as shipped, is a regression.** It moved the mid shape from 1.092 ms to
-  1.419 ms. The DRAM-throughput drop in §5.04 is real, but the chunk size starves the elementwise
-  kernels — waves per SM fall from 17.96 to 4.49 — and the vendor convolution loses more from four
-  small calls than L2 residency gives back.
-- **The absolute level 1.897× is not comparable** to any kernel measured against a clean reference.
-
-### Reference latency splits into three regimes
-
-Confirming that `score` values are not comparable across runs at all:
-
-| Regime | Reference latency (mid shape) |
-|---|---:|
-| Clean H100 | 1.60 – 1.65 ms |
-| H100 with the persisting-L2 pollution | ~2.70 ms |
-| RTX 5090 | 2.23 – 2.43 ms |
-
-Ranking any two kernels by `score` across regimes is meaningless.
+> **Why lineages exist.** `run_lineages.py` records the measurement that motivated them: on this
+> problem the seed decided **93.5%** of the final score while 21 optimization rounds decided 7%, and
+> the spread between seed draws was 10–41%. The search budget was going almost entirely into the
+> small term.
 
 ---
 
-## 8. What the SOL score actually says
+## 6. What the SOL score actually says
 
 ### The framework score is not a SOL score
 
@@ -578,11 +401,11 @@ score = math.exp(sum(math.log(v) for v in per_shape_speedups) / len(per_shape_sp
 ```
 
 That is the geometric mean of four `T_ref / T_k` latency ratios against the eager reference. It
-reproduces bit-for-bit from `eval_0008.json` (1.8972226100009641). `compile_and_run.py` never
+reproduces bit-for-bit from the lineage's own eval records. `compile_and_run.py` never
 imports any SOL machinery — `grep -c "sol_score\|sol_execbench"` returns 0.
 
-A SOL score is bounded in [0, 1]. **1.897 cannot be one.** And the kernel that scored it has no SOL
-trace at all — no `traces.jsonl` anywhere in the repo corresponds to `kernel_20260731_145417`.
+A SOL score is bounded in [0, 1]. **A framework score such as 1.2684 cannot be one**, and the two are
+not convertible.
 
 The real SOL path is a separate, manually-invoked code path in `solbench_bridge/evaluate.pyc`, which
 imports `sol_execbench.sol_score` and calls it only when `status == 'PASSED'` and both anchors are
@@ -630,7 +453,8 @@ compiled ratio 0.66-0.77 on trace lines 1-8 and the eager ratio 0.94-1.02 on lin
 **Read `0.736` as: the best kernel beats the fastest PyTorch implementation on every shape by
 1.21×, and closes 74% of the distance from that baseline to the roofline.** Twenty workloads, same-session reference,
 correctness enforced per-workload at the benchmark's own tolerances, all on the RTX 5090. That is a
-harder and more defensible claim than 1.897×, even though it is a smaller-looking number.
+harder and more defensible claim than any eager-anchored framework score, even though it is a
+smaller-looking number.
 
 Measured 2026-08-09 by running `kernel_20260806_070840.py` through `solbench_bridge.evaluate`; the
 kernel needed the standard `prebuild_agent8.py` step first, because the harness blocks
@@ -780,7 +604,7 @@ the table above — possible at all.
 
 ---
 
-## 9. Calibration against the real leaderboard
+## 7. Calibration against the real leaderboard
 
 **The single most important section for anyone quoting a number from this report.** Everything above
 is anchored to baselines we built ourselves, because NVIDIA does not publish T_b, T_SOL, or the
@@ -882,54 +706,15 @@ line of CUDA, and it is the highest-value thing to chase: it would make the loca
 *and* hand the search a far harder target to beat.
 
 ---
-
-## 10. The fastest kernel by absolute time
-
-```
-run/20260804_135540_vae_block_002_lineages/keep_vendor/…/code/kernel_20260804_145432.py
-```
-
-Scored 1.7098× — lower on paper, but measured against a reference of 1.617 ms that matches the clean
-1.638–1.662 ms band, and it runs the primary shape in **1.028 ms**. That is faster in absolute time
-than every kernel in the winning lineage, including the 1.398 ms of the nominal champion.
-
-| Kernel | Score | Ref (mid) | Test (mid) | Reference clean? |
-|---|---:|---:|---:|---|
-| `kernel_20260804_145432` | 1.7098 | 1.617 ms | **1.028 ms** | yes |
-| `kernel_20260731_142829` (r3) | 1.6168 | 1.646 ms | 1.092 ms | yes |
-| `kernel_20260731_141719` (r2) | 1.6149 | 1.662 ms | 1.118 ms | yes |
-| `kernel_20260731_145417` (r6) | **1.8972** | **2.712 ms** | 1.398 ms | **no — 31.25 MB carved out** |
-
-It reaches that by taking the same ideas without the chunking:
-
-- No batch chunking, no persisting-L2 reservation — the whole batch runs in one pass.
-- The graph covers *everything*, including both convolutions and the layout kernels.
-- Pointer indirection instead of static input buffers: a 7-slot `int64` device table holds the
-  addresses of `x` and all six parameters, dereferenced inside the kernels, so the graph captures no
-  data addresses and the per-call cost is a 56-byte H2D write. This is strictly better than round
-  6's 4.7 MB weight copy.
-- Weight layout conversion is itself a custom kernel, so `.contiguous(channels_last)` never bakes a
-  host pointer into the graph.
-
-> **Two caveats on this kernel.** It returns the graph's static output buffer, so the tensor from
-> call *n* is overwritten by call *n+1* — fine for a benchmark loop, a real aliasing hazard in a
-> pipeline that holds activations. Round 6 allocates a fresh output every call and does not have
-> this problem. It also trips the harness's state-leak detector by flipping
-> `torch.backends.cudnn.benchmark` to `True` globally, which speeds up the reference too — that one
-> works against its own score, not for it.
-
-Neither this kernel nor round 6 has ever been scored on all 20 workloads.
-
----
-
-## 11. Corrections needed in `run/vae_block_002/`
+## 8. Corrections needed in `run/vae_block_002/`
 
 Six discrepancies found while auditing the SOL artifacts. Listed most-misleading first.
 
-1. **Two GPUs are mixed in one tree with no marker.** The 1.897× runs are H100 PCIe under
-   `/home/elek/KernelMem`; every SOL artifact is RTX 5090 under `/home/otter77/git_project/KernelMem`.
-   8 of 20 run directories are `elek` runs, 11 are `otter77` runs.
-   `tasks/vae_block_002.py:26` still hardcodes `/home/elek/...` as the `SOLBENCH_SRC` default.
+1. **Two GPUs are mixed in one run tree with no marker.** 8 of 20 run directories were recorded on
+   a second machine (H100 PCIe, paths under `/home/elek/KernelMem`); 11 are RTX 5090 under
+   `/home/otter77/git_project/KernelMem`. Nothing in the tree distinguishes them, so scores from the
+   two are silently comparable-looking and are not. `tasks/vae_block_002.py:26` still hardcodes
+   `/home/elek/...` as the `SOLBENCH_SRC` default. **This report excludes the non-5090 runs entirely.**
 
 2. **`RESULTS_handwritten.txt` and `RESULTS_anchored.txt` print the wrong formula** under a
    "SOL score" heading. They show `T_SOL / T_k` — roofline efficiency, which ignores T_b entirely —
@@ -979,7 +764,7 @@ which kernel produced it is the human-chosen directory name.
 
 ---
 
-## 12. What is still on the table
+## 9. What is still on the table
 
 1. ~~**Score the champion.**~~ **Done, 2026-08-09.** `kernel_20260806_070840` (1.2684×) now has a
    full 20-workload trace at **SOL 0.736** (fastest-PyTorch anchor), replacing `agent8b`'s 0.618 as
@@ -990,11 +775,9 @@ which kernel produced it is the human-chosen directory name.
    the opposite direction from `agent_best`, which went 1.0804× in-loop → 0.935× over 20 workloads.
    **The proxy is unreliable in both directions; there is no substitute for running the harness.**
 
-   Still unscored: `kernel_20260804_145432` (fastest absolute) and `kernel_20260731_145417`
-   (1.897×), both from the older H100 runs. Re-timing them on the 5090 would make the whole corpus
-   comparable on one machine.
+   Every kernel this report cites now has a 20-workload SOL trace on the RTX 5090.
 
-2. **Build a T_b that matches NVIDIA's — the highest-value item in this list.** §9 shows their
+2. **Build a T_b that matches NVIDIA's — the highest-value item in this list.** §7 shows their
    PyTorch-only scoring baseline is **2.172× over the reference** while the best of four
    `torch.compile` modes here manages **1.109×**. A ~2× better PyTorch implementation therefore
    exists and is reachable without writing CUDA. Finding it would (a) make every local SOL score
@@ -1042,8 +825,8 @@ All figures come from artifacts in this repository.
 | **Best kernel + its SOL trace** | `run/20260805_132337_vae_block_002_lineages/own_gemm/…/kernel_20260806_070840.py` → `run/vae_block_002/out_owngemm_1p2684/` |
 | SOL traces (17 candidates) | `run/vae_block_002/out*/traces.jsonl` |
 | Prebuild step (harness blocks `load_inline`) | `run/vae_block_002/prebuild_agent8.py` |
-| Winning kernel + lineage | `run/20260731_134033_vae_block_002_claude_claude-opus-5/vae_block_002/` |
+| Winning kernel + lineage | `run/20260805_132337_vae_block_002_lineages/own_gemm/…/vae_block_002/` |
 | NCU metrics / launch counts | `.../profile/kernel_*_ncu.csv`, `kernel_*_nsys.csv` |
-| Absolute-time best | `run/20260804_135540_vae_block_002_lineages/keep_vendor/…/` |
+| Ablation traces (7 variants + control, 3 repeats) | `run/vae_block_002/out_abl_*/` |
 | Drift & pollution analysis | `utils/paired_bench.py`, `utils/verify_chain.py`, `utils/device_state.py` |
 | Prior methodology audit | `run/vae_block_002/methodology_review.md` |

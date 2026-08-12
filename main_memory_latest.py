@@ -127,33 +127,42 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "cross-round, so the margin must sit below the attenuated value. Re-derive "
                         "this for a different GPU or task. Use 0 to accept any improvement, or a "
                         "large value to pin the base to the seed (the pre-fix behaviour).")
-    p.add_argument("--base_reps", type=int, default=3,
+    p.add_argument("--base_reps", type=int, default=5,
                    help="Interleaved repeats used to compare a candidate against the base. The "
                         "base is re-measured alongside the candidate instead of being read from "
                         "a score stored when it last advanced, because that stored number goes "
                         "stale: one unchanged kernel re-measured 30 min later on RTX 5090 read "
-                        "+1.06%%, twice the --base_margin it feeds. 3 reps resolve ~0.4%%, which "
-                        "settles most rounds outright.")
+                        "+1.06%%, twice the --base_margin it feeds. Was 3; raised to 5 because "
+                        "the paired test has dof = reps-1 and dof=2 cannot support --base_sigma "
+                        "at all -- a true 3-sigma tail on 2 dof needs |t| >= 19.2, against 6.6 on "
+                        "4 dof and 4.5 on 7. The extra reps are close to free: the paired path no "
+                        "longer times the reference (time_ref=False), which was over half of each "
+                        "rep and was discarded unread.")
     p.add_argument("--base_max_reps", type=int, default=8,
                    help="Cap on interleaved repeats when the decision is close. Reps are added "
-                        "only while the measured difference sits within 3 standard errors of "
-                        "--base_margin, so clear wins and clear losses stop at --base_reps and "
-                        "only genuine coin-flips pay for precision. On rounds 13-20 of the exp3 "
-                        "run six of seven candidates (-0.66%% to -11.06%%) would stop early and "
-                        "one (+0.49%%) would escalate. At 3.6 s per measurement that is roughly "
-                        "+4%% on an 8.6-minute round. Set 0 to disable the paired re-measure and "
-                        "compare against the stored base score, as before.")
+                        "only while the measured difference cannot be separated from "
+                        "--base_margin at --base_sigma (evaluated on the t distribution at the "
+                        "reps actually taken), so clear wins and clear losses stop at "
+                        "--base_reps and only genuine coin-flips pay for precision. On rounds "
+                        "13-20 of the exp3 run six of seven candidates (-0.66%% to -11.06%%) "
+                        "would stop early and one (+0.49%%) would escalate. Set 0 to disable the "
+                        "paired re-measure and compare against the stored base score, as before.")
     p.add_argument("--base_sigma", type=float, default=3.0,
-                   help="How many standard errors above ZERO a paired gain must sit before it may "
-                        "advance the base. --base_margin asks 'is it big enough'; this asks 'are we "
-                        "sure it is a gain at all', and a point estimate alone cannot answer the "
-                        "second. Calibrated by re-measuring the exp3 chain paired: the two real "
-                        "advances came back at 6.6 and 8.6 sigma while the three that had been "
-                        "adopted on drift came back at -2.1, -1.7 and +0.9, so anything in 1..6 "
-                        "separates them and 3 sits in the middle. It matters most on noisy kernels "
-                        "-- multi-stream ones run ~5x noisier -- where a +0.6%% reading with 0.4%% "
-                        "standard error clears a 0.5%% margin at only 1.5 sigma. Set 0 to decide on "
-                        "the margin alone.")
+                   help="How significant a paired gain must be, in NORMAL-equivalent sigmas, "
+                        "before it may advance the base. --base_margin asks 'is it big enough'; "
+                        "this asks 'are we sure it is a gain at all', and a point estimate alone "
+                        "cannot answer the second. Calibrated by re-measuring the exp3 chain "
+                        "paired: the two real advances came back at 6.6 and 8.6 sigma while the "
+                        "three that had been adopted on drift came back at -2.1, -1.7 and +0.9, "
+                        "so anything in 1..6 separates them and 3 sits in the middle. It matters "
+                        "most on noisy kernels -- multi-stream ones run ~5x noisier -- where a "
+                        "+0.6%% reading with 0.4%% standard error clears a 0.5%% margin at only "
+                        "1.5 sigma. NOTE: this is now enforced through the t distribution at "
+                        "dof = --base_reps-1, not by comparing rel/se to the number directly. "
+                        "Those differ enormously at these rep counts -- 3.0 sigma means |t| >= "
+                        "19.2 at dof 2, 6.6 at dof 4, 4.5 at dof 7 -- and the old z-score reading "
+                        "let 2 of 7 historical advances through at t~4.8 and t~13.8 on dof 2. "
+                        "Set 0 to decide on the margin alone.")
     p.add_argument("--structural_grace", type=int, default=0,
                    help="Rounds a DECLARED structural rewrite may hold the base while it is "
                         "still slower than the kernel it displaced (0 = off, the ratchet-only "
@@ -1165,7 +1174,8 @@ def _load_checkpoint(task_root: Path) -> Optional[Dict[str, Any]]:
 
 def _paired_verdict_worker(reference: str, base_py: str, cand_py: str,
                            device_idx: int, warmup: int, repeat: int, tol: float,
-                           margin: float, min_reps: int, max_reps: int, conn) -> None:
+                           margin: float, min_reps: int, max_reps: int, conn,
+                           sigma: float = 3.0) -> None:
     """Subprocess entry for the paired base re-measure. String paths only, so
     nothing unpicklable crosses the Pipe."""
     import torch
@@ -1178,7 +1188,7 @@ def _paired_verdict_worker(reference: str, base_py: str, cand_py: str,
         out = adaptive_paired_verdict(
             _P(reference), _P(base_py), _P(cand_py),
             device=device_idx, warmup=warmup, repeat=repeat, tol=tol,
-            margin=margin, min_reps=min_reps, max_reps=max_reps)
+            margin=margin, min_reps=min_reps, max_reps=max_reps, sigma=sigma)
         conn.send(("ok", out))
     except Exception as e:
         conn.send(("err", f"{e.__class__.__name__}: {e}"))
@@ -1192,6 +1202,7 @@ def _paired_verdict_worker(reference: str, base_py: str, cand_py: str,
 def _paired_base_verdict(reference: Path, base_py: Path, cand_py: Path, *,
                          device_idx: int, warmup: int, repeat: int, tol: float,
                          margin: float, min_reps: int, max_reps: int,
+                         sigma: float = 3.0,
                          timeout: int = 1800) -> Optional[Dict[str, Any]]:
     """Re-measure the base and the candidate together, and return the verdict.
 
@@ -1226,7 +1237,8 @@ def _paired_base_verdict(reference: Path, base_py: Path, cand_py: Path, *,
         p = ctx.Process(
             target=_paired_verdict_worker,
             args=(str(reference), str(base_py), str(cand_py), device_idx,
-                  warmup, repeat, tol, margin, min_reps, max_reps, child_conn),
+                  warmup, repeat, tol, margin, min_reps, max_reps, child_conn,
+                  sigma),
         )
         p.start()
         try:
@@ -2665,7 +2677,8 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         task_path, Path(_base_path), Path(_cand_path),
                         device_idx=args.device, warmup=args.warmup, repeat=args.repeat,
                         tol=args.tol, margin=args.base_margin,
-                        min_reps=args.base_reps, max_reps=args.base_max_reps)
+                        min_reps=args.base_reps, max_reps=args.base_max_reps,
+                        sigma=args.base_sigma)
 
                 if _verdict is not None:
                     # Two independent questions, two gates. `beats_margin` is a
@@ -2678,18 +2691,34 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     # zero standard error means there is nothing to resolve, so it
                     # passes rather than blocking on a division.
                     _se = _verdict["se_pct"]
+                    # The significance decision belongs to the verdict, not here.
+                    # rel_pct/se_pct is a t statistic on dof = reps-1, and this
+                    # site used to compare it to --base_sigma as though it were a
+                    # z score: at 3 reps (dof 2) a true 3-sigma tail needs |t| >=
+                    # 19.2, so the old gate was roughly 6x more permissive than it
+                    # advertised. adaptive_paired_verdict now evaluates the t
+                    # distribution at the right dof and reports `sigma_ok`, with
+                    # `sigma_equiv` being what the observed t is really worth.
+                    # `_sig` is kept for the pre-sigma_ok fallback path only.
                     _sig = (_verdict["rel_pct"] / _se) if (_se and _se > 0) else float("inf")
-                    _sig_ok = (args.base_sigma <= 0) or (_sig >= args.base_sigma)
+                    if "sigma_ok" in _verdict:
+                        _sig_ok = bool(_verdict["sigma_ok"])
+                        _sig_shown = _verdict.get("sigma_equiv", _sig)
+                    else:
+                        _sig_ok = (args.base_sigma <= 0) or (_sig >= args.base_sigma)
+                        _sig_shown = _sig
                     should_update_base = bool(_verdict["beats_margin"]) and _sig_ok
                     _paired_note = (
                         f"paired {_verdict['rel_pct']:+.2f}% +/-{_verdict['se_pct']:.2f}% "
-                        f"({_sig:.1f} sigma, t={_verdict['t']:+.1f}, {_verdict['reps']} reps"
+                        f"({_sig_shown:.1f} sigma equiv, t={_verdict['t']:+.1f} on "
+                        f"{_verdict.get('dof', '?')} dof, {_verdict['reps']} reps"
                         f"{', escalated' if _verdict['escalated'] else ''}, "
                         f"{'resolved' if _verdict['resolved'] else 'UNRESOLVED'}; "
                         f"{_verdict['base_ms']:.4f} -> {_verdict['cand_ms']:.4f} ms)")
                     if _verdict["beats_margin"] and not _sig_ok:
                         _paired_note += (f" -- clears the margin but is under "
-                                         f"--base_sigma {args.base_sigma:.1f}, so it is "
+                                         f"--base_sigma {args.base_sigma:.1f} at "
+                                         f"{_verdict.get('dof', '?')} dof, so it is "
                                          f"not separable from noise")
                     # Persist it: an unresolved near-miss looks identical to a
                     # regression in the round record otherwise, which is exactly
@@ -2716,7 +2745,9 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         if _kn and _kn.stem in optimization_tree:
                             optimization_tree[_kn.stem]["paired_verdict"] = {
                                 k: _verdict[k] for k in
-                                ("rel_pct", "se_pct", "t", "reps", "resolved")
+                                ("rel_pct", "se_pct", "t", "dof", "reps", "resolved",
+                                 "p_one_sided", "sigma_equiv", "sigma_ok", "method")
+                                if k in _verdict
                             }
                     except Exception as _exc:
                         print(f"[base] Warning: could not attach paired verdict to "

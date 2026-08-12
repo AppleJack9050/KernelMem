@@ -685,12 +685,27 @@ def compare_and_bench(
     log_dir: str | Path | None = "run/debug",
     seed: int = 100,  # Fixed default seed; set it to None to read the seed from the env instead
     reject_on_state_leak: bool = True,
+    time_ref: bool = True,
 ) -> Dict[str, Any]:
     """
     Benchmark *test_py* against *ref_py*.
 
     Reads get_init_inputs() only from the reference script, and uses the same init args for ref/test.
     Also: fixed randomness + parameter alignment (supports the Model→ModelNew dedicated aligner & generic alignment).
+
+    *time_ref* controls whether the REFERENCE is timed. It must stay True for any
+    caller that reads ``score`` or ``speedup`` -- those are ``T_ref / T_test`` and
+    have no meaning without it. Pass False when only the candidate's absolute time
+    is wanted, and ``ref_ms``/``speedup``/``score`` come back None rather than
+    fabricated.
+
+    Why the switch exists: the reference is timed at the full warmup+repeat count
+    on every shape, and it is the SLOWER side by construction (that is what a
+    speedup above 1 means), so it is the majority of the benchmark's GPU time.
+    ``utils.paired_bench`` consumes only ``test_ms`` and threw all of it away --
+    on a 1.2x kernel over this repo's four shapes that is ~55% of every rep, paid
+    3-8 times per ratchet decision. Correctness still runs the reference, but that
+    needs ONE forward pass for the output comparison, not warmup+repeat of them.
     """
     import os
     import contextlib
@@ -975,7 +990,11 @@ def compare_and_bench(
             # so an end-of-round diff would always come back clean.
             _leaks = device_state.diff(_clean_state, device_state.snapshot())
             device_state.restore(_clean_state)
-            ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)
+            # The restore above must precede BOTH timings, so skipping the
+            # reference cannot let the candidate's leaked state reach its own
+            # measurement -- the ordering, not the reference run, is what guards
+            # that. See time_ref in the docstring.
+            ref_t  = _bench(ref_model, inp, dev, warmup, repeat) if time_ref else []
             test_t = _bench(test_model, inp, dev, warmup, repeat)
 
             if TORCH_DEVICE == "cuda":
@@ -992,9 +1011,9 @@ def compare_and_bench(
 
             per_shape = [{
                 "shape": _shape_tag(inp),
-                "ref_ms": _avg(ref_t),
+                "ref_ms": _avg(ref_t) if time_ref else None,
                 "test_ms": _avg(test_t),
-                "speedup": _avg(ref_t) / _avg(test_t),
+                "speedup": (_avg(ref_t) / _avg(test_t)) if time_ref else None,
                 "max_abs_err": max_err,
                 "primary": True,
             }]
@@ -1037,13 +1056,13 @@ def compare_and_bench(
                     if e_note:
                         raise ValueError(e_note)
                     device_state.restore(_clean_state)   # same rule per shape
-                    e_rt = _bench(ref_model,  extra, dev, warmup, repeat)
+                    e_rt = _bench(ref_model, extra, dev, warmup, repeat) if time_ref else []
                     e_tt = _bench(test_model, extra, dev, warmup, repeat)
                     per_shape.append({
                         "shape": _shape_tag(extra),
-                        "ref_ms": _avg(e_rt),
+                        "ref_ms": _avg(e_rt) if time_ref else None,
                         "test_ms": _avg(e_tt),
-                        "speedup": _avg(e_rt) / _avg(e_tt),
+                        "speedup": (_avg(e_rt) / _avg(e_tt)) if time_ref else None,
                         "max_abs_err": e_err,
                         "primary": False,
                     })
@@ -1060,8 +1079,14 @@ def compare_and_bench(
 
             # Geometric mean over shapes: each shape weighs equally, so a large
             # shape cannot dominate the score simply by taking longer.
-            _sp = [s["speedup"] for s in per_shape]
-            score = math.exp(sum(math.log(v) for v in _sp) / len(_sp))
+            # Undefined without a reference timing -- None, never a stand-in, so a
+            # caller that wanted a score and forgot time_ref fails loudly here
+            # rather than ranking on a fabricated number.
+            if time_ref:
+                _sp = [s["speedup"] for s in per_shape]
+                score = math.exp(sum(math.log(v) for v in _sp) / len(_sp))
+            else:
+                score = None
 
             # The scores above are already honest -- every reference was timed
             # from _clean_state. But a candidate that leaks device state is still
@@ -1099,7 +1124,7 @@ def compare_and_bench(
             "min": min(ref_t),
             "max": max(ref_t),
             "all": ref_t,
-        },
+        } if ref_t else None,
         "test_latency_ms": {
             "avg": sum(test_t) / len(test_t),
             "min": min(test_t),
