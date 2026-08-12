@@ -34,8 +34,8 @@ from prompts.judger_optimization_memory_latest import build_judger_optimization_
 from utils.gpu_lock import gpu_section
 from utils.torch_ext_cache import sweep_stale_batons, sweep_unheld_batons
 from utils import run_timing
-from utils.mcgs import (MonteCarloGraphSearch, load_code_features, reward_from_gain,
-                        state_key)
+from utils.mcgs import (MechanismPrior, MonteCarloGraphSearch, load_code_features,
+                        reward_from_gain, state_key)
 
 # ---------------------------------------------------------------------------
 # Serialize every GPU-touching entry point behind one cross-process mutex.
@@ -250,6 +250,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "rounds 0-4 and 5-9, then 0%% for rounds 10-14, 15-19 and 20-24 -- zero "
                         "wins in 22 edges past round 10. Calibrated on vae_block_002; re-derive it "
                         "before trusting it on a task whose kernels have more structural room.")
+    p.add_argument("--mcgs_prior", default="",
+                   help="Path to a mechanism prior fitted by "
+                        "scripts/build_mechanism_prior.py. With one loaded, selection "
+                        "switches from UCT to PUCT: the exploration term is weighted "
+                        "by how much each mechanism has historically paid on this "
+                        "task, instead of counting visits blind. Measured "
+                        "leave-one-run-out on vae_block_002: rho +0.324 against the "
+                        "held-out gain and a 58%%/47%% top-third win rate, where a "
+                        "node's OWN score predicts yield at rho +0.02. Empty (the "
+                        "default) keeps plain UCT -- a close cousin of this idea "
+                        "(bound-type focus routing) lost its A/B at SOL 0.500 vs "
+                        "0.516, so this is opt-in and wants its own A/B.")
+    p.add_argument("--mcgs_c_prior", type=float, default=1.0,
+                   help="PUCT exploration weight, used only when --mcgs_prior is set: "
+                        "U = Q + c_prior * P(a) * sqrt(N_parent) / (1 + N_child).")
     p.add_argument("--mcgs_reward_scale", type=float, default=3.0,
                    help="Percent gain that maps to a near-saturated reward via tanh(rel/scale). "
                         "At 3.0: 0%% -> 0.50, +1%% -> 0.58, +3%% -> 0.88. The reward is the PAIRED "
@@ -1526,7 +1541,31 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         c_puct=args.mcgs_c_puct, lam=args.mcgs_lam,
         widen_k=args.mcgs_widen_k, widen_alpha=args.mcgs_widen_alpha,
         max_depth=args.mcgs_max_depth, reward_scale=args.mcgs_reward_scale,
-        state_key_mode=args.mcgs_state_key, merge_tolerance=args.mcgs_merge_tol)
+        state_key_mode=args.mcgs_state_key, merge_tolerance=args.mcgs_merge_tol,
+        c_prior=args.mcgs_c_prior)
+    if _use_mcgs and getattr(args, "mcgs_prior", ""):
+        _pp = Path(args.mcgs_prior)
+        if not _pp.exists():
+            print(f"[mcgs] WARNING: --mcgs_prior {_pp} does not exist; continuing with "
+                  f"plain UCT. Fit one with scripts/build_mechanism_prior.py.", flush=True)
+        else:
+            try:
+                graph.prior = MechanismPrior.from_dict(
+                    json.loads(_pp.read_text(encoding="utf-8")))
+            except Exception as _exc:
+                print(f"[mcgs] WARNING: could not read the prior ({_exc}); continuing "
+                      f"with plain UCT.", flush=True)
+            if graph.prior is not None and graph.prior.table:
+                _top = ", ".join(f"{m} {a:+.2f}%(n={n})"
+                                 for m, a, n in graph.prior.ranked(4))
+                print(f"[mcgs] PUCT prior loaded from {_pp}: "
+                      f"{len(graph.prior.table)} mechanisms, fitted on "
+                      f"{graph.prior.fitted_on} edges. Top: {_top}", flush=True)
+                if graph.prior.note:
+                    print(f"[mcgs]   fit: {graph.prior.note}", flush=True)
+            else:
+                print(f"[mcgs] WARNING: the prior at {_pp} is empty; plain UCT it is.",
+                      flush=True)
     # Live objects for the graph's state representatives. The graph stores kernel
     # NAMES (it has to be JSON-serialisable for the checkpoint), and selection
     # needs `.code`/`.code_path`, so names are resolved through here and fall

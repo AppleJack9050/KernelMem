@@ -1,0 +1,66 @@
+{
+  "table": {
+    "mem_vectorize": [
+      0.790991406184502,
+      2
+    ],
+    "cudnn_algo_autotune": [
+      2.040439434464589,
+      2
+    ],
+    "stream_pipeline_overlap": [
+      0.39291777929905425,
+      6
+    ],
+    "atomic_privatize": [
+      -0.035627671078988676,
+      2
+    ],
+    "CUDA_Graph_Capture_Replay_StaticBuffers": [
+      -0.6057022797335807,
+      18
+    ],
+    "cudnn_plan_select": [
+      -1.0402232677754446,
+      3
+    ],
+    "l2_cache_blocking": [
+      -1.5070906167705942,
+      7
+    ],
+    "multistream_pipeline": [
+      0.7664711947342169,
+      3
+    ],
+    "cuda_graph_capture": [
+      1.2914040294693536,
+      3
+    ],
+    "cudnn_conv_engine_autotune": [
+      0.6513002845529665,
+      3
+    ],
+    "stream_stage_interlock_pipelining": [
+      -3.4243968830106972,
+      3
+    ],
+    "reduction_kernel_fusion_lastblock": [
+      -5.471611154272395,
+      3
+    ],
+    "l2_evict_policy_hints": [
+      0.3692349672245272,
+      3
+    ],
+    "coalesced_tile_transpose": [
+      -1.176476248741218,
+      2
+    ]
+  },
+  "global_mean": 0.5272716074575272,
+  "kappa": 0.0,
+  "tau": 2.0,
+  "repeat_penalty": 0.25,
+  "fitted_on": 86,
+  "note": "task=vae_block_002 runs=10 edges=86 max_round=9 kappa=0.0 min_support=2"
+}

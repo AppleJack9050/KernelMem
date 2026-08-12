@@ -184,6 +184,46 @@ def main() -> None:
               f"{ii['switches']:>2} switches, mean N {gg.stats()['mean_N']:.2f}, "
               f"best {gg.best().rep_value:.4f}")
 
+    print("\n[replay] the shipped prior defaults still reproduce their claimed signal")
+    # The one number that justifies --mcgs_prior existing. Guarded rather than
+    # trusted: a defaults change or a refit that quietly drops rho would otherwise
+    # leave the flag recommending itself on evidence it no longer has.
+    try:
+        import sys as _sys
+        from pathlib import Path as _P
+        _sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
+        from scripts.build_mechanism_prior import collect as _collect, _spearman
+        from utils.mcgs import MechanismPrior as _MP
+        _edges = _collect(_P("run"), "vae_block_002", 9)
+    except Exception as _exc:
+        _edges = []
+        print(f"  skipped: run history unavailable ({_exc.__class__.__name__})")
+    if len(_edges) >= 40:
+        _runs = sorted({e["run"] for e in _edges})
+        _pr, _tr = [], []
+        for _held in _runs:
+            _m = _MP.fit([(e["mech"], e["gain"]) for e in _edges if e["run"] != _held],
+                         min_support=1)
+            for _e in (x for x in _edges if x["run"] == _held):
+                if _m.support(_e["mech"]) > 0:
+                    _pr.append(_m.advantage(_e["mech"])); _tr.append(_e["gain"])
+        _rho = _spearman(_pr, _tr)
+        _ord = sorted(range(len(_pr)), key=lambda i: -_pr[i])
+        _top = _ord[: max(1, len(_ord) // 3)]
+        _prec = sum(1 for i in _top if _tr[i] > 1) / len(_top)
+        _base = sum(1 for g in _tr if g > 1) / len(_tr)
+        print(f"  leave-one-run-out: n={len(_pr)}/{len(_edges)} runs={len(_runs)} "
+              f"rho={_rho:+.3f} top-third {_prec*100:.0f}% vs base {_base*100:.0f}%")
+        _check(_rho > 0.20,
+               f"the prior still predicts held-out gain (rho={_rho:+.3f} > 0.20)")
+        _check(_prec > _base,
+               f"and still beats the base win rate ({_prec*100:.0f}% > {_base*100:.0f}%)")
+        _check(len(_runs) >= 5,
+               f"cross-validated across enough distinct runs ({len(_runs)}) -- a "
+               f"run-grouping bug once collapsed these to 6 and flipped rho to -0.171")
+    elif _edges:
+        print(f"  skipped: only {len(_edges)} edges available")
+
     print("\n[replay] all checks passed")
     print("NOTE: this proves the mechanics, not that MCGS wins. Run the live A/B "
           "(--search mcgs vs --search ratchet, matched --round, one task) for that.")

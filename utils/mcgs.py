@@ -201,6 +201,179 @@ def reward_from_gain(rel_pct: Optional[float], *, scale: float = 3.0,
 
 
 @dataclass
+class MechanismPrior:
+    """Historical advantage per optimization mechanism, as a PUCT prior.
+
+    Why this exists
+    ---------------
+    Selection had no predictive signal about where the next gain would come from.
+    Measured over the saved runs, a node's OWN score correlates with the gain it
+    yields at rho = +0.02 -- i.e. not at all. So UCT was ranking branch points on
+    a quantity that does not predict what it is being used to predict.
+
+    A per-mechanism average does carry signal. Leave-one-RUN-out over the 108
+    scored edges that name a method (a held-out run has no memory of itself):
+
+        global mechanism prior   rho = +0.485, top-third win rate 50% vs base 34%
+        state-conditioned (kNN)  rho = +0.373, top-third 18% vs base 19% -- no lift
+
+    The state-conditioned form is JitRL's Eq. 4-7 and it buys nothing here,
+    because the code-feature vector carries about two bits (see the state-key
+    measurement above). The simple global average is the useful object, so that
+    is what this is.
+
+    Two corrections the raw average needs
+    -------------------------------------
+    * SUPPORT FLOOR, not shrinkage. The obvious correction for "the mechanisms
+      driving the top third have n=3" is to shrink each estimate toward zero by
+      n/(n+kappa). Swept leave-one-run-out, that makes it monotonically WORSE:
+
+          kappa    0     1     2     5    10
+          rho   +.324 +.214 +.209 +.169 +.118
+
+      The reason is visible in the table it produces. The n=3 mechanisms really
+      are good (3/3 wins each) while the n=18 one -- CUDA_Graph_Capture_Replay_
+      StaticBuffers, median -0.56% -- really is mediocre, so shrinking by support
+      pulls the informative estimates toward the mean and leaves the uninformative
+      one at full size. `kappa` is kept as a knob and defaults to 0. What DOES
+      help is a hard floor: dropping n=1 mechanisms (min_support=2) raises
+      top-third precision from 58%/47% to 59%/42% at a coverage cost of 7 points.
+    * ROUND CONFOUND. Win rate is 42% in rounds 0-9 and 0% after, so part of the
+      raw rho is the exhaustion cliff rather than anything about mechanisms.
+      Controlling for it (rounds 0-9 only) the signal drops to rho = +0.324 and a
+      +11 point precision lift. `max_depth` already handles the cliff, so the
+      prior must not be credited with it twice -- fit with `max_round` set to the
+      productive window rather than over everything.
+
+    Coverage is 73%: 47 distinct mechanism names over 108 edges, 27 of them
+    appearing exactly once. On the rest the prior has no estimate and returns
+    0.0, which is silence, not a negative opinion.
+    """
+    # mechanism -> (shrunk advantage in %, support count)
+    table: Dict[str, Tuple[float, int]] = field(default_factory=dict)
+    global_mean: float = 0.0
+    kappa: float = 0.0        # shrinkage; 0 = off, measured best (see docstring)
+    tau: float = 2.0          # softmax temperature over advantages, in % units
+    repeat_penalty: float = 0.25   # multiplier for a mechanism already on the path
+    fitted_on: int = 0
+    note: str = ""
+
+    @classmethod
+    def fit(cls, observations: Sequence[Tuple[str, float]], *, kappa: float = 0.0,
+            tau: float = 2.0, min_support: int = 2,
+            repeat_penalty: float = 0.25, note: str = "") -> "MechanismPrior":
+        """Fit from (mechanism, gain_pct) pairs.
+
+        *min_support* drops mechanisms seen fewer times than this outright rather
+        than shrinking them: a single observation carries no information about a
+        mean, and including it only adds names whose advantage is one sample of a
+        distribution with a 5% standard deviation.
+        """
+        by: Dict[str, List[float]] = {}
+        for mech, gain in observations:
+            m = str(mech).strip()
+            if m and isinstance(gain, (int, float)) and math.isfinite(gain):
+                by.setdefault(m, []).append(float(gain))
+        if not by:
+            return cls(note=note)
+        allg = [g for v in by.values() for g in v]
+        gm = sum(allg) / len(allg)
+        table: Dict[str, Tuple[float, int]] = {}
+        for m, v in by.items():
+            n = len(v)
+            if n < max(1, min_support):
+                continue
+            raw = (sum(v) / n) - gm
+            table[m] = (raw * (n / (n + max(kappa, 0.0))), n)
+        return cls(table=table, global_mean=gm, kappa=kappa, tau=tau,
+                   repeat_penalty=repeat_penalty, fitted_on=len(allg), note=note)
+
+    def advantage(self, mechanism: Optional[str]) -> float:
+        """Shrunk historical advantage of a mechanism, in percent. 0.0 if unknown."""
+        if not mechanism:
+            return 0.0
+        got = self.table.get(str(mechanism).strip())
+        return got[0] if got else 0.0
+
+    def support(self, mechanism: Optional[str]) -> int:
+        got = self.table.get(str(mechanism).strip()) if mechanism else None
+        return got[1] if got else 0
+
+    def weights(self, mechanisms: Sequence[Optional[str]],
+                already_applied: Sequence[str] = ()) -> List[float]:
+        """Normalised PUCT priors over a candidate list, summing to 1.
+
+        A mechanism already on the path is damped rather than removed. Removing
+        it outright would forbid a legitimate second application (a wider tile
+        after a different change made it fit); damping only makes it earn its way
+        back. The measured case for damping: the only repeat-mechanism states in
+        the run history pooled kernels from 0.3404 to 1.1635 speedup, i.e.
+        reapplying the same method behaved erratically.
+        """
+        seen = {str(m).strip() for m in already_applied if m}
+        adv = []
+        for m in mechanisms:
+            a = self.advantage(m)
+            if m and str(m).strip() in seen:
+                a = a * self.repeat_penalty if a > 0 else a
+            adv.append(a)
+        t = max(self.tau, 1e-6)
+        mx = max(adv) if adv else 0.0
+        ex = [math.exp((a - mx) / t) for a in adv]
+        s = sum(ex)
+        return [e / s for e in ex] if s > 0 else [1.0 / max(len(adv), 1)] * len(adv)
+
+    def ranked(self, limit: int = 10) -> List[Tuple[str, float, int]]:
+        return sorted(((m, a, n) for m, (a, n) in self.table.items()),
+                      key=lambda t: -t[1])[:limit]
+
+    def hint(self, already_applied: Sequence[str] = (), limit: int = 5) -> str:
+        """Prompt-side view: what has paid here, and what is already spent.
+
+        Not wired into the optimization prompt by this module. Selection can only
+        re-rank children that already exist, so steering GENERATION is where the
+        prior would have more leverage -- but that changes what the model is asked
+        for, which belongs in an A/B of its own rather than riding along.
+        """
+        if not self.table:
+            return "(no mechanism history available)"
+        seen = {str(m).strip() for m in already_applied if m}
+        up = [(m, a, n) for m, a, n in self.ranked(limit * 3) if a > 0 and m not in seen][:limit]
+        down = [(m, a, n) for m, a, n in reversed(self.ranked(10_000)) if a < 0][:limit]
+        out = []
+        if up:
+            out.append("Historically paid on this task: " +
+                       ", ".join(f"{m} ({a:+.2f}%, n={n})" for m, a, n in up))
+        if down:
+            out.append("Historically lost: " +
+                       ", ".join(f"{m} ({a:+.2f}%, n={n})" for m, a, n in down))
+        if seen:
+            out.append("Already applied on this path: " + ", ".join(sorted(seen)))
+        return "\n".join(out) or "(no mechanism history available)"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"table": {m: [a, n] for m, (a, n) in self.table.items()},
+                "global_mean": self.global_mean, "kappa": self.kappa, "tau": self.tau,
+                "repeat_penalty": self.repeat_penalty, "fitted_on": self.fitted_on,
+                "note": self.note}
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> Optional["MechanismPrior"]:
+        if not d or not isinstance(d, dict):
+            return None
+        tbl = {}
+        for m, v in (d.get("table") or {}).items():
+            try:
+                tbl[str(m)] = (float(v[0]), int(v[1]))
+            except Exception:
+                continue
+        return cls(table=tbl, global_mean=float(d.get("global_mean") or 0.0),
+                   kappa=float(d.get("kappa", 0.0)), tau=float(d.get("tau", 2.0)),
+                   repeat_penalty=float(d.get("repeat_penalty", 0.25)),
+                   fitted_on=int(d.get("fitted_on") or 0), note=str(d.get("note") or ""))
+
+
+@dataclass
 class StateNode:
     """One state in the DAG. Statistics are pooled over every kernel in it."""
     key: str
@@ -288,7 +461,9 @@ class MonteCarloGraphSearch:
                  widen_k: float = 1.0, widen_alpha: float = 0.5,
                  max_depth: int = 10, reward_scale: float = 3.0,
                  state_key_mode: str = "mechanisms",
-                 merge_tolerance: float = 0.15) -> None:
+                 merge_tolerance: float = 0.15,
+                 prior: Optional[MechanismPrior] = None,
+                 c_prior: float = 1.0) -> None:
         self.nodes: Dict[str, StateNode] = {}
         self.root: Optional[str] = None
         self.c_puct = float(c_puct)
@@ -299,6 +474,8 @@ class MonteCarloGraphSearch:
         self.reward_scale = float(reward_scale)
         self.state_key_mode = str(state_key_mode)
         self.merge_tolerance = float(merge_tolerance)
+        self.prior = prior
+        self.c_prior = float(c_prior)
         self.splits = 0            # merges refused on the value guard
         self.total_visits = 0
 
@@ -416,12 +593,31 @@ class MonteCarloGraphSearch:
                 return Selection(node, path,
                                  f"progressive widening: {len(kids)} child state(s) < "
                                  f"budget {budget} at N={node.N}")
-            logN = math.log(max(node.N, 1))
-            best, best_u = None, -float("inf")
-            for c in kids:
-                u = c.q(self.lam) + self.c_puct * math.sqrt(logN / max(c.N, 1))
-                if u > best_u:
-                    best, best_u = c, u
+            # PUCT when a mechanism prior is loaded, plain UCT otherwise.
+            #
+            # UCT's exploration term is blind to WHAT a child did -- it only counts
+            # how often it was visited, so with ~30 evaluations it spreads budget
+            # evenly over children that are not equally promising. PUCT weights
+            # that term by a prior, and the measured prior here is the historical
+            # advantage of the mechanism that produced each child. Mechanisms
+            # already applied on the path are damped inside `weights`, so the
+            # prior cannot recommend the same edit all the way down a branch.
+            if self.prior is not None and self.prior.table:
+                applied = self.path_mechanisms(path)
+                P = self.prior.weights([c.via for c in kids], already_applied=applied)
+                sqrtN = math.sqrt(max(node.N, 1))
+                best, best_u = None, -float("inf")
+                for c, p in zip(kids, P):
+                    u = c.q(self.lam) + self.c_prior * p * sqrtN / (1 + c.N)
+                    if u > best_u:
+                        best, best_u = c, u
+            else:
+                logN = math.log(max(node.N, 1))
+                best, best_u = None, -float("inf")
+                for c in kids:
+                    u = c.q(self.lam) + self.c_puct * math.sqrt(logN / max(c.N, 1))
+                    if u > best_u:
+                        best, best_u = c, u
             if best is None:
                 return Selection(node, path, "no child scored; expanding here")
             node = best
@@ -480,6 +676,7 @@ class MonteCarloGraphSearch:
             "mean_N": (sum(n.N for n in self.nodes.values()) / n_nodes) if n_nodes else 0.0,
             "total_visits": self.total_visits,
             "max_depth_seen": max((n.depth for n in self.nodes.values()), default=0),
+            "prior_mechanisms": len(self.prior.table) if self.prior else 0,
         }
 
     # -------------------------------------------------------------- persistence
@@ -494,8 +691,13 @@ class MonteCarloGraphSearch:
                 "reward_scale": self.reward_scale,
                 "state_key_mode": self.state_key_mode,
                 "merge_tolerance": self.merge_tolerance,
+                "c_prior": self.c_prior,
             },
             "splits": self.splits,
+            # Persisted so a resumed run selects with the SAME prior it started
+            # with. Re-reading the prior file on resume would silently change the
+            # search policy mid-run if the file had been refitted since.
+            "prior": self.prior.to_dict() if self.prior is not None else None,
             "nodes": {k: n.to_dict() for k, n in self.nodes.items()},
         }
 
@@ -508,9 +710,11 @@ class MonteCarloGraphSearch:
                 max_depth=int(p.get("max_depth", 10)),
                 reward_scale=float(p.get("reward_scale", 3.0)),
                 state_key_mode=str(p.get("state_key_mode", "mechanisms")),
-                merge_tolerance=float(p.get("merge_tolerance", 0.15)))
+                merge_tolerance=float(p.get("merge_tolerance", 0.15)),
+                c_prior=float(p.get("c_prior", 1.0)))
         if not d:
             return g
+        g.prior = MechanismPrior.from_dict(d.get("prior"))
         g.root = d.get("root")
         g.total_visits = int(d.get("total_visits") or 0)
         g.splits = int(d.get("splits") or 0)
@@ -591,6 +795,58 @@ if __name__ == "__main__":
     _check(gm.splits == 1, "the refusal is counted")
     _check(all(len({m for m in n.members}) <= 2 for n in gm.nodes.values()),
            "no state silently accumulates mismatched members")
+
+    print("[mcgs] mechanism prior")
+    obs = ([("good", 5.0)] * 4 + [("bad", -4.0)] * 4 + [("meh", 0.2)] * 4
+           + [("rare", 9.0)])
+    pr = MechanismPrior.fit(obs, min_support=2)
+    _check(pr.advantage("good") > pr.advantage("meh") > pr.advantage("bad"),
+           "advantage orders mechanisms by their measured gain")
+    _check(pr.support("rare") == 0 and pr.advantage("rare") == 0.0,
+           "a mechanism under min_support is dropped, not guessed at")
+    _check(pr.advantage("never_seen") == 0.0,
+           "an unknown mechanism scores 0.0 -- silence, not a negative opinion")
+    _check(pr.kappa == 0.0,
+           "shrinkage defaults OFF: the sweep made it monotonically worse "
+           "(rho +0.324 at kappa=0 down to +0.118 at kappa=10)")
+    _sh = MechanismPrior.fit(obs, kappa=10.0, min_support=2)
+    _check(abs(_sh.advantage("good")) < abs(pr.advantage("good")),
+           "kappa still shrinks when asked for explicitly")
+
+    w = pr.weights(["good", "bad", "meh"])
+    _check(abs(sum(w) - 1.0) < 1e-9, "weights normalise to 1")
+    _check(w[0] > w[2] > w[1], "the best mechanism carries the most prior mass")
+    w_rep = pr.weights(["good", "bad", "meh"], already_applied=["good"])
+    _check(w_rep[0] < w[0],
+           "a mechanism already on the path is damped rather than removed")
+    _check(w_rep[0] > 0.0, "...but can still be re-selected if nothing else looks better")
+    _check(all(x > 0 for x in pr.weights([None, None])),
+           "an all-unknown candidate set degrades to uniform, never to zeros")
+
+    _rt = MechanismPrior.from_dict(json.loads(json.dumps(pr.to_dict())))
+    _check(abs(_rt.advantage("good") - pr.advantage("good")) < 1e-12,
+           "the prior survives a JSON round trip")
+
+    print("[mcgs] PUCT selection uses the prior; UCT still runs without one")
+    gp = MonteCarloGraphSearch(prior=pr, c_prior=1.0, widen_k=0.0, widen_alpha=0.0)
+    gp.observe(key="R", kernel_name="s", kernel_path="/s", value=1.0)
+    gp.observe(key="G", kernel_name="a", kernel_path="/a", value=1.0,
+               parent_key="R", mechanism="good")
+    gp.observe(key="B", kernel_name="b", kernel_path="/b", value=1.0,
+               parent_key="R", mechanism="bad")
+    for k in ("R", "G", "B"):
+        gp.backup([k], 0.5)          # identical Q, so only the prior can break the tie
+    _check(gp.select().node.key == "G",
+           "with equal Q, PUCT descends to the historically better mechanism")
+    gu = MonteCarloGraphSearch(prior=None, widen_k=0.0, widen_alpha=0.0)
+    for key, mech, parent in (("R", None, None), ("G", "good", "R"), ("B", "bad", "R")):
+        gu.observe(key=key, kernel_name=key, kernel_path=f"/{key}", value=1.0,
+                   parent_key=parent, mechanism=mech)
+    for k in ("R", "G", "B"):
+        gu.backup([k], 0.5)
+    _check(gu.select() is not None, "selection still works with no prior loaded (UCT)")
+    _check(gp.stats()["prior_mechanisms"] == 3 and gu.stats()["prior_mechanisms"] == 0,
+           "stats report whether a prior is in play")
 
     print("[mcgs] graph mechanics")
     g = MonteCarloGraphSearch(max_depth=3, widen_k=1.0, widen_alpha=0.5)
