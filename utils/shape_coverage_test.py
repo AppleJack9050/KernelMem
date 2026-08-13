@@ -73,6 +73,29 @@ SHAPES = [
 ]
 
 
+PROBLEM = REPO / "solbench_problems/L1/002_vae_conv3x3_groupnorm_silu_residual_fused"
+
+
+def all_shapes() -> List[Tuple[str, str, bool]]:
+    """Every workload in the problem, labelled, with a flag for 'currently scored'.
+
+    Reading the suite rather than a hardcoded list matters because the scored set
+    is a moving target -- it changed twice on 2026-08-12 -- while the suite does
+    not. `scored` is resolved against ref_0.py as it stands right now, so the
+    column always reflects the live configuration instead of a stale snapshot.
+    """
+    import json as _json
+    wkls = [_json.loads(l) for l in (PROBLEM / "workload.jsonl").read_text().splitlines() if l.strip()]
+    ref_src = (REPO / "ref_0.py").read_text()
+    out = []
+    for w in wkls:
+        a = w["axes"]
+        label = f"b{a['batch_size']} {a['height']}x{a['width']}"
+        out.append((label, w["uuid"], w["uuid"] in ref_src))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
 def sol_score(t_k: float, t_b: float, t_sol: float) -> float:
     gap = t_b - t_sol
     if gap <= 0:
@@ -108,8 +131,11 @@ def _bench_paired(fn_a, fn_b, warmup: int, reps: int):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel", default=str(BEST))
-    ap.add_argument("--warmup", type=int, default=5)
+    ap.add_argument("--warmup", type=int, default=12,
+                    help="12 by default: the split-K kernel autotunes (variant, split_k) on the\nfirst call for each new problem shape and needs the warmup to absorb that search")
     ap.add_argument("--reps", type=int, default=15)
+    ap.add_argument("--all", action="store_true",
+                    help="every workload in the suite, not just the six hand-picked ones")
     a = ap.parse_args()
 
     import torch
@@ -131,8 +157,9 @@ def main() -> None:
     print(f"{'workload':<14} {'scored?':>8} {'t_sol':>8} {'t_b':>8} {'t_ref':>8} "
           f"{'t_kern':>8} {'vs eager':>9} {'score_stored':>13} {'score_live':>11}")
 
+    shapes = all_shapes() if a.all else SHAPES
     rows = []
-    for label, uuid, scored in SHAPES:
+    for label, uuid, scored in shapes:
         t_sol = tsol[uuid]["t_sol_ms"]
         t_b = base[uuid]["t_b_ms"]
         # Rebuild the workload dict from the reference definition; only the axes
@@ -183,6 +210,7 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     if rows:
+        print(f"\n{len(rows)} workloads measured")
         sc = [r for r in rows if r[1]]
         un = [r for r in rows if not r[1]]
         print("\n=== VERDICT ===")

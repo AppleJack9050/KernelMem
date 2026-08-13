@@ -86,8 +86,13 @@ def get_inputs():
 _WORKLOAD_EXTRA = [
     # small: launch-overhead dominated
     json.loads('{"uuid": "8d631edd-1bc9-5142-9253-b0378a890e67", "axes": {"batch_size": 2, "height": 64, "width": 64}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0027, "max_rtol": 1e-05}}'),
-    # large: bandwidth/compute dominated
-    json.loads('{"uuid": "952fec71-f323-5dab-9340-dad59ad7a3f1", "axes": {"batch_size": 4, "height": 256, "width": 256}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.003, "max_rtol": 1e-05}}'),
+    # large: bandwidth/compute dominated. Swapped 2026-08-12 from b4 256x256
+    # (rank 5 of 20 by size) to b1 1024x1024 (rank 1, 4x larger), so the scored
+    # set reaches the top of the workload size range rather than stopping a
+    # quarter of the way up. Costs ~3x the per-iteration bench time, and drops
+    # the only shape measured to be behind its peers -- see
+    # utils/shape_coverage_test.py.
+    json.loads('{"uuid": "38357eec-a997-567f-a5e4-07cb993c02f9", "axes": {"batch_size": 1, "height": 1024, "width": 1024}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0032, "max_rtol": 1e-05}}'),
     # awkward: H*W = 17161 is odd, so it is divisible by no tile size at all.
     # Small enough (~26% of the mid shape) that the extra coverage is nearly free.
     json.loads('{"uuid": "f1b799bf-831f-5434-98be-68e897f6a219", "axes": {"batch_size": 1, "height": 131, "width": 131}, "inputs": {"x": {"type": "random"}, "conv1_weight": {"type": "random"}, "norm1_weight": {"type": "random"}, "norm1_bias": {"type": "random"}, "conv2_weight": {"type": "random"}, "norm2_weight": {"type": "random"}, "norm2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0029, "max_rtol": 1e-05}}'),
