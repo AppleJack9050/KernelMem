@@ -115,18 +115,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup", type=int, default=25, help="Warm-up iterations")
     p.add_argument("--repeat", type=int, default=100, help="Timed iterations per benchmark")
     p.add_argument("--tol", type=float, default=1e-2, help="Max |err| tolerated")
-    p.add_argument("--base_margin", type=float, default=0.005,
+    p.add_argument("--base_margin", type=float, default=0.05,
                    help="Relative margin a kernel must beat the current base by to become the new "
-                        "base for later optimization rounds (0.005 = 0.5%%). Too low and the base "
+                        "base for later optimization rounds (0.05 = 5%%). Too low and the base "
                         "churns on measurement jitter; too high and optimization keeps restarting "
-                        "from the seed instead of compounding. Default measured on RTX 5090 / "
-                        "vae_block_002: within-session noise is 0.15-0.80%% stdev (kernel-dependent -- "
-                        "multi-stream kernels are ~5x noisier), but scores are compared ACROSS "
-                        "rounds, where GPU-state drift of +0.9..+1.7%% attenuates real gains. A "
-                        "verified +1.26%% same-session improvement showed up as only +0.57%% "
-                        "cross-round, so the margin must sit below the attenuated value. Re-derive "
-                        "this for a different GPU or task. Use 0 to accept any improvement, or a "
-                        "large value to pin the base to the seed (the pre-fix behaviour).")
+                        "from the seed instead of compounding. Use 0 to accept any improvement, or "
+                        "a large value to pin the base to the seed (the pre-fix behaviour). "
+                        "NOTE this margin also gates the --patience plateau stop, so raising it "
+                        "shortens runs unless --patience is raised with it. "
+                        "Noise floor measured 2026-08-13 on RTX 5090 / vae_block_002 "
+                        "(utils/process_spread.py, 8 fresh processes, autotune config pinned, "
+                        "hundreds of reps, clocks at stock): between-process CV 0.3-1.4%% "
+                        "(b8 64x128 is the worst at 1.4%% and throws ~4%% outliers), with NO "
+                        "measurable cross-round drift -- slopes of +-0.15%%/process with "
+                        "inconsistent signs -- because each candidate is benchmarked in a fresh "
+                        "short-lived subprocess and the thermal ramp never builds. So ~1%% is "
+                        "noise on any shape and ~3%% is noise on b8 64x128; 5%% demands a win "
+                        "several times the floor. Earlier help text here justified 0.5%% from "
+                        "'+0.9..+1.7%% cross-round drift' -- that figure came from a single "
+                        "process holding the GPU under continuous load for minutes and does NOT "
+                        "describe this harness. Re-derive for a different GPU or task.")
     p.add_argument("--base_reps", type=int, default=5,
                    help="Interleaved repeats used to compare a candidate against the base. The "
                         "base is re-measured alongside the candidate instead of being read from "
