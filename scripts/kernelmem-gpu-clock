@@ -1,0 +1,66 @@
+#!/bin/bash
+# Root-owned wrapper granting exactly one privilege: pin / release a GPU clock.
+#
+# Installed to /usr/local/sbin by scripts/install_clock_lock_sudoers.sh and
+# granted NOPASSWD there. It exists so the sudoers rule does not have to name
+# nvidia-smi with wildcards: sudo's `*` matches spaces, so a rule like
+#   NOPASSWD: /usr/bin/nvidia-smi -i * -lgc *
+# also matches `nvidia-smi -i 0 -lgc 2700,2700 -f /etc/sudoers`, and nvidia-smi's
+# -f writes its output to that file AS ROOT. That is a root escalation, not a
+# benchmarking convenience.
+#
+# This script therefore accepts a fixed grammar and validates every argument
+# against it before anything is executed. Anything else exits non-zero.
+#
+#   kernelmem-gpu-clock lock    <gpu-index> <mhz>  pin core clock to <mhz>
+#   kernelmem-gpu-clock lockmem <gpu-index> <mhz>  pin memory clock to <mhz>
+#   kernelmem-gpu-clock unlock  <gpu-index>        release both pins
+#   kernelmem-gpu-clock status  <gpu-index>        current core clock
+set -euo pipefail
+
+SMI=/usr/bin/nvidia-smi
+[[ -x "$SMI" ]] || SMI=$(command -v nvidia-smi) || { echo "nvidia-smi not found" >&2; exit 2; }
+
+usage() {
+  echo "usage: $(basename "$0") {lock <idx> <mhz>|lockmem <idx> <mhz>|unlock <idx>|status <idx>}" >&2
+  exit 2
+}
+
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+op=${1:-}; idx=${2:-}
+[[ -n "$op" && -n "$idx" ]] || usage
+is_uint "$idx" || { echo "gpu index must be a non-negative integer" >&2; exit 2; }
+(( idx <= 15 )) || { echo "gpu index out of range" >&2; exit 2; }
+
+case "$op" in
+  lock)
+    mhz=${3:-}
+    is_uint "$mhz" || { echo "mhz must be a non-negative integer" >&2; exit 2; }
+    # Guard rails: below ~200 MHz the card is unusable, above 4000 no shipping
+    # part accepts it. Keeps a typo from pinning the GPU to 1 MHz for a day.
+    (( mhz >= 200 && mhz <= 4000 )) || { echo "mhz out of range [200,4000]" >&2; exit 2; }
+    [[ $# -eq 3 ]] || usage
+    exec "$SMI" -i "$idx" -lgc "${mhz},${mhz}"
+    ;;
+  lockmem)
+    mhz=${3:-}
+    is_uint "$mhz" || { echo "mhz must be a non-negative integer" >&2; exit 2; }
+    # GDDR7 runs five figures; HBM stacks report ~1-4 GHz. One range covers both.
+    (( mhz >= 200 && mhz <= 20000 )) || { echo "mhz out of range [200,20000]" >&2; exit 2; }
+    [[ $# -eq 3 ]] || usage
+    exec "$SMI" -i "$idx" -lmc "${mhz},${mhz}"
+    ;;
+  unlock)
+    [[ $# -eq 2 ]] || usage
+    "$SMI" -i "$idx" -rgc || true
+    "$SMI" -i "$idx" -rmc >/dev/null 2>&1 || true
+    ;;
+  status)
+    [[ $# -eq 2 ]] || usage
+    exec "$SMI" -i "$idx" --query-gpu=clocks.sm --format=csv,noheader,nounits
+    ;;
+  *)
+    usage
+    ;;
+esac

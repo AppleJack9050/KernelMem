@@ -31,7 +31,7 @@ from typing import List, Tuple
 
 import torch
 
-from utils import device_state
+from utils import clock_lock, device_state
 
 # ---------------------------------------------------------------------------
 
@@ -715,6 +715,17 @@ def compare_and_bench(
     dev = torch.device(f"cuda:{device_idx}") if TORCH_DEVICE == "cuda" else torch.device("cpu")
     if TORCH_DEVICE == "cuda":
         torch.cuda.set_device(dev)
+        # Nothing is timed until the GPU clock is pinned. This is the choke point
+        # every measurement passes through -- the seed loop, the repair path, the
+        # optimization path, paired_bench, the noise probes and each spawned
+        # benchmark subprocess -- so validating here covers them all by
+        # construction, the same reason gpu_section() is wrapped around this
+        # function rather than around its callers. Already pinned by the parent
+        # run (the normal case) costs one nvidia-smi query to re-verify; not
+        # pinned at all locks it now; unlockable stops the run rather than
+        # producing an unreproducible number.
+        clock_lock.ensure_locked(device_idx, what="benchmark",
+                                 verbose=clock_lock.owner_pid() is None)
         # Set CUDA_LAUNCH_BLOCKING=1 to get detailed error messages for "unspecified launch failure"
         # This makes CUDA operations synchronous and provides better error reporting
         # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -1133,6 +1144,11 @@ def compare_and_bench(
         },
         "num_runs": repeat,
         "state_leak": _leaks,
+        # The frequency these times were taken at, recorded WITH them. Latencies
+        # from two different clocks are not comparable, and REPORT_002:762 traces
+        # the "a trace cannot be audited on its own" problem to exactly this
+        # field being absent from every artifact this repo had written.
+        "clock": clock_lock.state(),
         # Geometric-mean speedup across every benchmarked shape. Equals the
         # single-shape ref/test ratio when the task has no get_inputs_extra().
         "score": score,

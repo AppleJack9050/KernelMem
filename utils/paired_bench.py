@@ -48,6 +48,7 @@ import statistics as st
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from utils import clock_lock
 from utils.compile_and_run import compare_and_bench
 
 
@@ -490,6 +491,14 @@ def main() -> None:
 
     if len(a.kernels) < 2:
         p.error("need at least two kernels (baseline + candidate)")
+
+    # Interleaving cancels drift WITHIN a comparison; it cannot make two
+    # comparisons taken at different clocks comparable. Pin before measuring.
+    try:
+        clock_lock.ensure_locked(a.device, what="paired comparison")
+    except clock_lock.ClockLockError as exc:
+        print(f"\n[clock] {exc}\n")
+        raise SystemExit(2)
 
     out = run(a.reference, a.kernels, a.reps, a.device, a.warmup, a.repeat, a.tol)
     _report(out)

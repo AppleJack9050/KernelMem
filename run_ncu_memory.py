@@ -32,6 +32,8 @@ import json, math
 import pandas as pd
 import numpy as np
 
+from utils import clock_lock
+
 try:
     from utils import run_timing as _timing
 except Exception:  # standalone use outside the repo root: timing is optional
@@ -213,6 +215,13 @@ def profile_bench(
             sys.executable,
             bench_py,
         ]
+
+        # ncu defaults to --clock-control base, i.e. it sets the clock itself for
+        # the duration of the profile. With the run's own pin in place that is
+        # two authorities fighting over one knob, and the counters then describe
+        # a frequency the timed runs never saw. Hand control to the pin instead.
+        if clock_lock.state().get("locked"):
+            cmd.insert(1, "--clock-control=none")
 
         # Optional: respect caller-specified CUDA device index for the benchmark script
         if device_idx is not None:

@@ -42,6 +42,16 @@ def main() -> int:
 
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
+    # The false-positive rate this measures is a property of the verdict function
+    # at a FIXED clock. Leave the clock free and it also folds in whatever the
+    # driver did between trials, which is not what the number is read as.
+    from utils import clock_lock
+    try:
+        clock_lock.ensure_locked(args.device, what="null-verdict trials")
+    except clock_lock.ClockLockError as exc:
+        print(f"\n[clock] {exc}\n")
+        return 2
+
     # Two distinct paths holding identical bytes: the verdict function takes two
     # files, and giving it the same path twice would let any per-path caching
     # make the comparison artificially clean.

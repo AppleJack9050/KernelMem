@@ -113,6 +113,16 @@ def main() -> None:
     a = ap.parse_args()
 
     import torch
+
+    # Timing the unscored shapes against stored scores only means something if
+    # both were taken at the same clock.
+    from utils import clock_lock
+    try:
+        clock_lock.ensure_locked(0, what="shape coverage")
+    except clock_lock.ClockLockError as exc:
+        print(f"\n[clock] {exc}\n")
+        raise SystemExit(2)
+
     sys.path.insert(0, str(REPO))
     ref_mod = _load(REPO / "ref_0.py", "_ref0")
     from sol_execbench.core import Workload

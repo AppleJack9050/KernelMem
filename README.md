@@ -108,6 +108,77 @@ pip install torch matplotlib pandas numpy
 
 Make sure `ncu` and `nsys` are available in your shell.
 
+### 1b. Allow the GPU clock to be pinned (once per machine)
+
+**Every run pins the GPU clock before it measures anything, and refuses to start
+if it cannot.** An unpinned clock is chosen by the driver from temperature, power
+and duty cycle — none of which the harness controls or records — so the same
+kernel timed twice is timed on two effectively different machines, and no score
+from such a run is comparable with any other. Pinning is root-only, so grant it
+once:
+
+```bash
+sudo bash scripts/install_clock_lock_sudoers.sh   # installs a restricted wrapper + sudoers rule
+python -m utils.clock_lock --status               # check: target, current clock, privilege
+```
+
+The frequency is chosen **per device**: a value measured on this machine for this
+exact card, else a built-in preset for the model, else a class-based fraction of
+that card's own ceiling. An unfamiliar card is measured (~45 s, once, cached in
+`priors/clock_presets.json`) rather than guessed at:
+
+```bash
+python -m utils.clock_lock --calibrate            # measure what this card holds under load
+```
+
+On the RTX 5090 the preset is **2407 MHz core / 13801 MHz memory**. That is well
+below the ~2763 MHz the card sustains, and deliberately so: this repo scores
+against `T_SOL = max(FLOPs / 104.8e12, bytes / 1792e9)`, and the 104.8 TFLOPS
+constant is `170 SM × 256 FLOP/clk × 2.41 GHz` — a clock baked into a constant.
+Running faster than 2.41 GHz produces times a `T_SOL` assuming 2.41 GHz cannot
+explain, which is how a kernel once scored 1.036, i.e. faster than light. The
+~13% of wall-clock this costs buys numbers that mean what the report says.
+
+Useful knobs:
+
+| | |
+|---|---|
+| `--gpu_clock_mhz 2610` | pin a different frequency for this run |
+| `KERNELMEM_CLOCK_KEEP=1` | leave the clock pinned between back-to-back runs |
+| `KERNELMEM_CLOCK_AUTOCAL=0` | never auto-measure an unfamiliar card |
+| `--no_clock_lock` | run unpinned **on purpose**; artifacts are stamped `locked: false` |
+
+Every benchmark result carries a `clock` field recording the frequency it was
+taken at, so a trace can be audited on its own.
+
+### 1c. Verify the noise floor
+
+Two checks answer "can this harness resolve a 1% difference?", and they answer
+different halves of it. Run them on a kernel with a **fixed** config — a kernel
+that autotunes per instance (`self._choice` in `kernel_autotune_splitk.py`)
+re-rolls its own configuration every process, and that spread is the kernel's,
+not the harness's:
+
+```bash
+# 1. Spread: re-measure an unchanged kernel across fresh processes.
+python -m utils.noise_verify --kernel run/vae_block_002/kernels/nhwc_eager.py \
+  --processes 12 --calls 3 --band 1.0
+
+# 2. False positives: run the real decision rule on two identical kernels.
+python -m utils.noise_null_verdict --ref tasks/vae_block_002.py \
+  --kernel run/vae_block_002/kernels/nhwc_eager.py \
+  --trials 15 --margin 0.01 --out null.jsonl
+```
+
+`noise_verify` reports the **±2σ band** — the interval a re-measurement of an
+unchanged kernel lands in ~95% of the time, so any "improvement" smaller than it
+is indistinguishable from measuring the same kernel twice. It watches for other
+processes on the GPU *during* each measurement and discards any sample that
+shared the card, which on a multi-session box is otherwise reported as harness
+noise. Measured 2026-08-14 on the RTX 5090, unlocked clocks: **±2σ = 0.46% on
+score**, reproduced exactly across two independent runs, with 0/15 false accepts
+at a 1% margin.
+
 ### 2. Run a single task
 
 The most basic usage is to specify a PyTorch task script as `arch_py`:

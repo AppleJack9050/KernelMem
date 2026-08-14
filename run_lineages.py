@@ -49,6 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from utils import clock_lock
 from utils.lineage import (LineageSpec, LineageState, ceilings, fund, vendor_overhead,
                            read_lineage_progress, read_stop_reason,
                            trajectory_verdict, vendor_split)
@@ -202,6 +203,18 @@ def main() -> None:
     if unknown:
         print(f"[ERROR] unknown plan id(s): {unknown}. Known: {list(PLANS)}")
         return
+
+    # Pin the clock once, here, before any lineage starts. Lineages are compared
+    # against each other and funded on those comparisons, so they must all be
+    # measured at the same frequency -- and since the coordinator's environment
+    # is inherited by every child, one lock at the top covers all of them. A
+    # child locking for itself would also unlock when it finished, un-pinning the
+    # lineages still running.
+    try:
+        clock_lock.ensure_locked(args.device, what="lineage run")
+    except clock_lock.ClockLockError as exc:
+        print(f"\n[clock] {exc}\n")
+        raise SystemExit(2)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     root = (args.work_dir / f"{stamp}_{args.arch_py.stem}_lineages").resolve()

@@ -32,6 +32,7 @@ from prompts.optimization_memory_latest import build_optimization_prompt
 from prompts.judger_repair_memory import build_correctness_prompts
 from prompts.judger_optimization_memory_latest import build_judger_optimization_prompts
 from utils.gpu_lock import gpu_section
+from utils import clock_lock
 from utils.torch_ext_cache import sweep_stale_batons, sweep_unheld_batons
 from utils import run_timing
 from utils.mcgs import (MechanismPrior, MonteCarloGraphSearch, load_code_features,
@@ -134,18 +135,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup", type=int, default=25, help="Warm-up iterations")
     p.add_argument("--repeat", type=int, default=100, help="Timed iterations per benchmark")
     p.add_argument("--tol", type=float, default=1e-2, help="Max |err| tolerated")
-    p.add_argument("--base_margin", type=float, default=0.005,
+    p.add_argument("--base_margin", type=float, default=0.05,
                    help="Relative margin a kernel must beat the current base by to become the new "
-                        "base for later optimization rounds (0.005 = 0.5%%). Too low and the base "
-                        "churns on measurement jitter; too high and optimization keeps restarting "
-                        "from the seed instead of compounding. Default measured on RTX 5090 / "
+                        "base for later optimization rounds (0.05 = 5%%). This is a HARD gate: a "
+                        "candidate that does not clear it does not advance the base, however "
+                        "significant the measurement is. --base_sigma still applies on top, so an "
+                        "advance must be both >=5%% AND separable from noise. "
+                        "Set deliberately far above the noise floor so that no advance can be "
+                        "bought with measurement error. For reference, measured on RTX 5090 / "
                         "vae_block_002: within-session noise is 0.15-0.80%% stdev (kernel-dependent -- "
-                        "multi-stream kernels are ~5x noisier), but scores are compared ACROSS "
-                        "rounds, where GPU-state drift of +0.9..+1.7%% attenuates real gains. A "
-                        "verified +1.26%% same-session improvement showed up as only +0.57%% "
-                        "cross-round, so the margin must sit below the attenuated value. Re-derive "
-                        "this for a different GPU or task. Use 0 to accept any improvement, or a "
-                        "large value to pin the base to the seed (the pre-fix behaviour).")
+                        "multi-stream kernels are ~5x noisier) and cross-round GPU-state drift is "
+                        "+0.9..+1.7%%, so 5%% sits ~6x above the worst single-kernel stdev and ~3x "
+                        "above the drift term. The cost is real and should be understood: the "
+                        "historical exp3 chain reached 1.2039x over 19 rounds via 7 advances "
+                        "averaging ~2.7%% each, and NONE of them would clear this gate -- expect "
+                        "far fewer base advances, and on a task already near roofline expect none. "
+                        "Was 0.005 (0.5%%), which was calibrated to sit just below the drift-"
+                        "attenuated value of a real gain (a verified +1.26%% same-session "
+                        "improvement read as only +0.57%% cross-round). Use 0 to accept any "
+                        "improvement. NOTE: under --search mcgs (the default) the base is chosen "
+                        "by graph selection rather than by this ratchet, so this gate governs the "
+                        "recorded accept evidence and best_kernel promotion, not which state the "
+                        "next round branches from; use --search ratchet for a literal one-way "
+                        "5%%-or-nothing incumbent.")
     p.add_argument("--base_reps", type=int, default=5,
                    help="Interleaved repeats used to compare a candidate against the base. The "
                         "base is re-measured alongside the candidate instead of being read from "
@@ -271,9 +283,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "relative gain, never the blocked score -- score carries +0.9..+1.7%% "
                         "cross-round drift and a corruptible T_ref denominator, and backing a max "
                         "over that up a graph compounds the bias at every level.")
-    p.add_argument("--patience", type=int, default=4,
+    p.add_argument("--plateau_margin", type=float, default=0.005,
+                   help="Relative improvement in best_score that counts as PROGRESS for the "
+                        "--patience plateau counter (0.005 = 0.5%%). Deliberately decoupled from "
+                        "--base_margin. The two answer different questions: --base_margin asks "
+                        "'is this worth adopting as the incumbent', while this asks 'is this run "
+                        "still going anywhere'. They were the same knob while the adoption gate "
+                        "was 0.5%%; once the adoption gate was raised to 5%% they had to split, "
+                        "because a shared 5%% would mean almost no round ever registers as "
+                        "progress and the default --patience 4 would kill nearly every run after "
+                        "four rounds -- including the exp3 run, whose four best rounds came after "
+                        "a 2-round drought. Kept at the old 0.5%%, which is calibrated: the final "
+                        "'improvement' on vae_block_002 was +0.017%%, i.e. noise, and must not "
+                        "reset the counter.")
+    p.add_argument("--patience", type=int, default=5,
                    help="Stop after this many consecutive rounds that fail to improve best_score "
-                        "by more than --base_margin (0 disables). Late rounds are where a run "
+                        "by more than --plateau_margin (0 disables). Late rounds are where a run "
                         "spends its time without earning anything: on vae_block_002 the last 10 "
                         "of 21 rounds took 46%% of the wall clock and moved the score by +0.017%%. "
                         "Measured on that run, every value from 3 up stops after the same real "
@@ -303,6 +328,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "folder and continues each task from its checkpoint.json instead of "
                         "starting a new run. Combine with a larger --round to extend a finished run.")
     p.add_argument("--subproc_id", type=int, default=0, help="Identifier for sub-process (e.g., when running multiple in parallel)")
+    p.add_argument("--no_clock_lock", action="store_true",
+                   help="Run WITHOUT pinning the GPU clock. Off by default: an "
+                        "unpinned clock is set by temperature and power, neither "
+                        "of which the harness controls, so scores from such a run "
+                        "are not comparable with any other run. The artifacts are "
+                        "stamped 'locked: false' so the opt-out stays visible.")
+    p.add_argument("--gpu_clock_mhz", type=int, default=0,
+                   help="Pin the GPU core clock to this frequency instead of the "
+                        "one measured for this device (0 = auto).")
     
     return p
 
@@ -1521,7 +1555,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     scores: List[float] = []
     err_flags: List[bool] = []
     last_score_for_curve = 0.0  # default baseline for plotting on early failures
-    rounds_since_improvement = 0  # consecutive rounds not beating best_score by --base_margin
+    rounds_since_improvement = 0  # consecutive rounds not beating best_score by --plateau_margin
     # Bound here, not in the loop: a resume that starts past --round never enters the
     # body, and the process_exit timing row below reads both.
     _plateau_stop = False
@@ -3277,7 +3311,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         # +0.017%, which is noise, and treating it as real would have kept the
         # loop alive for another 7 rounds.
         if best_score_at_round_start > 0:
-            _improved = best_score > best_score_at_round_start * (1.0 + args.base_margin)
+            _improved = best_score > best_score_at_round_start * (1.0 + args.plateau_margin)
         else:
             _improved = best_score > best_score_at_round_start
         rounds_since_improvement = 0 if _improved else rounds_since_improvement + 1
@@ -3321,7 +3355,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
         if _plateau_stop:
             _best_txt = f"{best_score:.4f}" if best_score != float("-inf") else "none"
-            print(f"[plateau] No gain above the {args.base_margin * 100:.1f}% margin for "
+            print(f"[plateau] No gain above the {args.plateau_margin * 100:.1f}% margin for "
                   f"{rounds_since_improvement} consecutive rounds (best={_best_txt}). Stopping "
                   f"after round {round_idx} of {args.round}; the remaining "
                   f"{args.round - round_idx - 1} would very likely have cost wall clock without "
@@ -3437,6 +3471,22 @@ def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_spe
 def main():
     args = _build_arg_parser().parse_args()
     _install_stop_handler()
+
+    # ---- Preflight: the GPU clock is pinned before anything is measured ----
+    # Checked here, before a single token is spent, rather than at the first
+    # benchmark twenty minutes in. The clock is pinned for the whole run and
+    # inherited by every spawned benchmark subprocess, so the run is measured at
+    # one frequency from end to end instead of at whatever the driver chose for
+    # each round.
+    if args.no_clock_lock:
+        os.environ[clock_lock.ENV_POLICY] = "0"
+    if args.gpu_clock_mhz:
+        os.environ[clock_lock.ENV_GPU_MHZ] = str(args.gpu_clock_mhz)
+    try:
+        clock_lock.ensure_locked(args.device, what="run")
+    except clock_lock.ClockLockError as exc:
+        print(f"\n[clock] {exc}\n", flush=True)
+        raise SystemExit(2)
 
     all_tasks = _collect_tasks(args.arch_py)
 

@@ -91,7 +91,18 @@ def main() -> int:
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
     import torch
+    from utils import clock_lock
     from utils.compile_and_run import compare_and_bench
+
+    # This probe exists to measure the harness's own noise, and an unpinned clock
+    # is not noise the harness has to live with -- it is a variable that can be
+    # removed. Measuring L3 (drift over time) without pinning measures the
+    # driver's boost policy instead of the harness.
+    try:
+        clock_lock.ensure_locked(args.device, what="noise probe")
+    except clock_lock.ClockLockError as exc:
+        print(f"\n[clock] {exc}\n")
+        return 2
 
     props = torch.cuda.get_device_properties(args.device)
     # 114 SMs = H100 PCIe, 132 = H100 NVL. Printed so a run can never be
@@ -102,6 +113,7 @@ def main() -> int:
               "kernel": args.kernel, "ref": args.ref,
               "warmup": args.warmup, "repeat": args.repeat,
               "time_ref": bool(args.time_ref),
+              "clock": clock_lock.state(),
               "started": datetime.now().isoformat(timespec="seconds")}
     out_path = Path(args.out)
     with out_path.open("a") as fh:

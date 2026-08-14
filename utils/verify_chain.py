@@ -169,7 +169,17 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=3, help="Minimum interleaved repeats")
     ap.add_argument("--max_reps", type=int, default=8, help="Cap when the call is close")
     ap.add_argument("--margin", type=float, default=0.005,
-                    help="Adoption margin the verdict is judged against")
+                    help="Margin the verdict is judged against. This deliberately does NOT "
+                         "track main_memory_latest.py --base_margin, which is now a hard 5%% "
+                         "adoption gate. It was briefly set to 0.05 to match and that voids "
+                         "this tool: adaptive_paired_verdict stops adding reps as soon as the "
+                         "DECISION is safe, and against a 5%% margin a ~1%% effect is "
+                         "unambiguously not a 5%% improvement on the first check -- so it "
+                         "breaks at --reps and returns resolved=True having never resolved "
+                         "whether the edge is +1%% or 0%%, which is the only question this "
+                         "tool exists to answer. The adoption gate asks 'is it big enough to "
+                         "adopt'; this asks 'how big is it, and is it distinguishable from "
+                         "zero'. Keep them separate.")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--warmup", type=int, default=25)
     ap.add_argument("--repeat", type=int, default=100)
