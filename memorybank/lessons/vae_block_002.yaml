@@ -1,0 +1,54 @@
+task: vae_block_002
+note: 'Durable engineering findings for this task, accumulated across runs in this repository.
+  Advisory context injected into the optimization prompt -- never a constraint. Edit with
+  `python -m utils.memorybank_lessons`. Each entry must carry its evidence: an unsourced claim
+  injected into every prompt is how a guess becomes folklore.
+
+  '
+lessons:
+- id: vendor-conv-is-three-quarters-of-the-time
+  confidence: measured
+  claim: 'The vendor GEMM/conv is ~75% of the reference''s GPU time, so any approach that
+    keeps it is bounded near 1.1x however well the rest is fused.
+
+    '
+  evidence: 'Reference profiled four times on an RTX 5090 (2026-08-15): 1996.8/2629.7, 2053.3/2742.6,
+    2084.5/2804.4 and 2131.5/2788.5 us, i.e. 74.3-76.4% vendor. The keep_vendor lineage ceiling
+    came out 1.11-1.13x every time, below the 1.2058 incumbent.
+
+    '
+  action: 'To go past ~1.2x you must OWN the convolution, not fuse around it. Treat elementwise/normalisation
+    fusion as the small term; it cannot carry the run.
+
+    '
+  source: run_lineages.py ceilings, 2026-08-15
+- id: depth-past-ten-edits-has-never-paid
+  confidence: measured
+  claim: 'Long edit chains from the seed stop producing wins entirely after about ten steps.
+
+    '
+  evidence: 'Win rate by round index: 41% for rounds 0-4, 41% for 5-9, then 0% for 10-14,
+    0% for 15-19 and 0% for 20-24 -- zero wins in 22 edges past round 10.
+
+    '
+  action: 'If ten edits deep and flat, the granularity chosen at the seed is the constraint.
+    Restart from a different granularity rather than editing further.
+
+    '
+  source: utils/mcgs.py max_depth rationale
+- id: seed-choice-dominates-the-final-score
+  confidence: measured
+  claim: 'Which granularity and algorithm the seed picks decides almost the whole result;
+    later optimization rounds move very little.
+
+    '
+  evidence: 'On this task the seed decided 93.5% of the final score and 21 optimization rounds
+    decided 7%, while the spread BETWEEN seed draws was 10-41%.
+
+    '
+  action: 'Spend the first decision well: state the granularity and the algorithm explicitly
+    and justify them against the vendor share above. Do not assume a weak seed can be recovered
+    by tuning.
+
+    '
+  source: run_lineages.py rationale

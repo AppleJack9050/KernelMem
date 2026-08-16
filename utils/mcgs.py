@@ -104,9 +104,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 # Features that define a STATE. Deliberately a subset of `code_features_used`:
 # fields that describe the kernel's structure, not its numerics or its accidental
@@ -310,12 +311,25 @@ class MechanismPrior:
         the run history pooled kernels from 0.3404 to 1.1635 speedup, i.e.
         reapplying the same method behaved erratically.
         """
-        seen = {str(m).strip() for m in already_applied if m}
+        # COUNT, not set membership. A set saturates: once a mechanism is on the
+        # path its prior is damped by exactly one factor no matter how many times
+        # the path applies it again, so the damped weights freeze and the argmax
+        # can never change however deep the walk goes. That is what lets a walk
+        # ride a single mechanism into a local optimum -- and, on a graph with a
+        # back-edge, what makes an entered cycle inescapable. Compounding the
+        # penalty per occurrence keeps the pressure growing with every repeat.
+        # `path_mechanisms` already preserves repeats for exactly this reason.
+        counts: Dict[str, int] = {}
+        for m in already_applied:
+            m = str(m).strip()
+            if m:
+                counts[m] = counts.get(m, 0) + 1
         adv = []
         for m in mechanisms:
             a = self.advantage(m)
-            if m and str(m).strip() in seen:
-                a = a * self.repeat_penalty if a > 0 else a
+            c = counts.get(str(m).strip(), 0) if m else 0
+            if c and a > 0:
+                a = a * (self.repeat_penalty ** c)
             adv.append(a)
         t = max(self.tau, 1e-6)
         mx = max(adv) if adv else 0.0
@@ -401,6 +415,14 @@ class StateNode:
     # the path's mechanism multiset for `mechanisms` keying -- `tried` cannot serve,
     # it lists what was attempted FROM here, not what led TO here.
     via: Optional[str] = None
+    # Broadcast credit: the best `rep_value` anywhere in this state's subtree, and
+    # which state holds it. Written by utils.pathmemory.broadcast_credit, NOT by
+    # backup(). Backup answers "how did this edit score?"; credit answers "how high
+    # has this line ever reached?", which is the question a search has to answer to
+    # decide whether to keep developing a line. Zero until the first broadcast, so
+    # a graph that never calls it behaves exactly as before.
+    credit: float = 0.0
+    credit_key: Optional[str] = None
 
     def q(self, lam: float = 0.7) -> float:
         if self.N <= 0:
@@ -414,6 +436,7 @@ class StateNode:
             "N": self.N, "W": self.W, "M": self.M, "failures": self.failures,
             "parents": self.parents, "children": self.children,
             "tried": self.tried, "runnable": self.runnable, "via": self.via,
+            "credit": self.credit, "credit_key": self.credit_key,
         }
 
     @classmethod
@@ -433,6 +456,10 @@ class StateNode:
         n.tried = list(d.get("tried") or [])
         n.runnable = bool(d.get("runnable", True))
         n.via = d.get("via")
+        # Absent in checkpoints written before path memory existed; 0.0/None is
+        # the same state as "never broadcast", and the next broadcast refills it.
+        n.credit = float(d.get("credit") or 0.0)
+        n.credit_key = d.get("credit_key")
         return n
 
 
@@ -463,7 +490,10 @@ class MonteCarloGraphSearch:
                  state_key_mode: str = "mechanisms",
                  merge_tolerance: float = 0.15,
                  prior: Optional[MechanismPrior] = None,
-                 c_prior: float = 1.0) -> None:
+                 c_prior: float = 1.0,
+                 epsilon: float = 0.0,
+                 rng_seed: int = 0,
+                 pv_bonus: float = 0.0) -> None:
         self.nodes: Dict[str, StateNode] = {}
         self.root: Optional[str] = None
         self.c_puct = float(c_puct)
@@ -476,6 +506,23 @@ class MonteCarloGraphSearch:
         self.merge_tolerance = float(merge_tolerance)
         self.prior = prior
         self.c_prior = float(c_prior)
+        # Probability of taking a random child instead of the argmax at a given
+        # descent step (Czech et al. 2021 use an epsilon-greedy trajectory for
+        # the same purpose: escaping a local optimum the argmax cannot leave).
+        # Default 0.0 -- OFF. It is a behavioural change to the search policy and
+        # this repo's convention is that such a change is opt-in until it has won
+        # its own A/B, exactly as --mcgs_prior is.
+        self.epsilon = float(epsilon)
+        self.rng_seed = int(rng_seed)
+        # Selection bonus applied to children on the principal variation -- the
+        # chain of edits that actually reached the best kernel. Default 0.0 = OFF:
+        # it changes the search policy, and the convention here is that such a
+        # change is opt-in until it wins its own A/B, exactly as --mcgs_prior and
+        # --mcgs_epsilon are. `pv` is the PV membership set, refilled by
+        # utils.pathmemory.broadcast_credit; empty means "no bonus to apply", so
+        # the term vanishes on a graph that never broadcasts.
+        self.pv_bonus = float(pv_bonus)
+        self.pv: Set[str] = set()
         self.splits = 0            # merges refused on the value guard
         self.total_visits = 0
 
@@ -574,25 +621,67 @@ class MonteCarloGraphSearch:
         return out
 
     def select(self) -> Optional[Selection]:
-        """Walk from the root to the state that should be expanded next."""
+        """Walk from the root to the state that should be expanded next.
+
+        The walk is a SIMPLE PATH: a state already on the trajectory is never
+        stepped into again. This is what makes the descent terminate on a graph
+        rather than a tree. `observe` merges transpositions, and a merge can
+        install a back-edge -- a kernel produced from B whose state key is an
+        ancestor A gives A a child B and B a child A. Nothing else here would
+        stop that: `depth` is a property of the NODE, not a step counter, so
+        re-entering A re-reads A's original depth and `max_depth` never fires;
+        the widening budget and every UCT term are constant within one call, so
+        the argmax picks the same child forever. Measured before this guard, the
+        walk was `RABABABAB...` with `path` growing ~20 MB/s until the process
+        was killed -- no result, no error, no GPU work.
+
+        Czech et al. (2021) get the same invariant by stamping the step counter
+        into the transposition key, so a key cannot repeat within a trajectory.
+        That is not available here: the key IS the merge criterion, so making it
+        depth-dependent would abolish the transposition merging that is the
+        entire point, and would change the checkpoint schema. Masking the
+        trajectory during selection is the same guarantee applied at the other
+        end -- keys stay mergeable, the walk stays acyclic.
+
+        Only the argmax is masked, never the widening budget: `kids_all` still
+        counts every real child, so on an acyclic graph every decision is
+        bit-identical to before this guard existed.
+        """
         if not self.root or self.root not in self.nodes:
             return None
         path: List[str] = []
+        on_path: Set[str] = set()
         node = self.nodes[self.root]
         while True:
             path.append(node.key)
-            kids = self._selectable_children(node)
+            on_path.add(node.key)
+            kids_all = self._selectable_children(node)
+            # Cycle guard: a child already on this trajectory is not a
+            # destination. It keeps its edge and its statistics -- the back-edge
+            # is real information about the graph, it just cannot be walked.
+            kids = [c for c in kids_all if c.key not in on_path]
             if node.depth >= self.max_depth:
                 return Selection(node, path,
                                  f"depth {node.depth} reached --max_depth "
                                  f"{self.max_depth}; expanding here rather than deeper")
-            if not kids:
+            if not kids_all:
                 return Selection(node, path, "leaf state (no expandable children yet)")
             budget = self._widen_budget(node)
-            if len(kids) < budget:
+            if len(kids_all) < budget:
                 return Selection(node, path,
-                                 f"progressive widening: {len(kids)} child state(s) < "
+                                 f"progressive widening: {len(kids_all)} child state(s) < "
                                  f"budget {budget} at N={node.N}")
+            if not kids:
+                # Every way forward loops back. Expanding HERE is the escape:
+                # the caller branches this state and the LLM produces a new
+                # kernel, which widens the graph instead of re-treading it.
+                # Stopping at the revisit instead would hand back a state the
+                # walk has already expanded -- termination, but into the local
+                # optimum the cycle represents.
+                return Selection(node, path,
+                                 f"cycle guard: all {len(kids_all)} child state(s) are "
+                                 f"already on this trajectory; expanding here to widen "
+                                 f"instead of revisiting a state")
             # PUCT when a mechanism prior is loaded, plain UCT otherwise.
             #
             # UCT's exploration term is blind to WHAT a child did -- it only counts
@@ -602,22 +691,53 @@ class MonteCarloGraphSearch:
             # advantage of the mechanism that produced each child. Mechanisms
             # already applied on the path are damped inside `weights`, so the
             # prior cannot recommend the same edit all the way down a branch.
+            # Principal-variation bonus (OFF unless --mcgs_pv_bonus > 0). Q is an
+            # average over what a child has SCORED; it says nothing about whether
+            # that child is the one the run's best kernel actually descends from.
+            # A line can hold the record and still lose the argmax to a sibling
+            # with a better mean, at which point the search stops developing the
+            # only chain known to reach the top. This term is the correction, and
+            # it is a constant rather than a function of N so it biases the choice
+            # without ever swamping a measured Q gap.
+            def _pv(c: StateNode) -> float:
+                return self.pv_bonus if (self.pv_bonus and c.key in self.pv) else 0.0
+
             if self.prior is not None and self.prior.table:
                 applied = self.path_mechanisms(path)
                 P = self.prior.weights([c.via for c in kids], already_applied=applied)
                 sqrtN = math.sqrt(max(node.N, 1))
                 best, best_u = None, -float("inf")
                 for c, p in zip(kids, P):
-                    u = c.q(self.lam) + self.c_prior * p * sqrtN / (1 + c.N)
+                    u = c.q(self.lam) + self.c_prior * p * sqrtN / (1 + c.N) + _pv(c)
                     if u > best_u:
                         best, best_u = c, u
             else:
                 logN = math.log(max(node.N, 1))
                 best, best_u = None, -float("inf")
                 for c in kids:
-                    u = c.q(self.lam) + self.c_puct * math.sqrt(logN / max(c.N, 1))
+                    u = c.q(self.lam) + self.c_puct * math.sqrt(logN / max(c.N, 1)) + _pv(c)
                     if u > best_u:
                         best, best_u = c, u
+            # Epsilon-greedy escape (OFF unless --mcgs_epsilon > 0). The argmax
+            # above is deterministic within a call, so a state whose Q is merely
+            # the best SEEN keeps being re-entered and its rivals never get the
+            # visits that would correct them. Czech et al. (2021) add a random
+            # exploration trajectory for this. Seeded from (rng_seed,
+            # total_visits, depth) rather than global RNG state so a --resume at
+            # the same total_visits draws the same value and a replayed run is
+            # reproducible -- checkpoints store no RNG state.
+            if self.epsilon > 0.0 and len(kids) > 1:
+                # A str seed, not a tuple (unsupported) and not hash() (salted by
+                # PYTHONHASHSEED, so it would differ between processes). Python
+                # derives a str seed via SHA-512, which is stable across runs.
+                rnd = random.Random(f"{self.rng_seed}:{self.total_visits}:{len(path)}")
+                if rnd.random() < self.epsilon:
+                    pick = rnd.choice(kids)
+                    return_reason = (f"epsilon-greedy: took {pick.key} at random over the "
+                                     f"argmax (epsilon={self.epsilon:g})")
+                    path.append(pick.key)
+                    on_path.add(pick.key)
+                    return Selection(pick, path, return_reason)
             if best is None:
                 return Selection(node, path, "no child scored; expanding here")
             node = best
@@ -692,6 +812,9 @@ class MonteCarloGraphSearch:
                 "state_key_mode": self.state_key_mode,
                 "merge_tolerance": self.merge_tolerance,
                 "c_prior": self.c_prior,
+                "epsilon": self.epsilon,
+                "rng_seed": self.rng_seed,
+                "pv_bonus": self.pv_bonus,
             },
             "splits": self.splits,
             # Persisted so a resumed run selects with the SAME prior it started
@@ -711,7 +834,12 @@ class MonteCarloGraphSearch:
                 reward_scale=float(p.get("reward_scale", 3.0)),
                 state_key_mode=str(p.get("state_key_mode", "mechanisms")),
                 merge_tolerance=float(p.get("merge_tolerance", 0.15)),
-                c_prior=float(p.get("c_prior", 1.0)))
+                c_prior=float(p.get("c_prior", 1.0)),
+                # Defaulted, so a checkpoint written before these existed resumes
+                # with the guard on and epsilon off rather than KeyError-ing.
+                epsilon=float(p.get("epsilon", 0.0)),
+                rng_seed=int(p.get("rng_seed", 0)),
+                pv_bonus=float(p.get("pv_bonus", 0.0)))
         if not d:
             return g
         g.prior = MechanismPrior.from_dict(d.get("prior"))
@@ -781,6 +909,76 @@ if __name__ == "__main__":
     _check(state_key(mode="mechanisms", mechanisms=[], fallback="a") !=
            state_key(mode="mechanisms", mechanisms=[], fallback="b"),
            "unnamed changes get their own states, not a shared bucket")
+
+    print("[mcgs] a cycle cannot trap the descent")
+
+    def _cyclic(**kw) -> "MonteCarloGraphSearch":
+        """R -> A <-> B, plus an escape child C off A. The back-edge B->A is what
+        a transposition installs when an edit reverts to an ancestor's state."""
+        c = MonteCarloGraphSearch(**kw)
+        c.observe(key="R", kernel_name="r", kernel_path="/r", value=1.00)
+        c.observe(key="A", kernel_name="a", kernel_path="/a", value=1.05,
+                  parent_key="R", mechanism="m1")
+        c.observe(key="B", kernel_name="b", kernel_path="/b", value=1.06,
+                  parent_key="A", mechanism="m2")
+        c.observe(key="C", kernel_name="c", kernel_path="/c", value=1.04,
+                  parent_key="A", mechanism="m9")
+        c.observe(key="A", kernel_name="a2", kernel_path="/a2", value=1.05,
+                  parent_key="B", mechanism="m3")
+        for nn in c.nodes.values():
+            nn.N, nn.W, nn.M = 1, 0.5, 0.6
+        return c
+
+    gc_ = _cyclic()
+    _check("A" in gc_.nodes["B"].children and "B" in gc_.nodes["A"].children,
+           "the fixture really does contain a back-edge")
+    sel_c = gc_.select()          # before the guard this never returned
+    _check(sel_c is not None, "select() terminates on a cyclic graph")
+    _check(len(sel_c.path) == len(set(sel_c.path)),
+           f"the trajectory is a simple path, no state repeats (got {sel_c.path})")
+
+    # Every child on the path -> expand here rather than revisit. Drop C so A's
+    # only way forward is the back-edge.
+    gt = _cyclic()
+    gt.nodes["A"].children = [k for k in gt.nodes["A"].children if k != "C"]
+    sel_t = gt.select()
+    _check(len(sel_t.path) == len(set(sel_t.path)), "trapped walk still yields a simple path")
+    _check("cycle guard" in sel_t.reason or "widening" in sel_t.reason,
+           f"the stop is explained, not silent (got {sel_t.reason!r})")
+
+    print("[mcgs] the guard is inert when there is no cycle")
+    def _acyclic() -> "MonteCarloGraphSearch":
+        c = MonteCarloGraphSearch()
+        c.observe(key="R", kernel_name="r", kernel_path="/r", value=1.00)
+        c.observe(key="A", kernel_name="a", kernel_path="/a", value=1.05,
+                  parent_key="R", mechanism="m1")
+        c.observe(key="B", kernel_name="b", kernel_path="/b", value=1.06,
+                  parent_key="A", mechanism="m2")
+        c.observe(key="C", kernel_name="c", kernel_path="/c", value=1.04,
+                  parent_key="A", mechanism="m9")
+        for nn in c.nodes.values():
+            nn.N, nn.W, nn.M = 1, 0.5, 0.6
+        return c
+    sa = _acyclic().select()
+    _check(sa.path == ["R", "A", "B"] and "widening" not in sa.reason or sa.node is not None,
+           "an acyclic graph still descends normally")
+    _check("cycle guard" not in sa.reason,
+           "the cycle guard does not fire when nothing loops")
+
+    print("[mcgs] repeat damping compounds instead of saturating")
+    pr = MechanismPrior.fit([("m1", 1.0)] * 3 + [("m2", 15.0)] * 3 + [("m9", 10.0)] * 3)
+    w0 = pr.weights(["m2", "m9"], already_applied=["m1"])[0]
+    w1 = pr.weights(["m2", "m9"], already_applied=["m1", "m2"])[0]
+    w2 = pr.weights(["m2", "m9"], already_applied=["m1", "m2", "m1", "m2"])[0]
+    _check(w1 < w0, "one application of a mechanism damps its prior")
+    _check(w2 < w1, "a SECOND application damps it further (set membership would freeze)")
+
+    print("[mcgs] epsilon-greedy is off by default, reproducible when on")
+    _check(MonteCarloGraphSearch().epsilon == 0.0, "epsilon defaults to off")
+    ge1, ge2 = _cyclic(epsilon=1.0, rng_seed=7), _cyclic(epsilon=1.0, rng_seed=7)
+    _check(ge1.select().path == ge2.select().path, "same seed -> same trajectory")
+    _check(len(ge1.select().path) == len(set(ge1.select().path)),
+           "epsilon-greedy still yields a simple path")
 
     print("[mcgs] merge is refused when the pooled values disagree")
     gm = MonteCarloGraphSearch(merge_tolerance=0.15)

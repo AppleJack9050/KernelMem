@@ -1,0 +1,150 @@
+task: general
+note: 'Cross-task engineering experience. Injected into the optimization prompt for EVERY
+  task, so the bar for an entry is that it would still hold on a problem with different shapes
+  and a different operator. A number measured on one block belongs in that block''s file,
+  not here. Edit with `python -m utils.memorybank_lessons ... general`.
+
+  '
+lessons:
+- id: find-the-dominant-op-before-choosing-a-transform
+  confidence: measured
+  claim: 'Amdahl decides the ceiling before any kernel is written: if one vendor call is most
+    of the GPU time, fusing everything around it cannot pass 1/(1-share).
+
+    '
+  evidence: 'Measured repeatedly here: a block whose vendor conv was 74-76% of GPU time capped
+    a keep-the-vendor approach at 1.11-1.13x, while owning the operator opened 1.55x. A lineage
+    was once funded on a ceiling no admissible implementation could reach because the share
+    was assumed rather than profiled.
+
+    '
+  action: 'Profile the reference and state the dominant op''s share of GPU time before proposing
+    anything. If the plan keeps that op, say what ceiling it accepts.
+
+    '
+  source: run_lineages.py ceilings; utils/lineage.py
+- id: derate-algorithmic-wins-by-the-execution-unit
+  confidence: measured
+  claim: 'An op-count reduction is only realisable at the rate of the units that will execute
+    it; fp32 has no tensor-core MMA instruction at all.
+
+    '
+  evidence: 'fp32 Winograd F(2x2,3x3) removes 2.25x of the multiplies but runs on CUDA cores
+    at 62.7 TFLOP/s against 105.9 for TF32, so the effective ratio is ~1.33x. On an H100 the
+    same derate is harsher (~3.7x).
+
+    '
+  action: 'Multiply any op-count win by (achievable rate of the units you will land on) /
+    (rate the baseline uses) before believing it. Quoting the raw ratio funds work that cannot
+    arrive.
+
+    '
+  source: utils/lineage.py ALGORITHM_WORK_RATIO
+- id: read-the-base-kernel-before-transforming-it
+  confidence: measured
+  claim: 'A transform that the base already performs is not a no-op -- it usually costs occupancy
+    while removing no traffic.
+
+    '
+  evidence: 'Applying a further fusion pass to a full-forward rewrite that already fused the
+    block measured -35.02% +-0.28% paired (t=-99.7), 1.3733 -> 2.1131 ms.
+
+    '
+  action: 'Before proposing fusion, tiling or vectorisation, point at the lines in the base
+    kernel that do NOT already do it. If you cannot, choose a different method.
+
+    '
+  source: run/20260815_045606_vae_block_002 round 1
+- id: rank-on-a-paired-measurement-never-on-score
+  confidence: measured
+  claim: 'A ratio against a separately timed reference is unfit for deciding whether an edit
+    helped; only a paired side-by-side on the kernel''s own time is.
+
+    '
+  evidence: 'Cross-round drift of +0.9..+1.7% was measured on UNCHANGED kernels against a
+    0.5% decision margin, and the reference denominator is corruptible -- one kernel starved
+    the reference''s L2 and read +9.35% while running 1.28x slower.
+
+    '
+  action: 'Claim a win only from a paired comparison. Treat any improvement under ~1% as indistinguishable
+    from measuring the same kernel twice.
+
+    '
+  source: utils/mcgs.py docstring; utils/paired_bench; utils/noise_verify
+- id: only-pinned-clock-numbers-are-comparable
+  confidence: measured
+  claim: 'An unpinned GPU clock makes two timings of the same kernel two different experiments,
+    and can produce scores the roofline cannot explain.
+
+    '
+  evidence: 'Roofline constants here bake in a fixed frequency (104.8 TFLOPS = 170 SM x 256
+    FLOP/clk x 2.41 GHz). Running at the card''s own ~2763 MHz once produced 1.036 -- faster
+    than the light the same constant defines.
+
+    '
+  action: 'Do not reason about, or compare against, a measurement whose artifact is stamped
+    `locked: false`.
+
+    '
+  source: README clock-lock section; utils/clock_lock
+- id: prefer-one-decisive-change-per-round
+  confidence: observed
+  claim: 'Outcomes cluster at the extremes: edits tend to regress clearly or win clearly,
+    and the noise band is the smallest group.
+
+    '
+  evidence: 'Across saved runs, 42% of edges regressed past -1%, 33% won past +1%, and only
+    25% landed inside the +-1% band.
+
+    '
+  action: 'Make one structural change with a stated mechanism rather than several cautious
+    ones. A timid edit is likelier to land in the noise than to bank a small gain.
+
+    '
+  source: utils/mcgs.py backup rationale
+- id: a-hung-build-is-usually-a-stale-lock-not-your-kernel
+  confidence: measured
+  claim: 'A killed compile orphans torch''s extension baton permanently, and any later kernel
+    reusing that extension NAME hangs on the dead lock and is then misreported as an illegal
+    memory access or an infinite loop.
+
+    '
+  evidence: 'Reproduced: a build alarmed mid-ninja leaves no lock, while the same build killed
+    with SIGTERM/SIGKILL leaves one behind. A directory was found holding a lock from a previous
+    day with no .so and no .o, and the perfectly good kernel that later picked that name was
+    scored -inf and sent to repair.
+
+    '
+  action: 'If a kernel hangs at build time, suspect a stale baton for its extension name before
+    rewriting the kernel. Give each variant a distinct extension name.
+
+    '
+  source: utils/torch_ext_cache
+- id: a-recorded-method-list-is-advice-not-a-menu
+  confidence: measured
+  claim: 'The best kernel found on a problem is frequently produced by a method absent from
+    the catalog, so treating recorded knowledge as the permitted set forbids the win.
+
+    '
+  evidence: 'The best kernel to date on one task used `stream_pipeline_overlap`, which is
+    not among the catalog''s 26 entries, and it was found in a round where the decision table
+    matched nothing and the judge was free to invent.
+
+    '
+  action: 'Use the catalog to recognise a fitting method, not to bound the search. If nothing
+    listed fits the measured bottleneck, invent one and name its mechanism.
+
+    '
+  source: prompts/judger_optimization_memory_latest.py ENFORCEMENT_MODE
+- id: reference-material-is-written-for-another-card
+  claim: External kernel references here target B200/sm_100 and Hopper/sm_90, but this benchmark
+    runs on an RTX 5090 = GB202 = sm_120; their hardware constants do not transfer.
+  evidence: The vendored ncu-report-skill carries 103 B200/sm_100/tcgen05 mentions including
+    a whole file of B200 metric names, and KernelWiki 489. tcgen05 MMA is sm_100a and does
+    not exist on sm_120.
+  action: Take the METHOD from such references (profile, diagnose, then plan) and re-derive
+    every metric name, roofline constant and instruction availability for sm_120. Never propose
+    tcgen05 here.
+  confidence: measured
+  source: third_party/kernel-design-agents; utils/install_kda_skills
+  recorded: '2026-08-15'

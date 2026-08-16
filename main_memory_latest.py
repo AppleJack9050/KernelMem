@@ -110,9 +110,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "an explicit per-call effort; it now only sets the default for calls that "
                         "do not request one.")
     p.add_argument("--round", "-G", type=int, default=10, help="Number of generations per task")
-    p.add_argument("--num_seeds", type=int, default=3,
+    p.add_argument("--num_seeds", type=int, default=1,
                    help="Round-0 seed candidates to draw; the best-scoring one becomes the base "
-                        "(1 = previous single-sample behaviour)")
+                        "(1 = single-sample behaviour; >1 draws several and keeps the best)")
     p.add_argument("--seed_granularity", default=None, choices=["A", "B", "C", "D"],
                    help="Pin the round-0 granularity instead of letting the seed choose it. "
                         "The choice fixes what every later round may rewrite and is never "
@@ -277,6 +277,39 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--mcgs_c_prior", type=float, default=1.0,
                    help="PUCT exploration weight, used only when --mcgs_prior is set: "
                         "U = Q + c_prior * P(a) * sqrt(N_parent) / (1 + N_child).")
+    p.add_argument("--mcgs_epsilon", type=float, default=0.0,
+                   help="Probability of taking a RANDOM child instead of the argmax at "
+                        "each descent step. The argmax is deterministic within a call, so "
+                        "a state that merely looks best keeps being re-entered while its "
+                        "rivals never get the visits that would correct them; Czech et al. "
+                        "(2021) add a random exploration trajectory for exactly this. "
+                        "Seeded from (--mcgs_rng_seed, total_visits, depth), so a --resume "
+                        "at the same visit count makes the same draw and replays stay "
+                        "reproducible. Default 0.0 = OFF: it changes the search policy, and "
+                        "the convention here is that such a change is opt-in until it wins "
+                        "its own A/B, exactly as --mcgs_prior is. Note this is NOT what "
+                        "keeps the walk out of a cycle -- the trajectory mask in select() "
+                        "does that unconditionally.")
+    p.add_argument("--mcgs_rng_seed", type=int, default=0,
+                   help="Seed for --mcgs_epsilon. Fixed default so two runs at the same "
+                        "epsilon are comparable; vary it to get independent samples.")
+    p.add_argument("--mcgs_pv_bonus", type=float, default=0.0,
+                   help="Selection bonus for children on the PRINCIPAL VARIATION -- the "
+                        "chain of edits that actually reached the best kernel, computed by "
+                        "utils.pathmemory.broadcast_credit. Q and credit are denominated "
+                        "differently: backup stores reward_from_gain, a function of the "
+                        "PERCENTAGE GAIN OVER THE PARENT, so a line climbing hard off a bad "
+                        "seed outranks one inching forward from a good one -- while being "
+                        "worse on absolute score, the only number the run reports. The state "
+                        "holding the record can therefore lose the argmax to a line that has "
+                        "never come near it. Added as a constant "
+                        "rather than scaled by N, so it breaks ties and near-ties without "
+                        "swamping a real Q gap -- 0.05-0.15 is the useful range against a Q "
+                        "in [0,1]. Default 0.0 = OFF: it changes the search policy, and the "
+                        "convention here is that such a change is opt-in until it wins its "
+                        "own A/B, exactly as --mcgs_prior and --mcgs_epsilon are. The "
+                        "PROMPT half of path memory is separate and on by default; disable "
+                        "that with KERNELMEM_PATHWAY=0.")
     p.add_argument("--mcgs_reward_scale", type=float, default=3.0,
                    help="Percent gain that maps to a near-saturated reward via tanh(rel/scale). "
                         "At 3.0: 0%% -> 0.50, +1%% -> 0.58, +3%% -> 0.88. The reward is the PAIRED "
@@ -1312,6 +1345,23 @@ def _save_checkpoint(task_root: Path, eval_dir: Path, *, task_path: Path,
         print(f"[checkpoint] WARNING: failed to save checkpoint: {exc}", flush=True)
 
 
+def _same_task(recorded: Optional[str], task_path: Path) -> bool:
+    """Is *recorded* the same task file as *task_path*, however it was spelled?
+
+    Falls back to the plain string compare when a path cannot be resolved (the
+    file has moved, or the checkpoint came from another machine), so a genuinely
+    different task is still rejected.
+    """
+    if not recorded:
+        return False
+    if recorded == str(task_path):
+        return True
+    try:
+        return Path(recorded).resolve() == Path(task_path).resolve()
+    except OSError:
+        return False
+
+
 def _load_checkpoint(task_root: Path) -> Optional[Dict[str, Any]]:
     path = task_root / _CHECKPOINT_NAME
     if not path.exists():
@@ -1576,7 +1626,10 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         widen_k=args.mcgs_widen_k, widen_alpha=args.mcgs_widen_alpha,
         max_depth=args.mcgs_max_depth, reward_scale=args.mcgs_reward_scale,
         state_key_mode=args.mcgs_state_key, merge_tolerance=args.mcgs_merge_tol,
-        c_prior=args.mcgs_c_prior)
+        c_prior=args.mcgs_c_prior,
+        epsilon=getattr(args, "mcgs_epsilon", 0.0),
+        rng_seed=getattr(args, "mcgs_rng_seed", 0),
+        pv_bonus=getattr(args, "mcgs_pv_bonus", 0.0))
     if _use_mcgs and getattr(args, "mcgs_prior", ""):
         _pp = Path(args.mcgs_prior)
         if not _pp.exists():
@@ -1669,7 +1722,14 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         ckpt = _load_checkpoint(task_root)
         if ckpt is None:
             print(f"[resume] No checkpoint under {task_root}; starting from round 0.")
-        elif ckpt.get("task") != str(task_path):
+        # Compare RESOLVED paths, not the raw strings. The checkpoint records
+        # whatever spelling the writing run was invoked with, so resuming the
+        # same task via a different spelling -- absolute vs relative, a symlink,
+        # a trailing "./" -- compared unequal and silently restarted from round
+        # 0, discarding a seed that costs ~12 minutes of decode to regenerate.
+        # The failure was silent in the worst way: it printed a WARNING and then
+        # looked like a healthy fresh run.
+        elif not _same_task(ckpt.get("task"), task_path):
             print(f"[resume] WARNING: checkpoint belongs to {ckpt.get('task')}, not "
                   f"{task_path}; starting from round 0.")
         else:
@@ -1703,6 +1763,16 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             # from scratch with the budget already spent.
             if ckpt.get("mcgs"):
                 graph = MonteCarloGraphSearch.from_dict(ckpt["mcgs"])
+                # `pv` is derived, not stored, so a restored graph has an empty one
+                # and would select the first round after a resume with no PV bonus
+                # -- a silent one-round policy change across a restart. Rebuild it
+                # here, before any selection happens.
+                try:
+                    from utils.pathmemory import broadcast_credit
+                    broadcast_credit(graph)
+                except Exception as _exc:
+                    print(f"[pathway] credit broadcast skipped on resume "
+                          f"({type(_exc).__name__}: {_exc})", flush=True)
                 _g = graph.stats()
                 print(f"[mcgs] Restored the search graph: {_g['states']} states over "
                       f"{_g['kernels']} kernels, {_g['merged_states']} merged, "
@@ -2836,11 +2906,29 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         # Build history block with previously generated kernels (keep last round_idx kernels, or at least 5)
                         # For round 0, keep_last=0 means no history; for round 1+, keep_last should be round_idx to include all previous rounds
                         history_block = _build_history_block(code_dir, keep_last=max(round_idx, 5))
+                        # Just-in-time memory: the chain of edits that actually
+                        # reached the best kernel, with each state's own context.
+                        # Built here because it needs the live graph. "" under the
+                        # ratchet, on round 1, or with KERNELMEM_PATHWAY=0 -- and a
+                        # failure to build it must never cost a round, so it
+                        # degrades to "" exactly as lessons_block does.
+                        pathway_block = ""
+                        if _use_mcgs:
+                            try:
+                                from utils.pathmemory import render_pathway
+                                pathway_block = render_pathway(
+                                    graph,
+                                    current_key=(_mcgs_sel.node.key if _mcgs_sel else None),
+                                    lam=args.mcgs_lam)
+                            except Exception as _exc:
+                                print(f"[pathway] block skipped "
+                                      f"({type(_exc).__name__}: {_exc})", flush=True)
                         # Use parent_kernel (best_kernel) for optimization, not current_kernel
                         opt_prompt = build_optimization_prompt(
                             arch_path=parent_kernel_path if parent_kernel_path else current_kernel.code_path,  # type: ignore[union-attr]
                             gpu_name=args.gpu,
                             history_block=history_block,  # Pass history_block to include previously generated kernels
+                            pathway_block=pathway_block,
                             optimization_suggestion=strategy_json
                         )
                         prompt_file = io_dir / f"round{round_idx:03d}_opt_prompt.txt"
@@ -3139,6 +3227,20 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     if _ck not in _path:
                         _path.append(_ck)
                     graph.backup(_path, _r, failed=_failed)
+                    # Second pass, opposite direction: backup credits this path
+                    # with THIS rollout's reward, broadcast credits every state
+                    # with the best value anywhere below it. Run here rather than
+                    # at prompt-build time so `credit` is correct in the
+                    # checkpoint too, and a --resume or the viewer sees the same
+                    # numbers the round saw. Never allowed to break a round: it
+                    # is a read of the graph, and a bad read must not cost the
+                    # kernel that was just measured.
+                    try:
+                        from utils.pathmemory import broadcast_credit
+                        broadcast_credit(graph)
+                    except Exception as _exc:
+                        print(f"[pathway] credit broadcast skipped "
+                              f"({type(_exc).__name__}: {_exc})", flush=True)
                     _merged = len(graph.nodes[_ck].members) > 1
                     print(f"[mcgs] Child state {_ck}: {_rel:+.2f}% ({_basis}) -> reward "
                           f"{_r:.3f}, value {_child_value:.4f}, N={graph.nodes[_ck].N}"
@@ -3486,6 +3588,37 @@ def main():
         clock_lock.ensure_locked(args.device, what="run")
     except clock_lock.ClockLockError as exc:
         print(f"\n[clock] {exc}\n", flush=True)
+        raise SystemExit(2)
+
+    # ---- Preflight: --gpu resolves to a real GPU_SPEC_INFO key ----
+    # This is the step the `--gpu` default documented but never performed:
+    # args.gpu was set to None and never assigned again, so every prompt builder
+    # received None. The seed path survived it (build_seed_prompt calls
+    # resolve_gpu_name itself), but build_judger_optimization_prompts indexes the
+    # table directly and raised `KeyError: 'None not present in GPU_SPEC_INFO'`
+    # -- at the FIRST optimization round, i.e. after the whole seed phase had
+    # been paid for. Resolved once here so every consumer gets a valid key, and
+    # resolved before any tokens are spent so a bad name costs seconds.
+    #
+    # A supplied --gpu is normalised too, not just a detected one: the spec table
+    # is keyed "RTX 5090" while torch reports "NVIDIA GeForce RTX 5090", and a
+    # user passing the torch spelling should not be punished for it.
+    try:
+        from prompts.hardware.gpu_specs import GPU_SPEC_INFO as _GPU_SPECS
+        from prompts.generate_custom_cuda_memory import resolve_gpu_name as _resolve_gpu
+        _requested = args.gpu
+        if _requested is None:
+            import torch as _torch
+            if not _torch.cuda.is_available():
+                raise KeyError("no CUDA device visible, so --gpu cannot be auto-detected")
+            _requested = _torch.cuda.get_device_name(args.device)
+        args.gpu = _resolve_gpu(_requested, _GPU_SPECS)
+        if args.gpu != _requested:
+            print(f"[gpu] '{_requested}' -> spec key '{args.gpu}'", flush=True)
+        else:
+            print(f"[gpu] spec key '{args.gpu}'", flush=True)
+    except Exception as exc:
+        print(f"\n[gpu] {exc}\n", flush=True)
         raise SystemExit(2)
 
     all_tasks = _collect_tasks(args.arch_py)

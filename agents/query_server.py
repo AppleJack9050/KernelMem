@@ -42,6 +42,53 @@ DEFAULT_EFFORT = "high"
 # ---------------------------------------------------------------------------
 _TOOL_CALL_TYPES = {"seed", "optimization", "repair"}
 _AGENT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+
+# ---------------------------------------------------------------------------
+# External Claude skills (opt-in: KERNELMEM_SKILLS=1)
+#
+# Installed by utils/install_kda_skills into ~/.claude/skills, which is the only
+# place the SDK looks once `setting_sources` includes "user" -- project scope
+# would resolve against the per-call temp `cwd`, which does not exist yet and is
+# deleted afterwards.
+#
+# OFF by default, for two reasons rather than caution alone:
+#   1. The skills target B200/sm_100 (and Hopper sm_90). This repo benchmarks on
+#      an RTX 5090 = sm_120, where tcgen05 does not exist and the B200 metric
+#      names are not all valid. Loading them changes what the model proposes, so
+#      it is a search-policy change and wants its own A/B, exactly as
+#      --mcgs_prior does.
+#   2. Loading a skill costs turns from the 30-turn tool budget.
+# ---------------------------------------------------------------------------
+_SKILLS_ENV = "KERNELMEM_SKILLS"
+
+# Appended only when skills are actually loaded. The correction is the point: the
+# skills state their target as B200 in their own text, so without this the model
+# reads authoritative-sounding sm_100 advice and applies it to sm_120.
+_SKILLS_INSTRUCTION = """
+
+SKILLS ARE AVAILABLE THIS CALL. `ncu-report-skill` (profiling method) and
+`KernelWiki` (kernel technique reference) are loadable via the Skill tool.
+HARDWARE CORRECTION, which overrides anything they say: those skills were written
+for NVIDIA B200 / sm_100 and Hopper / sm_90. This benchmark runs on an RTX 5090
+= GB202 = sm_120, consumer Blackwell. `tcgen05` MMA does not exist on sm_120 --
+never propose it. B200 metric names and roofline constants in those documents
+belong to another card; re-derive any number for sm_120 before relying on it.
+Take their METHOD (profile, diagnose, then plan) and discard their constants.
+"""
+
+
+def _skills_enabled() -> bool:
+    return os.environ.get(_SKILLS_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _skills_config():
+    """(skills, setting_sources, tools) for the options, or (None, None, base)."""
+    if not _skills_enabled():
+        return None, None, _AGENT_TOOLS
+    names = [n.strip() for n in os.environ.get("KERNELMEM_SKILL_NAMES", "").split(",") if n.strip()]
+    # "Skill" must be allowed explicitly: allowed_tools is an allowlist, so
+    # without it the skills load and then cannot be invoked.
+    return (names or "all"), ["user"], _AGENT_TOOLS + ["Skill"]
 _TOOL_MAX_TURNS = int(os.environ.get("KERNELMEM_AGENT_MAX_TURNS", "30"))
 
 _TOOL_MODE_INSTRUCTION = """
@@ -339,16 +386,20 @@ def query_server(
         # A private scratch cwd, so the agent's files land nowhere near the repo
         # or the run artifacts even though it holds a real Bash.
         workdir = tempfile.mkdtemp(prefix=f"kernelmem_agent_{call_type}_")
+        _skills, _sources, _tools = _skills_config()
         options = ClaudeAgentOptions(
-            system_prompt=(system_prompt or "") + _TOOL_MODE_INSTRUCTION,
+            system_prompt=((system_prompt or "") + _TOOL_MODE_INSTRUCTION
+                           + (_SKILLS_INSTRUCTION if _skills else "")),
             model=model,
             effort=effort,
-            tools=_AGENT_TOOLS,
-            allowed_tools=_AGENT_TOOLS,
+            tools=_tools,
+            allowed_tools=_tools,
             permission_mode="bypassPermissions",  # headless: nothing can approve a prompt
             cwd=workdir,
             max_turns=_TOOL_MAX_TURNS,
             env={**_SUBSCRIPTION_ENV, **_agent_build_env(workdir)},
+            skills=_skills,
+            setting_sources=_sources,
         )
     else:
         options = ClaudeAgentOptions(

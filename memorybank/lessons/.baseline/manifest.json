@@ -1,0 +1,21 @@
+{
+  "taken": "2026-08-16T14:41:22",
+  "note": "Pristine copy of the long-term memory, taken before the first automated write. Restore with: python -m utils.memorybank_lessons restore [--task NAME]",
+  "files": {
+    "general.yaml": {
+      "from": "memorybank/lessons/general.yaml",
+      "sha256": "1c572c68b01beeb57bc5830401c3895f974047c179c4c86b633f417eef8a69f8",
+      "bytes": 6815
+    },
+    "vae_block_002.yaml": {
+      "from": "memorybank/lessons/vae_block_002.yaml",
+      "sha256": "386639926ff5247e61a27e1210df7f1961b0f7d8876facda9bc6859d0b3d35b1",
+      "bytes": 2273
+    },
+    "bottleneck_headroom_kernelstructure.yaml": {
+      "from": "memorybank/bottleneck_headroom_kernelstructure.yaml",
+      "sha256": "5f7b053ef464b079b6e098980e8b138efc83e16b4e9c783e61a4e57dd9a6c29f",
+      "bytes": 70643
+    }
+  }
+}

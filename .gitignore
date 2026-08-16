@@ -4,3 +4,14 @@
 # NOTE: because this is ignored, the CUTLASS capability does NOT travel with the
 # repo -- install it (or set CUTLASS_INCLUDE_DIR) on every machine you run on.
 third_party/cutlass/
+
+# Vendored Claude skills from mit-han-lab/kernel-design-agents (28 MB) and its two
+# submodules, DongyunZou/ncu-report-skill and DongyunZou/KernelWiki. Re-fetch with:
+#   git clone --depth 1 --recurse-submodules --shallow-submodules \
+#     https://github.com/mit-han-lab/kernel-design-agents.git third_party/kernel-design-agents
+#   python -m utils.install_kda_skills
+# IGNORED DELIBERATELY, and not only for size: none of those three repositories
+# ships a LICENSE file, so their contents are all-rights-reserved by default and
+# must not be committed into this repository. Referencing a local checkout keeps
+# provenance with upstream; copying the text in here would not.
+third_party/kernel-design-agents/
