@@ -1,0 +1,42 @@
+timestamp,round_idx,phase,seconds,detail
+2026-08-16 20:48:51,-1,process_start,0.000,pid=32699 subproc_id=0 task=vae_block_002
+2026-08-16 21:16:55,0,llm:seed,1682.532,
+2026-08-16 21:17:30,0,bench:seed,35.117,ok
+2026-08-16 21:17:30,0,round_total,1719.372,best=1.1926
+2026-08-16 21:17:38,1,ncu_invocation:metrics[kernel0],6.403,ok
+2026-08-16 21:17:43,1,ncu_invocation:section[kernel0],5.083,ok
+2026-08-16 21:17:49,1,ncu_invocation:metrics[kernel1],6.075,ok
+2026-08-16 21:17:54,1,ncu_invocation:section[kernel1],4.987,ok
+2026-08-16 21:18:00,1,ncu_invocation:metrics[kernel2],6.018,ok
+2026-08-16 21:18:06,1,ncu_invocation:section[kernel2],5.279,ok
+2026-08-16 21:18:12,1,ncu_invocation:metrics[kernel3],6.122,ok
+2026-08-16 21:18:17,1,ncu_invocation:section[kernel3],5.231,ok
+2026-08-16 21:18:23,1,ncu_invocation:metrics[kernel4],6.030,ok
+2026-08-16 21:18:28,1,ncu_invocation:section[kernel4],5.293,ok
+2026-08-16 21:18:34,1,ncu_invocation:metrics[kernel5],6.208,ok
+2026-08-16 21:18:40,1,ncu_invocation:section[kernel5],5.136,ok
+2026-08-16 21:18:40,1,ncu_profile_total,68.173,names=6 csv=ncu_temp_0.csv
+2026-08-16 21:18:40,1,ncu:base,68.178,names=6
+2026-08-16 21:18:43,1,nsys,2.814,
+2026-08-16 21:18:48,1,llm:judge_gate,5.572,
+2026-08-16 21:24:16,1,llm:judge_optimization,327.377,
+2026-08-16 21:27:31,1,llm:optimization,194.859,
+2026-08-16 21:28:05,1,bench:opt,34.706,ok
+2026-08-16 21:28:27,1,round_total,657.153,best=1.1926
+2026-08-16 21:28:35,2,ncu_invocation:metrics[kernel0],6.629,ok
+2026-08-16 21:28:41,2,ncu_invocation:section[kernel0],5.542,ok
+2026-08-16 21:28:47,2,ncu_invocation:metrics[kernel1],6.388,ok
+2026-08-16 21:28:53,2,ncu_invocation:section[kernel1],5.391,ok
+2026-08-16 21:28:59,2,ncu_invocation:metrics[kernel2],6.481,ok
+2026-08-16 21:29:05,2,ncu_invocation:section[kernel2],5.547,ok
+2026-08-16 21:29:11,2,ncu_invocation:metrics[kernel3],6.384,ok
+2026-08-16 21:29:16,2,ncu_invocation:section[kernel3],5.238,ok
+2026-08-16 21:29:23,2,ncu_invocation:metrics[kernel4],6.236,ok
+2026-08-16 21:29:28,2,ncu_invocation:section[kernel4],5.287,ok
+2026-08-16 21:29:34,2,ncu_invocation:metrics[kernel5],6.379,ok
+2026-08-16 21:29:40,2,ncu_invocation:section[kernel5],5.495,ok
+2026-08-16 21:29:40,2,ncu_profile_total,71.083,names=6 csv=ncu_temp_0.csv
+2026-08-16 21:29:40,2,ncu:base,71.087,names=6
+2026-08-16 21:29:43,2,nsys,2.762,
+2026-08-16 21:29:47,2,llm:judge_gate,4.526,
+2026-08-16 21:36:45,2,llm:judge_optimization,417.156,

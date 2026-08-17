@@ -1,8 +1,8 @@
 Kernel Name,kernel_launch_count,time_pct,total_time_ns
-void cutlass::Kernel<cutlass::conv::kernel::ImplicitGemmConvolution<cutlass::conv::threadblock::Imp…,96,87.9,31283929.0
-"gn_silu_add_nhwc2nchw_kernel(const float *, const float *, float *, const float *, const float *, c…",48,4.4,1565761.0
-"nchw2nhwc_kernel(const float *, float *, int, int, int)",48,2.8,981152.0
-"gn_partial_kernel(const float *, float *, int, int, int, int, int, int)",96,2.3,814656.0
-"gn_silu_nhwc_kernel(const float *, float *, const float *, const float *, const float *, const floa…",48,1.6,582816.0
-"gn_finalize_kernel(const float *, float *, float *, int, int, long, float)",96,0.8,269441.0
-"kcrs2krsc_kernel(const float *, float *, int, int)",24,0.2,85088.0
+void cutlass::Kernel<cutlass::conv::kernel::ImplicitGemmConvolution<cutlass::conv::threadblock::Imp…,24,88.5,24133674.0
+"gn_silu_add_nchw_kernel(const float *, const float *, const float *, const float *, float *, int, i…",12,3.9,1060221.0
+"nchw2nhwc_round_kernel(const float *, float *, int, int)",12,3.7,1020159.0
+"gn_silu_round_kernel(const float *, const float *, const float *, float *, int)",12,1.8,497503.0
+"gn_partial_kernel(const float *, float *, float *, int, int)",24,1.4,393663.0
+"weight_krsc_round_kernel(const float *, float *)",24,0.4,107712.0
+"gn_finalize_kernel(const float *, const float *, const float *, const float *, float *, float *, in…",24,0.2,49216.0

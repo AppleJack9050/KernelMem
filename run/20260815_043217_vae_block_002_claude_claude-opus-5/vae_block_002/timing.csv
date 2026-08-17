@@ -1,0 +1,6 @@
+timestamp,round_idx,phase,seconds,detail
+2026-08-15 04:32:17,-1,process_start,0.000,pid=21151 subproc_id=0 task=vae_block_002
+2026-08-15 04:45:41,0,llm:seed,802.021,
+2026-08-15 04:46:13,0,bench:seed,31.948,ok
+2026-08-15 04:55:11,0,stop_signal,0.000,signum=15 graceful
+2026-08-15 04:55:28,0,abort_signal,0.000,signum=15 round_abandoned

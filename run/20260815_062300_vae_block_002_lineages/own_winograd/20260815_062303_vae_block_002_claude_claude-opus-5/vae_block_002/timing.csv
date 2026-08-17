@@ -1,0 +1,3 @@
+timestamp,round_idx,phase,seconds,detail
+2026-08-15 06:23:03,-1,process_start,0.000,pid=54829 subproc_id=101 task=vae_block_002
+2026-08-15 06:56:24,0,llm:seed,1997.734,failed:

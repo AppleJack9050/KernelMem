@@ -5,13 +5,14 @@ claude.ai account) so usage bills against the user's Claude subscription
 credit — never a pay-per-token API key.
 """
 
+import ast
 import asyncio
 import datetime
 import os
 import shutil
 import tempfile
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -105,10 +106,22 @@ yourself instead of spending a round on it.
   compilation are what tools are for. The harness measures performance.
 - Work only inside your working directory. Do not modify anything outside it.
 
+DELIVER EARLY AND OFTEN, TO A FILE. The moment you have a complete kernel that
+compiles -- however unambitious -- write it to `ANSWER.py` in your working
+directory. Overwrite it whenever you have something better that still compiles.
+Treat it as a ratchet: `ANSWER.py` should always hold the best COMPLETE kernel
+you have so far, never a partial edit.
+
+This exists because your turn budget can run out mid-investigation, and if it
+does, your final message never happens and everything you built is lost with the
+scratch directory. `ANSWER.py` is read when that occurs. Writing it costs one
+turn and makes the difference between a scored kernel and nothing at all.
+
 OUTPUT CONTRACT (unchanged, and now strict): your FINAL message must contain
 exactly ONE fenced code block holding the complete Python file, and nothing
 else of substance. Intermediate messages may say whatever you like -- only the
-last one is read.
+last one is read. `ANSWER.py` is a FALLBACK, not a substitute: still post the
+code in your final message.
 """
 
 
@@ -169,6 +182,77 @@ def _agent_build_env(workdir: str) -> Dict[str, str]:
     ext_dir = os.path.join(workdir, "torch_ext")
     os.makedirs(ext_dir, exist_ok=True)
     return {"TORCH_EXTENSIONS_DIR": ext_dir}
+
+
+# ---------------------------------------------------------------------------
+# The second delivery channel.
+#
+# Tool mode was retrofitted onto a design that was one-shot: `tools=[],
+# max_turns=1`, where the reply simply WAS the kernel, so "your final message
+# must contain the code" described a reply rather than constraining one. The
+# contract never changed when the call became an agent that works over many
+# turns in a filesystem. The result is a seam: the agent does its work in a
+# directory and delivers through a message, and only the message is read.
+#
+# That seam is not hypothetical. On 2026-08-16 a seed spent 35 minutes, ran six
+# successful nvcc builds and a 64-point config sweep, wrote a complete 17 KB
+# kernel to its scratch dir -- and scored nothing, because the turn budget ran
+# out before the turn that would have PASTED that file into a message, and the
+# cleanup then deleted it. A sibling agent orphaned by a SIGKILL that same hour
+# produced a kernel measured correct to 1.5e-3 against a 1e-2 tolerance and
+# clearly faster; it survived only because the kill skipped the cleanup. Two
+# working kernels in one hour, both discarded by the plumbing rather than by
+# the benchmark.
+#
+# So the directory becomes a real delivery channel: the agent maintains its best
+# complete kernel at ANSWER.py, and when the message never arrives the harness
+# reads the file instead. Delivery stops being one all-or-nothing turn at the
+# end and becomes a ratchet the agent updates as it goes.
+#
+# Salvage is SAFE TO ATTEMPT because it is not a shortcut past any gate. A
+# salvaged kernel still has to compile, still has to match the reference within
+# tol, and still has to beat the base to be promoted -- the harness validates it
+# exactly as it validates a delivered one. The gate below only rejects files
+# that cannot be kernels at all, so the worst case is one wasted benchmark
+# rather than a bad kernel silently promoted.
+# ---------------------------------------------------------------------------
+_ANSWER_FILE = "ANSWER.py"
+
+
+def _salvage_answer(workdir: Optional[str]) -> Optional[str]:
+    """The agent's best kernel from its scratch dir, or None if there isn't one.
+
+    Read BEFORE the workdir is removed, and deliberately strict about what counts:
+
+    * it must parse as a complete Python module -- a file the agent was midway
+      through writing when the turn budget ran out fails here, which is the main
+      thing that could otherwise be salvaged into a wasted round;
+    * it must mention ``ModelNew``, the entry point the output contract names, so
+      a leftover probe script (``prof.py``, ``err_test.py``) is not mistaken for
+      an answer.
+
+    Never raises: this runs on the failure path, and a salvage attempt that threw
+    would replace a clear error with a confusing one.
+    """
+    if not workdir:
+        return None
+    path = os.path.join(workdir, _ANSWER_FILE)
+    try:
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        return None
+    if not src.strip():
+        return None
+    try:
+        ast.parse(src)
+    except (SyntaxError, ValueError):
+        return None
+    if "ModelNew" not in src:
+        return None
+    return src
 
 
 def retry_with_backoff(
@@ -412,18 +496,52 @@ def query_server(
         )
     prompt_text = _flatten_prompt(prompt)
 
+    salvaged: Optional[str] = None
+    call_error: Optional[Exception] = None
     try:
         texts, result = retry_with_backoff(
             lambda: asyncio.run(_run_query(prompt_text, options, final_only=use_tools)),
             max_retries=3,
             retry_if=_is_transient_cli_result_error,
         )
+    except Exception as exc:
+        # Held, not swallowed: re-raised below unless the scratch dir yields a
+        # kernel. BaseException is deliberately NOT caught -- a KeyboardInterrupt
+        # or the graceful-stop signal must keep unwinding, not be converted into
+        # a salvage.
+        texts, result, call_error = [], None, exc
     finally:
+        # Before the tree goes, and inside the finally so it also runs when the
+        # call raised. Note retry_with_backoff retries INSIDE this block, so the
+        # workdir is shared across attempts and an ANSWER.py written by attempt 1
+        # survives into attempt 2 -- the ratchet spans retries.
+        salvaged = _salvage_answer(workdir)
         if workdir and os.environ.get("KERNELMEM_AGENT_KEEP_WORKDIR", "").strip().lower() \
                 not in {"1", "true", "yes", "on"}:
             shutil.rmtree(workdir, ignore_errors=True)
 
-    if result is not None and result.is_error:
+    failed = (call_error is not None
+              or (result is not None and result.is_error)
+              or not texts)
+    salvage_used = False
+    if failed and salvaged:
+        why = (f"{type(call_error).__name__}: {call_error}" if call_error is not None
+               else f"{result.subtype}: {result.result}" if result is not None
+               else "the model returned no text")
+        print(f"[salvage] {call_type}: no kernel arrived in the reply ({why}). "
+              f"Recovered {len(salvaged)} chars from {_ANSWER_FILE} in the agent's "
+              f"scratch dir; it still has to compile, match the reference and beat "
+              f"the base like any other candidate.", flush=True)
+        # Re-enter the normal path rather than returning early, so usage logging
+        # and the finish-reason print below happen for a salvaged call exactly as
+        # they do for a delivered one -- a scored kernel whose cost went unrecorded
+        # would be worse than the failure this is fixing.
+        texts = [f"```python\n{salvaged}\n```"]
+        salvage_used = True
+
+    if call_error is not None and not salvage_used:
+        raise call_error
+    if result is not None and result.is_error and not salvage_used:
         raise RuntimeError(f"Claude Agent SDK call failed ({result.subtype}): {result.result}")
 
     # Usage logging (usage.csv row format consumed by main_memory_latest.py)

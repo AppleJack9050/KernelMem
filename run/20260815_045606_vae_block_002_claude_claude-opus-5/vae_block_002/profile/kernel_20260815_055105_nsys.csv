@@ -1,0 +1,3 @@
+Kernel Name,kernel_launch_count
+gn_apply_nhwc_kernel,24
+gn_reduce_nhwc_kernel,24

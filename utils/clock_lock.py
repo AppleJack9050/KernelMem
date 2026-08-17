@@ -75,12 +75,15 @@ CLI
 from __future__ import annotations
 
 import atexit
+import datetime
 import json
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # --------------------------------------------------------------------------
@@ -365,6 +368,128 @@ def owner_pid() -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+# --------------------------------------------------------------------------
+# Ownership that survives the owner.
+#
+# Releasing the pin is already handled for every exit the process can observe:
+# atexit for a normal return, SIGINT/SIGTERM handlers for a stop. What none of
+# that can cover is SIGKILL, an OOM kill, or the power going out -- no code of
+# ours runs, and the card stays pinned with nothing left to say who pinned it.
+#
+# That is not a hypothetical either. ENV_OWNER lives in the environment, so it
+# dies with the process, and the NEXT run therefore sees a pinned card with no
+# owner and takes the "pre-existing external lock" branch -- adopting a dead
+# run's frequency as though an operator had chosen it. Measured on 2026-08-16: a
+# SIGKILLed run left the card at 2482 MHz, the next run adopted it instead of
+# applying the 2407 MHz target, and its reference profile read 2224 us against
+# the ~2526 us the same reference takes at target. Every score from it would
+# have been inflated against a T_SOL that assumes 2.41 GHz.
+#
+# So ownership is written to a FILE next to the machine, not into the
+# environment. A pin whose recorded owner is gone is stale: ours to reclaim at
+# our own target, rather than a stranger's choice to respect. In /tmp because
+# the GPU is machine-wide and so is the claim on it, and because a reboot -- the
+# one event that also resets the clocks -- clears it for free.
+# --------------------------------------------------------------------------
+def _lockfile(smi_idx: int) -> Path:
+    return Path(tempfile.gettempdir()) / f"kernelmem_clock_gpu{smi_idx}.json"
+
+
+def _proc_start_ticks(pid: int) -> Optional[int]:
+    """Field 22 of /proc/<pid>/stat: when this pid started, in clock ticks.
+
+    Recorded alongside the pid because pids are reused. Without it, a stale
+    record whose pid has been recycled by an unrelated process reads as "the
+    owner is alive", and the pin is left in place forever.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as fh:
+            data = fh.read()
+        # comm can contain spaces and parens; everything after the last ')' is
+        # positional, and starttime is the 20th field of that remainder.
+        return int(data[data.rindex(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _write_owner(smi_idx: int, gpu_mhz: Optional[int]) -> None:
+    """Claim the pin on disk. Never raises: failing to record must not fail a lock."""
+    pid = os.getpid()
+    try:
+        _lockfile(smi_idx).write_text(json.dumps({
+            "pid": pid,
+            "start_ticks": _proc_start_ticks(pid),
+            "target_gpu_mhz": gpu_mhz,
+            "gpu_name": device_name(smi_idx),
+            "taken": datetime.datetime.now().isoformat(timespec="seconds"),
+            "argv0": os.path.basename(sys.argv[0] if sys.argv else "?"),
+        }, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _read_owner(smi_idx: int) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(_lockfile(smi_idx).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _clear_owner(smi_idx: int) -> None:
+    try:
+        _lockfile(smi_idx).unlink()
+    except OSError:
+        pass
+
+
+def _owner_alive(rec: Optional[Dict[str, Any]]) -> bool:
+    """Is the process that took this pin still running?
+
+    Both halves must agree. `kill(pid, 0)` alone answers "some process has this
+    pid", which after pid reuse is a different question from the one being asked.
+    A record written before start_ticks was captured (or on a system without
+    /proc) falls back to the liveness check alone, which is the safe direction:
+    it can only make us treat a stale pin as live, never the reverse.
+    """
+    if not rec:
+        return False
+    pid = rec.get("pid")
+    if not isinstance(pid, int):
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True                      # someone else's process, but it exists
+    want = rec.get("start_ticks")
+    if want is None:
+        return True
+    now = _proc_start_ticks(pid)
+    return now is None or now == want
+
+
+def reclaim_stale(smi_idx: int = 0, *, verbose: bool = True) -> bool:
+    """Release a pin whose owner is dead. True if one was reclaimed.
+
+    Called before the external-lock branch, so a run that was killed cannot
+    hand its frequency to the next run as if it were policy.
+    """
+    rec = _read_owner(smi_idx)
+    if rec is None:
+        return False
+    if _owner_alive(rec):
+        return False
+    if verbose:
+        print(f"[clock] a previous run (pid {rec.get('pid')}, started "
+              f"{rec.get('taken')}) left this GPU pinned at "
+              f"{rec.get('target_gpu_mhz')} MHz and is no longer running. "
+              f"Releasing that stale pin rather than adopting it.", flush=True)
+    unlock(smi_idx, keep_claim=True)
+    _clear_owner(smi_idx)
+    return True
 
 
 def _snap(target: int, supported: List[int]) -> int:
@@ -685,6 +810,10 @@ def lock(smi_idx: int = 0, gpu_mhz: Optional[int] = None,
     ok, obs = verify(gpu_mhz, smi_idx)
     state["locked"] = bool(ok)
     state["observed"] = obs
+    if ok:
+        # Claim it on disk the moment the pin is real, so that even a SIGKILL one
+        # instruction later leaves a record saying who to blame and what to reclaim.
+        _write_owner(smi_idx, gpu_mhz)
     if not ok:
         state["error"] = (f"clock did not settle on {gpu_mhz} MHz "
                           f"(observed {obs.get('sm_mhz')} MHz, "
@@ -693,8 +822,15 @@ def lock(smi_idx: int = 0, gpu_mhz: Optional[int] = None,
     return state
 
 
-def unlock(smi_idx: int = 0) -> None:
-    """Release the pin. Best-effort: a failed unlock must not fail a finished run."""
+def unlock(smi_idx: int = 0, *, keep_claim: bool = False) -> None:
+    """Release the pin. Best-effort: a failed unlock must not fail a finished run.
+
+    Drops the on-disk claim too, so a released pin cannot later be mistaken for a
+    stale one. *keep_claim* exists for reclaim_stale, which clears the record
+    itself after deciding the record was the thing being acted on.
+    """
+    if not keep_claim:
+        _clear_owner(smi_idx)
     try:
         _run(_privileged("unlock", smi_idx), timeout=60)
     except (OSError, subprocess.SubprocessError):
@@ -723,10 +859,14 @@ def _release_on_exit(smi_idx: int) -> None:
         if owner_pid() != os.getpid():
             return
         if os.environ.get(ENV_KEEP, "").strip().lower() in ("1", "yes", "true", "on"):
+            # Deliberately kept, so drop the claim on the way out. Leaving it would
+            # make the next run read this as a dead owner and reclaim the very pin
+            # KEEP exists to preserve -- the two features would cancel out.
+            _clear_owner(smi_idx)
             print(f"[clock] leaving the clock pinned ({ENV_KEEP}=1); release it with "
                   f"`python -m utils.clock_lock --unlock`", flush=True)
             return
-        unlock(smi_idx)
+        unlock(smi_idx)                       # also drops the on-disk claim
         os.environ.pop(ENV_OWNER, None)
 
     atexit.register(_cleanup)
@@ -845,6 +985,13 @@ def ensure_locked(device_idx: int = 0, what: str = "run",
                     f"released or overrode the lock mid-run; timings on either "
                     f"side of that are not comparable.")
             return st
+
+    # 1b. A pin left by a run that died without releasing it. Checked BEFORE the
+    #     external-lock branch, because that branch cannot tell the two apart:
+    #     both look like "pinned, not by me". Adopting a dead run's frequency is
+    #     the failure this exists to prevent -- it silently measures at a clock
+    #     the repo's T_SOL constant does not assume.
+    reclaim_stale(idx, verbose=verbose)
 
     # 2. Already locked by something outside this run -- an operator, a systemd
     #    unit, a cluster prolog. The requirement is that the clock be pinned, not
@@ -965,6 +1112,11 @@ def _cli() -> int:
 
     if args.lock:
         st = lock(idx, gpu_mhz=args.mhz)
+        # `--lock` means "pin it and walk away", so this process is not the owner
+        # in the sense the claim records -- it is about to exit, and a claim whose
+        # pid is dead is exactly what reclaim_stale releases. Dropping it makes the
+        # pin a deliberate external lock, which is what the operator asked for.
+        _clear_owner(idx)
         print(describe(st))
         if st.get("dram_note"):
             print(f"[clock] memory clock: {st['dram_note']}")

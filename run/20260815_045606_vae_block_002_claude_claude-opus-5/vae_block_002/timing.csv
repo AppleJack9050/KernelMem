@@ -1,0 +1,50 @@
+timestamp,round_idx,phase,seconds,detail
+2026-08-15 04:56:06,-1,process_start,0.000,pid=27319 subproc_id=0 task=vae_block_002
+2026-08-15 05:08:34,0,llm:seed,746.333,
+2026-08-15 05:09:05,0,bench:seed,31.370,ok
+2026-08-15 05:31:53,0,stop_signal,0.000,signum=15 graceful
+2026-08-15 05:31:56,0,abort_signal,0.000,signum=15 round_abandoned
+2026-08-15 05:34:03,-1,process_start,0.000,pid=36363 subproc_id=0 task=vae_block_002
+2026-08-15 05:34:45,-1,process_start,0.000,pid=36604 subproc_id=0 task=vae_block_002
+2026-08-15 05:34:45,1,resume,0.000,start_round=1 best=1.2058
+2026-08-15 05:34:54,1,ncu_invocation:metrics[kernel0],7.149,ok
+2026-08-15 05:35:00,1,ncu_invocation:section[kernel0],5.783,ok
+2026-08-15 05:35:07,1,ncu_invocation:metrics[kernel1],6.932,ok
+2026-08-15 05:35:12,1,ncu_invocation:section[kernel1],5.696,ok
+2026-08-15 05:35:14,1,ncu_invocation:metrics[kernel2],1.810,ok
+2026-08-15 05:35:16,1,ncu_invocation:section[kernel2],1.857,ok
+2026-08-15 05:35:16,1,ncu_profile_total,29.253,names=3 csv=ncu_temp_0.csv
+2026-08-15 05:35:16,1,ncu:base,29.258,names=3
+2026-08-15 05:35:19,1,nsys,3.040,
+2026-08-15 05:43:14,-1,process_start,0.000,pid=39830 subproc_id=0 task=vae_block_002
+2026-08-15 05:43:14,1,resume,0.000,start_round=1 best=1.2058
+2026-08-15 05:43:15,1,ncu:base,0.000,cache_hit
+2026-08-15 05:43:18,1,nsys,2.978,
+2026-08-15 05:43:23,1,llm:judge_gate,4.686,
+2026-08-15 05:46:12,1,llm:judge_optimization,168.856,
+2026-08-15 05:51:05,1,llm:optimization,293.435,
+2026-08-15 05:51:37,1,bench:opt,31.998,ok
+2026-08-15 05:52:00,1,round_total,526.851,best=1.2058
+2026-08-15 05:52:04,2,ncu_invocation:metrics[kernel0],1.809,ok
+2026-08-15 05:52:06,2,ncu_invocation:section[kernel0],1.809,ok
+2026-08-15 05:52:07,2,ncu_invocation:metrics[kernel1],1.805,ok
+2026-08-15 05:52:09,2,ncu_invocation:section[kernel1],1.809,ok
+2026-08-15 05:52:11,2,ncu_invocation:metrics[kernel2],1.809,ok
+2026-08-15 05:52:13,2,ncu_invocation:section[kernel2],1.807,ok
+2026-08-15 05:52:19,2,ncu_invocation:metrics[kernel3],6.185,ok
+2026-08-15 05:52:24,2,ncu_invocation:section[kernel3],5.205,ok
+2026-08-15 05:52:30,2,ncu_invocation:metrics[kernel4],6.133,ok
+2026-08-15 05:52:36,2,ncu_invocation:section[kernel4],5.849,ok
+2026-08-15 05:52:36,2,ncu_profile_total,34.383,names=5 csv=ncu_temp_0.csv
+2026-08-15 05:52:36,2,ncu:base,34.387,names=5
+2026-08-15 05:52:39,2,nsys,2.753,
+2026-08-15 05:52:44,2,llm:judge_gate,5.084,
+2026-08-15 05:52:45,2,stop_signal,0.000,signum=15 graceful
+2026-08-15 05:52:47,2,abort_signal,0.000,signum=15 round_abandoned
+2026-08-15 05:53:10,-1,process_start,0.000,pid=44902 subproc_id=0 task=vae_block_002
+2026-08-15 05:53:10,2,resume,0.000,start_round=2 best=1.2058
+2026-08-15 05:53:11,2,ncu:base,0.000,cache_hit
+2026-08-15 05:53:14,2,nsys,2.774,
+2026-08-15 05:53:19,2,llm:judge_gate,4.859,
+2026-08-15 05:55:46,2,llm:judge_optimization,147.063,
+2026-08-15 06:16:37,2,llm:optimization,1250.855,failed:

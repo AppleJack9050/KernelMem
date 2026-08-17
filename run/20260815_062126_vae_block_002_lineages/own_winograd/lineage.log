@@ -1,0 +1,11 @@
+[gpu] spec key 'RTX 5090'
+[BATCH] Output folder: /home/otter77/git_project/KernelMem/run/20260815_062126_vae_block_002_lineages/own_winograd/20260815_062129_vae_block_002_claude_claude-opus-5
+[vae_block_002.py] Round 0
+[Seed] Generating the initial kernel ...
+[ref_profile] Profiling reference model to inform granularity choice ...
+[ref_profile] REFERENCE PROFILE (measured on this GPU, not estimated)
+[ref_profile] The unmodified reference takes 2816.6 us of GPU time per forward.
+[ref_profile] Where that time actually goes:
+[capability] cutlass: available (/home/otter77/git_project/KernelMem/third_party/cutlass/include; PFN shim required)
+
+[stop] Signal 15 received. Finishing the current round, then writing artifacts and a resumable checkpoint. Signal again to abort now.

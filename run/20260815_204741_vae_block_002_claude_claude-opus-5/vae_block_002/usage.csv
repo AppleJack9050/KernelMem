@@ -1,0 +1,2 @@
+timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens,model,effort
+2026-08-15 21:17:21,0,seed,935981,47956,983937,claude-opus-5,high

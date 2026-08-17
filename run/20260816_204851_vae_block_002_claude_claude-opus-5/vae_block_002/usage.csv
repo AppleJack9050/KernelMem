@@ -1,0 +1,4 @@
+timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens,model,effort
+2026-08-16 21:24:16,1,judge_optimization,68913,23922,92835,claude-opus-5,high
+2026-08-16 21:27:31,1,optimization,347772,22785,370557,claude-sonnet-5,high
+2026-08-16 21:36:45,2,judge_optimization,70113,30309,100422,claude-opus-5,high

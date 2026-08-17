@@ -35,7 +35,7 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from utils.mcgs_view import find_graph_file, load_graph
 
@@ -517,6 +517,70 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args) -> None:
         pass                                             # one line per 3s poll is noise
+
+
+def serve_background(path: Path, *, lam: float = 0.7, port: int = DEFAULT_PORT,
+                     tries: int = 20, open_browser: bool = False,
+                     verbose: bool = True) -> Optional[Tuple[ThreadingHTTPServer, str]]:
+    """Start the viewer beside a live run. Returns (server, url), or None.
+
+    A DAEMON THREAD in the run's own process, deliberately, not a subprocess.
+    A subprocess would outlive a ``kill -9`` of the run and keep holding the port,
+    and this repo has already been bitten once by exactly that shape of bug: a
+    SIGKILLed run skipped its cleanup and left the GPU clock pinned, which the
+    next run then adopted as an external lock and measured at the wrong frequency.
+    A daemon thread cannot survive its parent, so there is no cleanup to skip and
+    no orphan to inherit. It also cannot block interpreter exit, so it cannot
+    delay the graceful-stop path that writes the checkpoint.
+
+    Safe to run against a live run because the viewer is strictly read-only: it
+    polls the graph file the loop has already written and never imports the loop.
+    It does no GPU work, so it cannot perturb a measurement -- the thing that
+    matters most here, since ``noise_verify`` discards any sample that shared the
+    card.
+
+    Never raises. A viewer that cannot start is an inconvenience; a viewer that
+    takes down a run costs GPU hours, so every failure path returns None instead.
+    """
+    try:
+        path = Path(path)
+        if not path.exists():
+            return None
+        # A per-server subclass, because Handler carries its root on the CLASS.
+        # Two servers in one process (a batch run, or a caller that starts one
+        # per task) would otherwise silently serve each other's run directory.
+        handler = type("BoundHandler", (Handler,), {"root_path": path, "lam": float(lam)})
+        httpd: Optional[ThreadingHTTPServer] = None
+        chosen = 0
+        for p in range(int(port), int(port) + max(1, int(tries))):
+            try:
+                httpd = ThreadingHTTPServer(("127.0.0.1", p), handler)
+                chosen = p
+                break
+            except OSError:
+                continue          # port busy: another run's viewer already has it
+        if httpd is None:
+            if verbose:
+                print(f"[viewer] no free port in {port}..{port + tries - 1}; "
+                      f"viewer not started (the run is unaffected)", flush=True)
+            return None
+        # Loopback only, and never configurable from here. The CLI can be told to
+        # bind elsewhere by someone who means it; an automatic viewer that did so
+        # would publish a run directory to the network as a side effect of
+        # starting a training run.
+        url = f"http://127.0.0.1:{chosen}"
+        t = threading.Thread(target=httpd.serve_forever, name="mcgs-viewer", daemon=True)
+        t.start()
+        if verbose:
+            print(f"[viewer] {url}   (live MCGS graph for this run)", flush=True)
+        if open_browser:
+            threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+        return httpd, url
+    except Exception as exc:
+        if verbose:
+            print(f"[viewer] not started ({exc.__class__.__name__}: {exc}); "
+                  f"the run is unaffected", flush=True)
+        return None
 
 
 def main(argv: Optional[list] = None) -> int:

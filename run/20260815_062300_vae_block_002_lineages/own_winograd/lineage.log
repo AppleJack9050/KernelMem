@@ -1,0 +1,118 @@
+[gpu] spec key 'RTX 5090'
+[BATCH] Output folder: /home/otter77/git_project/KernelMem/run/20260815_062300_vae_block_002_lineages/own_winograd/20260815_062303_vae_block_002_claude_claude-opus-5
+[vae_block_002.py] Round 0
+[Seed] Generating the initial kernel ...
+[ref_profile] Profiling reference model to inform granularity choice ...
+[gpu_lock] own_winograd(D/winograd_f2x3): waiting for the GPU to free up (ref_profile) ...
+[gpu_lock] own_winograd(D/winograd_f2x3): acquired after 1.8s (ref_profile)
+[ref_profile] REFERENCE PROFILE (measured on this GPU, not estimated)
+[ref_profile] The unmodified reference takes 2829.3 us of GPU time per forward.
+[ref_profile] Where that time actually goes:
+[capability] cutlass: available (/home/otter77/git_project/KernelMem/third_party/cutlass/include; PFN shim required)
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+⚠️  Exception occurred (attempt 1/3). Retrying in 1.0s...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+❌ Not retrying again after 1 retry/retries: Exception: Claude Code returned an error result: Reached maximum number of turns (30)
+[Seed] candidate 1/1 failed to generate (Exception: Claude Code returned an error result: Reached maximum number of turns (30)); skipping this draw
+Traceback (most recent call last):
+  File "/home/otter77/git_project/KernelMem/main_memory_latest.py", line 3668, in <module>
+    main()
+    ~~~~^^
+  File "/home/otter77/git_project/KernelMem/main_memory_latest.py", line 3602, in main
+    res = _run_single_task(all_tasks[0], args, batch_dir=batch_dir)
+  File "/home/otter77/git_project/KernelMem/main_memory_latest.py", line 1889, in _run_single_task
+    raise RuntimeError(
+        f"All {n_seeds} seed draws failed to generate a kernel; nothing to "
+        f"optimise. See the [Seed] lines above for the per-draw errors.")
+RuntimeError: All 1 seed draws failed to generate a kernel; nothing to optimise. See the [Seed] lines above for the per-draw errors.

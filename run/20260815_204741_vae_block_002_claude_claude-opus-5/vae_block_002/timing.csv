@@ -1,0 +1,15 @@
+timestamp,round_idx,phase,seconds,detail
+2026-08-15 20:47:41,-1,process_start,0.000,pid=62978 subproc_id=0 task=vae_block_002
+2026-08-15 21:17:21,0,llm:seed,1777.824,
+2026-08-15 21:17:51,0,bench:seed,30.863,ok
+2026-08-15 21:17:51,0,round_total,1810.367,best=1.1106
+2026-08-15 21:17:59,1,ncu_invocation:metrics[kernel0],6.358,ok
+2026-08-15 21:18:04,1,ncu_invocation:section[kernel0],5.285,ok
+2026-08-15 21:18:11,1,ncu_invocation:metrics[kernel1],6.239,ok
+2026-08-15 21:18:16,1,ncu_invocation:section[kernel1],5.394,ok
+2026-08-15 21:18:23,1,ncu_invocation:metrics[kernel2],6.490,ok
+2026-08-15 21:18:28,1,ncu_invocation:section[kernel2],5.243,ok
+2026-08-15 21:18:32,1,stop_signal,0.000,signum=15 graceful
+2026-08-15 21:18:34,1,ncu_invocation:metrics[kernel3],5.977,ok
+2026-08-15 21:18:39,1,ncu_invocation:section[kernel3],4.785,ok
+2026-08-15 21:18:42,1,abort_signal,0.000,signum=15 round_abandoned

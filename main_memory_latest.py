@@ -360,6 +360,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to an existing batch folder (run/<stamp>_<task>_<tag>). Reuses that "
                         "folder and continues each task from its checkpoint.json instead of "
                         "starting a new run. Combine with a larger --round to extend a finished run.")
+    p.add_argument("--no_viewer", action="store_true",
+                   help="Do not start the live MCGS graph viewer. The viewer runs by "
+                        "default, as a DAEMON THREAD inside this process serving loopback "
+                        "only: it polls the graph file the loop has already written, never "
+                        "imports the loop, and does no GPU work, so it cannot perturb a "
+                        "measurement. A daemon thread cannot outlive the run, so unlike a "
+                        "subprocess it leaves no orphan holding the port after a kill -9. "
+                        "Also settable with KERNELMEM_VIEWER=0.")
+    p.add_argument("--viewer_port", type=int, default=8747,
+                   help="First port the viewer tries; it scans upward for a free one, so "
+                        "concurrent runs each get their own rather than the second failing.")
+    p.add_argument("--viewer_open", action="store_true",
+                   help="Open a browser at the viewer URL. Off by default: runs are "
+                        "usually launched headless or with output redirected, and popping "
+                        "a browser out of a background job is worse than printing a URL.")
     p.add_argument("--subproc_id", type=int, default=0, help="Identifier for sub-process (e.g., when running multiple in parallel)")
     p.add_argument("--no_clock_lock", action="store_true",
                    help="Run WITHOUT pinning the GPU clock. Off by default: an "
@@ -2915,7 +2930,19 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         pathway_block = ""
                         if _use_mcgs:
                             try:
-                                from utils.pathmemory import render_pathway
+                                from utils.pathmemory import (broadcast_credit,
+                                                              render_pathway)
+                                # Broadcast HERE as well as after backup, not only
+                                # after it. Credit is written at the end of a round,
+                                # so on round 1 -- when the graph holds the seed and
+                                # nothing else -- it had never run, every node still
+                                # read credit=0.0, and render_pathway correctly
+                                # reported "no pathway" for a graph that plainly had
+                                # one. Re-running it at prompt time is a cheap pass
+                                # over the nodes and makes the block correct whenever
+                                # it is built, rather than only when the round loop
+                                # happens to have refreshed it first.
+                                broadcast_credit(graph)
                                 pathway_block = render_pathway(
                                     graph,
                                     current_key=(_mcgs_sel.node.key if _mcgs_sel else None),
@@ -3656,6 +3683,29 @@ def main():
         batch_dir = (args.work_dir / batch_name).resolve()
         batch_dir.mkdir(parents=True, exist_ok=True)
         print(f"[BATCH] Output folder: {batch_dir}")
+
+    # ---- Live graph viewer ----
+    # Started here: after batch_dir exists (it is what the viewer serves) and
+    # before any round, so the page is up for the whole run rather than appearing
+    # once there is something to look at. There is no graph file until the first
+    # round boundary and the viewer reports that as a normal state, which is the
+    # correct thing to show during a 30-minute seed.
+    #
+    # Kept out of _run_single_task on purpose: a batch runs several tasks through
+    # that function, and one viewer per task would fight for ports and leave a
+    # thread per task alive. One per process, serving the batch folder, whose
+    # find_graph_file already follows the active task inside it.
+    _viewer = None
+    if not args.no_viewer and os.environ.get("KERNELMEM_VIEWER", "1").strip().lower() \
+            not in ("0", "off", "false", "no"):
+        try:
+            from utils.mcgs_serve import serve_background
+            _viewer = serve_background(batch_dir, lam=args.mcgs_lam,
+                                       port=args.viewer_port,
+                                       open_browser=args.viewer_open)
+        except Exception as exc:
+            print(f"[viewer] not started ({type(exc).__name__}: {exc}); "
+                  f"the run is unaffected", flush=True)
 
     # single file → run once (still inside the same batch folder)
     if args.arch_py.is_file():

@@ -1,0 +1,32 @@
+{
+  "task": "tasks/vae_block_002.py",
+  "reference_us": 2629.6576400000004,
+  "vendor_us": 1996.7504800000004,
+  "incumbent": null,
+  "lineages": [
+    {
+      "id": "own_gemm",
+      "granularity": "D",
+      "algorithm": "implicit_gemm",
+      "ceiling": 1.1970670606158236,
+      "status": "failed",
+      "reason": "exited rc=1 after 0/10 rounds",
+      "rounds_done": 0,
+      "best": null,
+      "batch_dir": "/home/otter77/git_project/KernelMem/run/20260815_062300_vae_block_002_lineages/own_gemm"
+    },
+    {
+      "id": "own_winograd",
+      "granularity": "D",
+      "algorithm": "winograd_f2x3",
+      "ceiling": 1.5456607752879585,
+      "status": "failed",
+      "reason": "exited rc=1 after 0/10 rounds",
+      "rounds_done": 0,
+      "best": null,
+      "batch_dir": "/home/otter77/git_project/KernelMem/run/20260815_062300_vae_block_002_lineages/own_winograd"
+    }
+  ],
+  "winner": null,
+  "timestamp": "2026-08-15T07:04:02.461850"
+}
