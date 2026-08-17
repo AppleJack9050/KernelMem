@@ -92,7 +92,19 @@ def _skills_config():
     return (names or "all"), ["user"], _AGENT_TOOLS + ["Skill"]
 _TOOL_MAX_TURNS = int(os.environ.get("KERNELMEM_AGENT_MAX_TURNS", "30"))
 
-_TOOL_MODE_INSTRUCTION = """
+# The budget is STATED and given a stop rule, because withholding both was
+# measurably expensive. Measured on 002 / H100, 2026-08-17 round 0: the seed call
+# hit the turn cap, the retry hit it again, and 62 turns over 37.7 minutes
+# delivered a kernel that had already existed at roughly turn 8 -- everything
+# after it was discarded when the wall arrived. The agent was never told how many
+# turns it had, and nothing in the prompt said when to stop, so it kept
+# investigating: ~25 of ~31 turns per attempt went to hand-rolled micro-benchmarks
+# (convbench.py, cpucost.py, ovl.py, micro.cu) re-deriving badly what the harness
+# measures properly two minutes later. The old text did say "do NOT benchmark",
+# but gave no reason, and an agent with no roofline feedback and no clock has no
+# reason to believe it. So: say the number, say why measuring here is wasted, and
+# say what ends the call.
+_TOOL_MODE_INSTRUCTION = f"""
 
 TOOLS ARE AVAILABLE THIS CALL. You have Bash, Read, Write, Edit, Glob and Grep,
 and a private scratch directory as your working directory. Use them: write the
@@ -102,15 +114,38 @@ yourself instead of spending a round on it.
 - `python -c "import torch"` works; torch, nvcc and ninja are on PATH.
 - torch.utils.cpp_extension.load_inline is the same mechanism the harness uses,
   so a successful load_inline in your scratch dir means it will build there too.
-- Do NOT benchmark against the reference to tune here; correctness and
-  compilation are what tools are for. The harness measures performance.
 - Work only inside your working directory. Do not modify anything outside it.
+
+YOU HAVE {_TOOL_MAX_TURNS} TURNS, AND A STOP RULE. Your job this call is a kernel
+that COMPILES and MATCHES THE REFERENCE -- not a fast one. The moment `ANSWER.py`
+compiles and matches on the shapes you can test, post it in your final message
+and STOP. Do not keep exploring because turns remain.
+
+DO NOT BENCHMARK OR PROFILE HERE, and here is why -- the old instruction said
+this without a reason:
+- The harness benchmarks your kernel immediately after you answer, over every
+  scored shape, with interleaved repeats and a paired significance test. Nothing
+  you measure in this scratch dir is read by anything.
+- The NEXT round's prompt hands you full ncu counters and an nsys timeline for
+  every kernel you wrote. That is real profiling data on the real shapes; your
+  hand-rolled timing loop here is a worse version of it, several turns later.
+- Turns spent measuring are turns not spent on correctness, which IS your job
+  this call and is the only thing that can make the round score zero.
+- Running out of turns is a FAILURE, not a finish: the call errors out, costs a
+  retry, and the round is then scored from whatever `ANSWER.py` holds -- which is
+  usually an EARLIER draft than your best work, so your later work is lost.
 
 DELIVER EARLY AND OFTEN, TO A FILE. The moment you have a complete kernel that
 compiles -- however unambitious -- write it to `ANSWER.py` in your working
 directory. Overwrite it whenever you have something better that still compiles.
 Treat it as a ratchet: `ANSWER.py` should always hold the best COMPLETE kernel
 you have so far, never a partial edit.
+
+UPDATE `ANSWER.py` BEFORE YOU START THE NEXT EXPERIMENT, every time -- not once
+at the beginning. A stale ratchet is how good work gets thrown away: on the run
+that motivated this text, `ANSWER.py` still held the FIRST draft while four
+better revisions sat beside it, and when the turn budget ran out the first draft
+was what got scored.
 
 This exists because your turn budget can run out mid-investigation, and if it
 does, your final message never happens and everything you built is lost with the
@@ -289,18 +324,18 @@ def retry_with_backoff(
                 predicate_attempts += 1
                 if predicate_attempts > retry_if_max_retries:
                     print(f"❌ Not retrying again after {predicate_attempts - 1} retry/retries: "
-                          f"{type(e).__name__}: {str(e)[:200]}")
+                          f"{type(e).__name__}: {str(e)[:200]}", flush=True)
                     raise
             attempt += 1
             if max_retries is not None and attempt > max_retries:
-                print(f"❌ Failed after {max_retries} attempts. Last error: {type(e).__name__}: {e}")
+                print(f"❌ Failed after {max_retries} attempts. Last error: {type(e).__name__}: {e}", flush=True)
                 raise
 
             error_name = type(e).__name__
             if max_retries is not None:
-                print(f"⚠️  {error_name} occurred (attempt {attempt}/{max_retries}). Retrying in {delay:.1f}s...")
+                print(f"⚠️  {error_name} occurred (attempt {attempt}/{max_retries}). Retrying in {delay:.1f}s...", flush=True)
             else:
-                print(f"⚠️  {error_name} occurred (attempt {attempt}, unlimited retries). Retrying in {delay:.1f}s...")
+                print(f"⚠️  {error_name} occurred (attempt {attempt}, unlimited retries). Retrying in {delay:.1f}s...", flush=True)
             time.sleep(delay)
             delay = min(delay * backoff_factor, max_delay)
 
@@ -317,8 +352,23 @@ def _is_transient_cli_result_error(exc: BaseException) -> bool:
 
     Matched on message text because the class carries no other signal. Kept
     narrow deliberately: a wrong match here would silently retry a real bug.
+
+    EXHAUSTING THE TURN BUDGET IS EXPLICITLY NOT TRANSIENT. The CLI reports it
+    through the same "returned an error result" channel, so the text match above
+    used to catch it and retry -- and a retry cannot do better, because nothing
+    about the second attempt is different: it gets a fresh full budget and walks
+    into the same wall. Measured on 002 / H100, 2026-08-17 round 0: two attempts,
+    30 turns each, 36.7 minutes of the round's 37.7, and the kernel that was
+    finally scored came from attempt 2's ANSWER.py written at roughly turn 8.
+    Salvage is the correct handling for this failure, and it is already wired --
+    so return False and let the call fall straight through to it.
     """
-    return isinstance(exc, Exception) and "returned an error result" in str(exc)
+    if not isinstance(exc, Exception):
+        return False
+    msg = str(exc)
+    if "maximum number of turns" in msg:
+        return False
+    return "returned an error result" in msg
 
 
 def colorize_finish_reason(reason: Optional[str]) -> str:
