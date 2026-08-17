@@ -1,0 +1,6 @@
+Kernel Name,kernel_launch_count
+gn_apply_nhwc,24
+gn_stats_nhwc,24
+nchw_to_nhwc_kernel,12
+weight_to_nhwc_kernel,24
+gn_finalize_nhwc,24

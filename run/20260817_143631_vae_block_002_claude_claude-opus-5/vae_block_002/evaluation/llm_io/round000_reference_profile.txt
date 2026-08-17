@@ -1,0 +1,31 @@
+REFERENCE PROFILE (measured on this GPU, not estimated)
+The unmodified reference takes 1510.1 us of GPU time per forward.
+Where that time actually goes:
+
+   % time         us  calls  kernel
+    41.4%      624.5      2  sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc…   <-- vendor GEMM/conv
+    11.0%      166.6      4  cudnn::engines_precompiled::nchwToNhwcKernel
+    10.6%      160.5      2  at::native::(anonymous namespace)::RowwiseMomentsCUDAKern…
+    10.4%      156.7      2  at::native::elementwise_kernel
+     9.5%      144.0      2  cudnn::engines_precompiled::nhwcToNchwKernel
+     9.4%      142.4      2  at::native::vectorized_elementwise_kernel
+     7.2%      108.9      1  at::native::vectorized_elementwise_kernel
+     0.3%        4.5      2  at::native::(anonymous namespace)::ComputeFusedParamsCUDA…
+
+Vendor GEMM/convolution kernels are 41.4% of GPU time.
+These are tuned tensor-core implementations. Ordinary library kernels
+(elementwise, reductions, norms, layout conversions) are straightforward
+to replace with your own CUDA; a vendor GEMM/conv is not.
+
+USE THIS WHEN CHOOSING GRANULARITY:
+- Leaving the vendor GEMM/conv in place fixes 41.4% of the runtime.
+  By Amdahl's law your speedup is then capped at 1/0.414 = 2.42x,
+  and only if you drive ALL other work to zero. Judge whether that cap is
+  worth the effort before committing to a granularity.
+- Do NOT assume the vendor kernel is slow. It is often at or near the
+  hardware roofline, in which case reimplementing it wins nothing by itself.
+  The gain from owning it comes from FUSING the surrounding work into its
+  prologue/epilogue so intermediates are never written to global memory.
+- Owning that operator requires granularity (D). If you choose (A)/(B)/(C),
+  you are accepting the 2.42x cap for the entire run — later rounds
+  cannot revisit this decision.

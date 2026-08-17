@@ -1,0 +1,259 @@
+[clock] WARNING: KERNELMEM_CLOCK_LOCK=0 -- running at unlocked boost clock (345 MHz now). Timings from this run are NOT comparable with locked runs.
+[gpu] spec key 'H100'
+[BATCH] Output folder: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5
+[viewer] http://127.0.0.1:8747   (live MCGS graph for this run)
+[vae_block_002.py] Round 0
+[Seed] Generating the initial kernel ...
+[ref_profile] Profiling reference model to inform granularity choice ...
+[ref_profile] REFERENCE PROFILE (measured on this GPU, not estimated)
+[ref_profile] The unmodified reference takes 1510.1 us of GPU time per forward.
+[ref_profile] Where that time actually goes:
+[capability] cutlass: available (/home/elek/miniforge3/envs/kernelmem311/lib/python3.11/site-packages/cutlass_library/source/include)
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+⚠️  Exception occurred (attempt 1/3). Retrying in 1.0s...
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+❌ Not retrying again after 1 retry/retries: Exception: Claude Code returned an error result: Reached maximum number of turns (30)
+[salvage] seed: no kernel arrived in the reply (Exception: Claude Code returned an error result: Reached maximum number of turns (30)). Recovered 14661 chars from ANSWER.py in the agent's scratch dir; it still has to compile, match the reference and beat the base like any other candidate.
+[90mFinish reason: unknown[0m
+[clock] WARNING: KERNELMEM_CLOCK_LOCK=0 -- running at unlocked boost clock (1755 MHz now). Timings from this benchmark are NOT comparable with locked runs.
+[seed] score=1.5522 (geomean over 4 shapes: 8x256x64x128=1.3826x  2x256x64x64=1.4003x  4x256x256x256=1.4993x  1x256x131x131=1.9996x)
+[seed] metrics saved to: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json
+[seed] bench took 56.6s
+[mcgs] Root state x:96c6a10077637347 <- kernel_20260817_151317 at 1.5522 (key mode: mechanisms)
+[base] Setting initial base_kernel: 1.5522
+[best] Updating best_kernel: 1.5522 vs -inf [stored-score (no paired verdict available)]
+[vae_block_002.py] Round 0 took 37.7 min (2263s)
+[vae_block_002.py] Round 1
+Optimizing start
+[mcgs] Round 1: branching from state x:96c6a10077637347 (depth 0, N=0, Q=0.000, value 1.5522) via kernel_20260817_151317
+[mcgs]   why: leaf state (no expandable children yet)
+[mcgs]   graph: 1 states / 1 kernels, 0 merged, mean N=0.00, depth seen 0
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['nchw2nhwc_kernel', 'wt_kcrs2krsc_kernel', 'gn_partial_kernel', 'gn_finalize_kernel', 'gn_silu_kernel', 'gn_silu_res_t_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_0.py (parent_kernel: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_151317.py)
+[ncu] Profiling kernel from file: /home/elek/KernelMem/test_kernel_0.py
+[ncu] Multiple kernels detected (6), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/6: nchw2nhwc_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel0_metrics.csv --kernel-name=::regex:\bnchw2nhwc_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 7.8s
+[ncu] [metrics] Completed for kernel 1/6: nchw2nhwc_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel0_section.csv --kernel-name=::regex:\bnchw2nhwc_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 6.9s
+[ncu] [section] Completed for kernel 1/6: nchw2nhwc_kernel
+[ncu] Profiling kernel 2/6: wt_kcrs2krsc_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel1_metrics.csv --kernel-name=::regex:\bwt_kcrs2krsc_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 7.1s
+[ncu] [metrics] Completed for kernel 2/6: wt_kcrs2krsc_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel1_section.csv --kernel-name=::regex:\bwt_kcrs2krsc_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 6.8s
+[ncu] [section] Completed for kernel 2/6: wt_kcrs2krsc_kernel
+[ncu] Profiling kernel 3/6: gn_partial_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel2_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 7.4s
+[ncu] [metrics] Completed for kernel 3/6: gn_partial_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel2_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 6.7s
+[ncu] [section] Completed for kernel 3/6: gn_partial_kernel
+[ncu] Profiling kernel 4/6: gn_finalize_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel3_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 7.0s
+[ncu] [metrics] Completed for kernel 4/6: gn_finalize_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel3_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 6.9s
+[ncu] [section] Completed for kernel 4/6: gn_finalize_kernel
+[ncu] Profiling kernel 5/6: gn_silu_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel4_metrics.csv --kernel-name=::regex:\bgn_silu_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 7.0s
+[ncu] [metrics] Completed for kernel 5/6: gn_silu_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel4_section.csv --kernel-name=::regex:\bgn_silu_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 6.8s
+[ncu] [section] Completed for kernel 5/6: gn_silu_kernel
+[ncu] Profiling kernel 6/6: gn_silu_res_t_kernel
+[ncu] [metrics[kernel5]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_metrics.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel5_metrics.csv --kernel-name=::regex:\bgn_silu_res_t_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [metrics[kernel5]] completed successfully in 7.1s
+[ncu] [metrics] Completed for kernel 6/6: gn_silu_res_t_kernel
+[ncu] [section[kernel5]] running: /usr/local/cuda/bin/ncu --config-file-path /home/elek/KernelMem/config_section.ncu-cfg --log-file=/home/elek/KernelMem/ncu_temp_0_kernel5_section.csv --kernel-name=::regex:\bgn_silu_res_t_kernel\b /home/elek/miniforge3/envs/kernelmem311/bin/python bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py --repeat 100
+[ncu] [section[kernel5]] completed successfully in 6.8s
+[ncu] [section] Completed for kernel 6/6: gn_silu_res_t_kernel
+[ok] Merged 6 kernel profiles into: /home/elek/KernelMem/ncu_temp_0.csv
+[ncu] profile_bench finished in 84.3s (6 kernel name(s), 12 invocation(s), 14.0s per name)
+[ncu] Saved profiling results to: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260817_151317_ncu.csv
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/elek/KernelMem/nsys_temp_0 /home/elek/miniforge3/envs/kernelmem311/bin/python3 bench_ref_inputs_0.py --device-idx 0 --test /home/elek/KernelMem/test_kernel_0.py
+[nsys] Profile completed: /home/elek/KernelMem/nsys_temp_0.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_0.nsys-rep
+[nsys] Extracted launch counts for 6 kernel(s)
+[nsys] Saved launch counts to: nsys_temp_0.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/elek/KernelMem/nsys_temp_0.nsys-rep
+[nsys] Extracted launch counts for 7 kernel(s)
+[nsys] Saved launch counts to: nsys_full_0.csv
+[nsys] Added full launch table (7 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260817_151317_nsys.nsys-rep
+[nsys] Saved .csv to: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260817_151317_nsys.csv
+[machine_check] Using kernel_launch_count from nsys: 108
+[judge_gate] Saved prompt to: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_judge_gate_prompt.txt
+Usage: In=24868, Out=267, Total=25135
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_code_features.json
+[machine_check] Saved machine_check_result to: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=62262, Out=25879, Total=88141
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_151317/opt_round_001.json
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+
+[stop] Signal 15 received. Finishing the current round, then writing artifacts and a resumable checkpoint. Signal again to abort now.
+
+[stop] Second signal - aborting immediately.

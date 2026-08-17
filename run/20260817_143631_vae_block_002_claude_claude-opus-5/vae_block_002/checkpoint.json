@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "task": "tasks/vae_block_002.py",
+  "next_round": 1,
+  "total_rounds": 20,
+  "base": {
+    "code_path": "/home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_151317.py",
+    "eval_path": "/home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json",
+    "score": 1.552185584346308
+  },
+  "best": {
+    "code_path": "/home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_151317.py",
+    "eval_path": "/home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json",
+    "score": 1.552185584346308
+  },
+  "current": {
+    "code_path": "/home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_151317.py",
+    "eval_path": "/home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json",
+    "score": 1.552185584346308
+  },
+  "repair_chain": null,
+  "base_score": 1.552185584346308,
+  "best_score": 1.552185584346308,
+  "optimization_tree": {
+    "kernel_20260817_151317": {
+      "parent": null,
+      "kernel_name": "kernel_20260817_151317",
+      "kernel_path": "/home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_151317.py",
+      "speedup": 1.552185584346308,
+      "runnable": true,
+      "ncu_passed": false,
+      "phase": "seed",
+      "round": 0,
+      "strategy": null,
+      "method_matched": false,
+      "timestamp": "2026-08-17T15:14:13.894861"
+    }
+  },
+  "scores": [
+    1.552185584346308
+  ],
+  "err_flags": [
+    false
+  ],
+  "last_score_for_curve": 1.552185584346308,
+  "rounds_since_improvement": 0,
+  "structural_debt": null,
+  "stop_reason": null,
+  "mcgs": {
+    "version": 1,
+    "root": "x:96c6a10077637347",
+    "total_visits": 0,
+    "params": {
+      "c_puct": 0.8,
+      "lam": 0.7,
+      "widen_k": 1.0,
+      "widen_alpha": 0.5,
+      "max_depth": 10,
+      "reward_scale": 3.0,
+      "state_key_mode": "mechanisms",
+      "merge_tolerance": 0.15,
+      "c_prior": 1.0,
+      "epsilon": 0.0,
+      "rng_seed": 0,
+      "pv_bonus": 0.0
+    },
+    "splits": 0,
+    "prior": null,
+    "nodes": {
+      "x:96c6a10077637347": {
+        "key": "x:96c6a10077637347",
+        "depth": 0,
+        "members": [
+          "kernel_20260817_151317"
+        ],
+        "rep": "kernel_20260817_151317",
+        "rep_path": "/home/elek/KernelMem/run/20260817_143631_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_151317.py",
+        "rep_value": 1.552185584346308,
+        "N": 0,
+        "W": 0.0,
+        "M": 0.0,
+        "failures": 0,
+        "parents": [],
+        "children": [],
+        "tried": [],
+        "runnable": true,
+        "via": null,
+        "credit": 0.0,
+        "credit_key": null
+      }
+    }
+  },
+  "opt_history_files": {},
+  "next_individual_id": 1,
+  "timestamp": "2026-08-17T15:14:13.896222"
+}
