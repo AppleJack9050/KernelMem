@@ -1,7 +1,8 @@
 Kernel Name,kernel_launch_count,time_pct,total_time_ns
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x128x32_warpgroupsize1x1x1…,24,57.4,7352505.0
-"void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…",36,15.1,1928823.0
-"gn_apply_nhwc2nchw(const float *, const float *, const float *, const float *, const float *, const…",12,12.2,1569428.0
-"gn_stats_nhwc(const float *, float *, float *, long, int)",24,9.1,1162442.0
-"gn_apply_nhwc(const float *, const float *, const float *, const float *, const float *, float *, l…",12,5.8,737672.0
-"gn_finalize_nhwc(const float *, const float *, float *, float *, int, float, float)",24,0.5,62272.0
+void cutlass::Kernel<cutlass::conv::kernel::ImplicitGemmConvolution<cutlass::conv::threadblock::Imp…,24,87.6,22097094.0
+"gn_silu_add_nchw_kernel(const float *, const float *, const float *, const float *, float *, int, i…",12,4.3,1075904.0
+"nchw2nhwc_round_kernel(const float *, float *, int, int)",12,4.1,1024512.0
+"gn_silu_round_kernel(const float *, const float *, const float *, float *, int)",12,1.9,480512.0
+"gn_partial_kernel(const float *, float *, float *, int, int)",24,1.6,398976.0
+"weight_krsc_round_kernel(const float *, float *)",24,0.4,105088.0
+"gn_finalize_kernel(const float *, const float *, const float *, const float *, float *, float *, in…",24,0.2,48448.0

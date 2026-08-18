@@ -3,398 +3,440 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
 
-_SRC = r"""
+_CUDA = r'''
+#include <cudaTypedefs.h>
+using PFN_cuTensorMapEncodeTiled  = PFN_cuTensorMapEncodeTiled_v12000;
+using PFN_cuTensorMapEncodeIm2col = PFN_cuTensorMapEncodeIm2col_v12000;
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
-#include <algorithm>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/conv/kernel/default_conv2d_fprop.h>
+#include <cutlass/conv/device/implicit_gemm_convolution.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
 
-__device__ __forceinline__ void warp_red2(float &a, float &b) {
-  #pragma unroll
-  for (int off = 16; off > 0; off >>= 1) {
-    a += __shfl_down_sync(0xffffffff, a, off);
-    b += __shfl_down_sync(0xffffffff, b, off);
-  }
+#define CH   256
+#define CH4  64
+#define GRPS 32
+#define CPG  8
+
+__device__ __forceinline__ float tf32_rn(float v) {
+    unsigned int r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(v));
+    return __int_as_float(r);
 }
-__device__ __forceinline__ float silu(float v) { return v / (1.f + __expf(-v)); }
+__device__ __forceinline__ float silu(float z) { return z / (1.f + __expf(-z)); }
 
-/* ---------------- generic NCHW fallback path ---------------- */
-__global__ void gn_stats_kernel(const float* __restrict__ x, float* __restrict__ psum,
-                                float* __restrict__ psum2, long epg, int nchunk) {
-  const int bg = blockIdx.x, chunk = blockIdx.y;
-  const long base = (long)bg * epg;
-  const long begin = (long)(chunk) * epg / nchunk;
-  const long end = (long)(chunk + 1) * epg / nchunk;
-  float s = 0.f, s2 = 0.f;
-  const long n = end - begin, p0 = base + begin;
-  if (((p0 & 3L) == 0) && ((n & 3L) == 0)) {
-    const float4* xv = reinterpret_cast<const float4*>(x + p0);
-    long nv = n >> 2;
-    for (long i = threadIdx.x; i < nv; i += blockDim.x) {
-      float4 v = xv[i];
-      s += v.x + v.y + v.z + v.w;
-      s2 += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+// ---------------------------------------------------------- K1: NCHW -> NHWC (+tf32 round)
+// tile: 128 pixels x 32 channels
+__global__ void nchw2nhwc_round_kernel(const float* __restrict__ src,
+                                       float* __restrict__ dst, int HW, int vec) {
+    __shared__ float sm[32][132];
+    const int p0 = blockIdx.x * 128;
+    const int c0 = blockIdx.y * 32;
+    const long nb = (long)blockIdx.z * CH * (long)HW;
+    const float* sp = src + nb;
+    float* dp = dst + nb;
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;          // 8 warps
+    if (vec && p0 + 128 <= HW) {
+        for (int c = wid; c < 32; c += 8) {
+            float4 v = *(const float4*)(sp + (long)(c0 + c) * HW + p0 + lane * 4);
+            float4 r;
+            r.x = tf32_rn(v.x); r.y = tf32_rn(v.y);
+            r.z = tf32_rn(v.z); r.w = tf32_rn(v.w);
+            *(float4*)&sm[c][lane * 4] = r;
+        }
+    } else {
+        for (int c = wid; c < 32; c += 8)
+            for (int j = 0; j < 4; ++j) {
+                int p = p0 + lane * 4 + j;
+                sm[c][lane * 4 + j] = (p < HW) ? tf32_rn(sp[(long)(c0 + c) * HW + p]) : 0.f;
+            }
     }
-  } else {
-    for (long i = threadIdx.x; i < n; i += blockDim.x) { float v = x[p0+i]; s += v; s2 += v*v; }
-  }
-  __shared__ float sa[32], sb[32];
-  int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
-  warp_red2(s, s2);
-  if (lane == 0) { sa[wid] = s; sb[wid] = s2; }
-  __syncthreads();
-  int nw = blockDim.x >> 5;
-  if (wid == 0) {
-    s = (lane < nw) ? sa[lane] : 0.f; s2 = (lane < nw) ? sb[lane] : 0.f;
-    warp_red2(s, s2);
-    if (lane == 0) { psum[(long)bg*nchunk+chunk] = s; psum2[(long)bg*nchunk+chunk] = s2; }
-  }
-}
-
-__global__ void gn_finalize_kernel(const float* __restrict__ psum, const float* __restrict__ psum2,
-                                   float* __restrict__ mean, float* __restrict__ rstd,
-                                   int nchunk, float inv_n, float eps) {
-  const int bg = blockIdx.x;
-  float s = 0.f, s2 = 0.f;
-  for (int i = threadIdx.x; i < nchunk; i += blockDim.x) {
-    s += psum[(long)bg*nchunk+i]; s2 += psum2[(long)bg*nchunk+i];
-  }
-  __shared__ float sa[32], sb[32];
-  int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
-  warp_red2(s, s2);
-  if (lane == 0) { sa[wid] = s; sb[wid] = s2; }
-  __syncthreads();
-  int nw = blockDim.x >> 5;
-  if (wid == 0) {
-    s = (lane < nw) ? sa[lane] : 0.f; s2 = (lane < nw) ? sb[lane] : 0.f;
-    warp_red2(s, s2);
-    if (lane == 0) {
-      float m = s * inv_n; float v = s2 * inv_n - m * m; v = v < 0.f ? 0.f : v;
-      mean[bg] = m; rstd[bg] = rsqrtf(v + eps);
+    __syncthreads();
+    const int cv = threadIdx.x & 7;
+    const int pr = threadIdx.x >> 3;            // 32 pixels per pass
+    for (int p = pr; p < 128; p += 32) {
+        int pg = p0 + p;
+        if (pg >= HW) break;
+        float4 o;
+        o.x = sm[cv * 4 + 0][p]; o.y = sm[cv * 4 + 1][p];
+        o.z = sm[cv * 4 + 2][p]; o.w = sm[cv * 4 + 3][p];
+        *(float4*)(dp + (long)pg * CH + c0 + cv * 4) = o;
     }
-  }
 }
 
-template <bool HAS_RES>
-__global__ void gn_apply_kernel(const float* __restrict__ x, const float* __restrict__ mean,
-                                const float* __restrict__ rstd, const float* __restrict__ gamma,
-                                const float* __restrict__ beta, const float* __restrict__ res,
-                                float* __restrict__ out, long N, int C, int G, int vec4) {
-  const int row = blockIdx.x;
-  const int c = row % C, b = row / C;
-  const int g = (int)((long)c * G / C);
-  const float sc = rstd[b*G+g] * gamma[c];
-  const float sh = beta[c] - mean[b*G+g] * sc;
-  const long base = (long)row * N;
-  if (vec4) {
-    const float4* xv = reinterpret_cast<const float4*>(x + base);
-    const float4* rv = reinterpret_cast<const float4*>(res + base);
-    float4* ov = reinterpret_cast<float4*>(out + base);
-    long nv = N >> 2;
-    for (long i = threadIdx.x; i < nv; i += blockDim.x) {
-      float4 v = xv[i]; float4 o;
-      o.x = silu(v.x*sc+sh); o.y = silu(v.y*sc+sh);
-      o.z = silu(v.z*sc+sh); o.w = silu(v.w*sc+sh);
-      if (HAS_RES) { float4 r = rv[i]; o.x+=r.x; o.y+=r.y; o.z+=r.z; o.w+=r.w; }
-      ov[i] = o;
+// ------------------------------------------------- K2: weights (K,C,3,3) -> (K,3,3,C) +round
+// one block per filter k, staged in shared memory so both sides are coalesced
+__global__ void weight_krsc_round_kernel(const float* __restrict__ w,
+                                         float* __restrict__ o) {
+    __shared__ float sh[CH * 9];
+    const long base = (long)blockIdx.x * (CH * 9);
+    for (int i = threadIdx.x; i < CH * 9; i += blockDim.x) sh[i] = w[base + i];
+    __syncthreads();
+    for (int i = threadIdx.x; i < CH * 9; i += blockDim.x) {
+        int c = i & (CH - 1);      // CH is a power of two
+        int rs = i >> 8;           // i / CH  in [0,9)
+        o[base + i] = tf32_rn(sh[c * 9 + rs]);
     }
-  } else {
-    for (long i = threadIdx.x; i < N; i += blockDim.x) {
-      float o = silu(x[base+i]*sc+sh);
-      if (HAS_RES) o += res[base+i];
-      out[base+i] = o;
+}
+
+// ---------------------------------------------------------- K3: per-(n,group) partial moments
+__global__ void gn_partial_kernel(const float* __restrict__ y,
+                                  float* __restrict__ psum, float* __restrict__ psq,
+                                  int HW, int chunks) {
+    const int ch = blockIdx.x, n = blockIdx.y;
+    const int pstart = (int)(((long)HW * ch) / chunks);
+    const int pend   = (int)(((long)HW * (ch + 1)) / chunks);
+    const int cv = threadIdx.x & 63;
+    const int pr = threadIdx.x >> 6;
+    const float4* y4 = (const float4*)(y + (long)n * HW * CH);
+    float s = 0.f, q = 0.f;
+    for (int p = pstart + pr; p < pend; p += 4) {
+        float4 v = y4[(long)p * CH4 + cv];
+        s += v.x + v.y + v.z + v.w;
+        q += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
-  }
-}
-
-torch::Tensor gn_silu(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta,
-                      double eps, int64_t groups, c10::optional<torch::Tensor> res_opt) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat, "float cuda expected");
-  TORCH_CHECK(x.is_contiguous(), "contiguous expected");
-  const int B = x.size(0), C = x.size(1);
-  const long N = x.size(2) * (long)x.size(3);
-  const int G = (int)groups;
-  const long epg = (long)(C / G) * N;
-  auto opts = x.options();
-  auto out = torch::empty_like(x);
-  int nchunk = (int)std::min<long>(128L, std::max<long>(1L, (epg + 16383) / 16384));
-  auto psum = torch::empty({(long)B*G*nchunk}, opts);
-  auto psum2 = torch::empty({(long)B*G*nchunk}, opts);
-  auto mean = torch::empty({(long)B*G}, opts);
-  auto rstd = torch::empty({(long)B*G}, opts);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  gn_stats_kernel<<<dim3(B*G, nchunk), 256, 0, stream>>>(x.data_ptr<float>(),
-      psum.data_ptr<float>(), psum2.data_ptr<float>(), epg, nchunk);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  gn_finalize_kernel<<<B*G, 128, 0, stream>>>(psum.data_ptr<float>(), psum2.data_ptr<float>(),
-      mean.data_ptr<float>(), rstd.data_ptr<float>(), nchunk, (float)(1.0/(double)epg), (float)eps);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  int vec4 = (N % 4 == 0) ? 1 : 0;
-  bool has_res = res_opt.has_value();
-  const float* resp = has_res ? res_opt.value().data_ptr<float>() : x.data_ptr<float>();
-  if (has_res) {
-    gn_apply_kernel<true><<<B*C, 256, 0, stream>>>(x.data_ptr<float>(), mean.data_ptr<float>(),
-        rstd.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(), resp,
-        out.data_ptr<float>(), N, C, G, vec4);
-  } else {
-    gn_apply_kernel<false><<<B*C, 256, 0, stream>>>(x.data_ptr<float>(), mean.data_ptr<float>(),
-        rstd.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(), resp,
-        out.data_ptr<float>(), N, C, G, vec4);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-/* ---------------- NHWC specialised path (C=256, G=32) ---------------- */
-#define CC 256
-#define GG 32
-#define CPG 8
-
-// grid (nchunk, B), block 256 threads == one per channel
-__global__ void gn_stats_nhwc(const float* __restrict__ x, float* __restrict__ psum,
-                              float* __restrict__ psum2, long N, int nchunk) {
-  const int chunk = blockIdx.x, b = blockIdx.y;
-  const long begin = (long)(chunk) * N / nchunk;
-  const long end = (long)(chunk + 1) * N / nchunk;
-  const int c = threadIdx.x;
-  const float* p = x + (long)b * N * CC + begin * CC + c;
-  float s = 0.f, s2 = 0.f;
-  for (long i = 0; i < end - begin; ++i) {
-    float v = p[i * CC];
-    s += v; s2 += v * v;
-  }
-  // reduce within groups of CPG=8 consecutive lanes
-  #pragma unroll
-  for (int off = CPG >> 1; off > 0; off >>= 1) {
-    s += __shfl_down_sync(0xffffffff, s, off, CPG);
-    s2 += __shfl_down_sync(0xffffffff, s2, off, CPG);
-  }
-  if ((c & (CPG - 1)) == 0) {
-    int g = c / CPG;
-    long o = ((long)b * nchunk + chunk) * GG + g;
-    psum[o] = s; psum2[o] = s2;
-  }
-}
-
-// grid B*GG
-__global__ void gn_finalize_nhwc(const float* __restrict__ psum, const float* __restrict__ psum2,
-                                 float* __restrict__ mean, float* __restrict__ rstd,
-                                 int nchunk, float inv_n, float eps) {
-  const int bg = blockIdx.x;
-  const int b = bg / GG, g = bg - b * GG;
-  float s = 0.f, s2 = 0.f;
-  for (int i = threadIdx.x; i < nchunk; i += blockDim.x) {
-    long o = ((long)b * nchunk + i) * GG + g;
-    s += psum[o]; s2 += psum2[o];
-  }
-  __shared__ float sa[32], sb[32];
-  int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
-  warp_red2(s, s2);
-  if (lane == 0) { sa[wid] = s; sb[wid] = s2; }
-  __syncthreads();
-  int nw = blockDim.x >> 5;
-  if (wid == 0) {
-    s = (lane < nw) ? sa[lane] : 0.f; s2 = (lane < nw) ? sb[lane] : 0.f;
-    warp_red2(s, s2);
-    if (lane == 0) {
-      float m = s * inv_n; float v = s2 * inv_n - m * m; v = v < 0.f ? 0.f : v;
-      mean[bg] = m; rstd[bg] = rsqrtf(v + eps);
+    __shared__ float ss[256], sq[256];
+    ss[threadIdx.x] = s; sq[threadIdx.x] = q;
+    __syncthreads();
+    if (threadIdx.x < GRPS) {
+        int g = threadIdx.x;
+        float a = 0.f, b = 0.f;
+        #pragma unroll
+        for (int r = 0; r < 4; ++r)
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) { a += ss[r * 64 + g * 2 + j]; b += sq[r * 64 + g * 2 + j]; }
+        psum[((long)n * GRPS + g) * chunks + ch] = a;
+        psq[((long)n * GRPS + g) * chunks + ch] = b;
     }
-  }
 }
 
-// NHWC in -> NHWC out, normalize + affine + silu
-__global__ void gn_apply_nhwc(const float* __restrict__ x, const float* __restrict__ mean,
-                              const float* __restrict__ rstd, const float* __restrict__ gamma,
-                              const float* __restrict__ beta, float* __restrict__ out, long N) {
-  const int b = blockIdx.y;
-  const long total = N * (CC / 4);   // number of float4 for this batch
-  const float4* xv = reinterpret_cast<const float4*>(x + (long)b * N * CC);
-  float4* ov = reinterpret_cast<float4*>(out + (long)b * N * CC);
-  const float4* gv = reinterpret_cast<const float4*>(gamma);
-  const float4* bv = reinterpret_cast<const float4*>(beta);
-  const long stride = (long)gridDim.x * blockDim.x;
-  for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += stride) {
-    int c4 = (int)(i & (CC / 4 - 1));
-    int g = c4 / (CPG / 4);
-    float m = mean[b * GG + g], r = rstd[b * GG + g];
-    float4 gm = gv[c4], bt = bv[c4], v = xv[i], o;
-    o.x = silu((v.x - m) * r * gm.x + bt.x);
-    o.y = silu((v.y - m) * r * gm.y + bt.y);
-    o.z = silu((v.z - m) * r * gm.z + bt.z);
-    o.w = silu((v.w - m) * r * gm.w + bt.w);
-    ov[i] = o;
-  }
-}
-
-// NHWC in + NCHW residual -> NCHW out, normalize + affine + silu + add
-#define TP 64
-#define TC 64
-__global__ void gn_apply_nhwc2nchw(const float* __restrict__ x, const float* __restrict__ mean,
-                                   const float* __restrict__ rstd, const float* __restrict__ gamma,
-                                   const float* __restrict__ beta, const float* __restrict__ res,
-                                   float* __restrict__ out, long N) {
-  __shared__ float tile[TC][TP + 1];
-  __shared__ float ssc[TC], ssh[TC];
-  const long p0 = (long)blockIdx.x * TP;
-  const int c0 = blockIdx.y * TC;
-  const int b = blockIdx.z;
-  const int tid = threadIdx.x;   // 256 threads
-
-  if (tid < TC) {
-    int c = c0 + tid;
-    int g = c / CPG;
-    float sc = rstd[b * GG + g] * gamma[c];
-    ssc[tid] = sc;
-    ssh[tid] = beta[c] - mean[b * GG + g] * sc;
-  }
-  __syncthreads();
-
-  const long xbase = (long)b * N * CC;
-  #pragma unroll
-  for (int it = 0; it < (TP * TC) / 256; ++it) {
-    int t = it * 256 + tid;
-    int cl = t & (TC - 1);
-    int pl = t >> 6;             // TC == 64
-    long p = p0 + pl;
-    float v = 0.f;
-    if (p < N) {
-      v = x[xbase + p * CC + c0 + cl];
-      v = silu(v * ssc[cl] + ssh[cl]);
+__global__ void gn_finalize_kernel(const float* __restrict__ psum, const float* __restrict__ psq,
+                                   const float* __restrict__ w, const float* __restrict__ b,
+                                   float* __restrict__ scale, float* __restrict__ shift,
+                                   int chunks, float cnt, float eps) {
+    const int g = blockIdx.x, n = blockIdx.y, tid = threadIdx.x;
+    const float* ps = psum + ((long)n * GRPS + g) * chunks;
+    const float* pq = psq  + ((long)n * GRPS + g) * chunks;
+    float s = 0.f, q = 0.f;
+    for (int i = tid; i < chunks; i += blockDim.x) { s += ps[i]; q += pq[i]; }
+    __shared__ float rs[256], rq[256];
+    rs[tid] = s; rq[tid] = q;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) { rs[tid] += rs[tid + off]; rq[tid] += rq[tid + off]; }
+        __syncthreads();
     }
-    tile[cl][pl] = v;
-  }
-  __syncthreads();
-
-  #pragma unroll
-  for (int it = 0; it < (TP * TC) / 256; ++it) {
-    int t = it * 256 + tid;
-    int pl = t & (TP - 1);
-    int cl = t >> 6;             // TP == 64
-    long p = p0 + pl;
-    if (p < N) {
-      long idx = ((long)b * CC + c0 + cl) * N + p;
-      out[idx] = tile[cl][pl] + res[idx];
+    if (tid < CPG) {
+        float mean = rs[0] / cnt;
+        float var = rq[0] / cnt - mean * mean;
+        var = var > 0.f ? var : 0.f;
+        float rstd = rsqrtf(var + eps);
+        int c = g * CPG + tid;
+        float ww = w[c];
+        scale[(long)n * CH + c] = rstd * ww;
+        shift[(long)n * CH + c] = b[c] - mean * rstd * ww;
     }
-  }
 }
 
-std::vector<torch::Tensor> gn_stats_nhwc_run(torch::Tensor x, double eps) {
-  const int B = x.size(0);
-  const long N = x.size(2) * (long)x.size(3);
-  auto opts = torch::TensorOptions().dtype(torch::kFloat).device(x.device());
-  int nchunk = (int)std::min<long>(256L, std::max<long>(1L, N / 64));
-  auto psum = torch::empty({(long)B * nchunk * GG}, opts);
-  auto psum2 = torch::empty({(long)B * nchunk * GG}, opts);
-  auto mean = torch::empty({(long)B * GG}, opts);
-  auto rstd = torch::empty({(long)B * GG}, opts);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  gn_stats_nhwc<<<dim3(nchunk, B), CC, 0, stream>>>(x.data_ptr<float>(), psum.data_ptr<float>(),
-      psum2.data_ptr<float>(), N, nchunk);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  gn_finalize_nhwc<<<B * GG, 256, 0, stream>>>(psum.data_ptr<float>(), psum2.data_ptr<float>(),
-      mean.data_ptr<float>(), rstd.data_ptr<float>(), nchunk,
-      (float)(1.0 / (double)(CPG * N)), (float)eps);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {mean, rstd};
+// ---------------------------------------------- K4: GN + SiLU + tf32 round, NHWC -> NHWC
+__global__ void gn_silu_round_kernel(const float* __restrict__ y,
+                                     const float* __restrict__ scale,
+                                     const float* __restrict__ shift,
+                                     float* __restrict__ out, int HWC4) {
+    const int n = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= HWC4) return;
+    const int cv = i & (CH4 - 1);
+    const float4* y4 = (const float4*)(y + (long)n * HWC4 * 4);
+    float4* o4 = (float4*)(out + (long)n * HWC4 * 4);
+    const float4 sc = ((const float4*)(scale + (long)n * CH))[cv];
+    const float4 sh = ((const float4*)(shift + (long)n * CH))[cv];
+    float4 v = y4[i], r;
+    r.x = tf32_rn(silu(v.x * sc.x + sh.x));
+    r.y = tf32_rn(silu(v.y * sc.y + sh.y));
+    r.z = tf32_rn(silu(v.z * sc.z + sh.z));
+    r.w = tf32_rn(silu(v.w * sc.w + sh.w));
+    o4[i] = r;
 }
 
-// x: channels-last (B,256,H,W) -> out channels-last
-torch::Tensor gn_silu_nhwc(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, double eps) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat);
-  TORCH_CHECK(x.size(1) == CC, "channels must be 256");
-  const int B = x.size(0);
-  const long N = x.size(2) * (long)x.size(3);
-  auto mr = gn_stats_nhwc_run(x, eps);
-  auto out = torch::empty_like(x);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  long total = N * (CC / 4);
-  int nb = (int)std::min<long>(2048L, (total + 255) / 256);
-  gn_apply_nhwc<<<dim3(nb, B), 256, 0, stream>>>(x.data_ptr<float>(), mr[0].data_ptr<float>(),
-      mr[1].data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(),
-      out.data_ptr<float>(), N);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
+// ------------------------------- K5: GN + SiLU + residual add, NHWC -> NCHW (fused transpose)
+// tile: 128 pixels x 32 channels, float4 on both sides when HW % 4 == 0
+__global__ void gn_silu_add_nchw_kernel(const float* __restrict__ y,
+                                        const float* __restrict__ res,
+                                        const float* __restrict__ scale,
+                                        const float* __restrict__ shift,
+                                        float* __restrict__ out, int HW, int vec) {
+    __shared__ float sm[32][133];
+    const int p0 = blockIdx.x * 128, c0 = blockIdx.y * 32, n = blockIdx.z;
+    const long nb = (long)n * CH * (long)HW;
+    const float* yp = y + nb;
+    const int cv = threadIdx.x & 7;             // float4 index within the 32-channel tile
+    const int pr = threadIdx.x >> 3;            // 32 pixels per pass
+    const float4 sc = ((const float4*)(scale + (long)n * CH + c0))[cv];
+    const float4 sh = ((const float4*)(shift + (long)n * CH + c0))[cv];
+    for (int p = pr; p < 128; p += 32) {
+        int pg = p0 + p;
+        if (pg >= HW) break;
+        float4 v = *(const float4*)(yp + (long)pg * CH + c0 + cv * 4);
+        sm[cv * 4 + 0][p] = silu(v.x * sc.x + sh.x);
+        sm[cv * 4 + 1][p] = silu(v.y * sc.y + sh.y);
+        sm[cv * 4 + 2][p] = silu(v.z * sc.z + sh.z);
+        sm[cv * 4 + 3][p] = silu(v.w * sc.w + sh.w);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (vec && p0 + 128 <= HW) {
+        for (int c = wid; c < 32; c += 8) {
+            long idx = nb + (long)(c0 + c) * HW + p0 + lane * 4;
+            float4 r = *(const float4*)(res + idx);
+            float4 o;
+            o.x = sm[c][lane * 4 + 0] + r.x;
+            o.y = sm[c][lane * 4 + 1] + r.y;
+            o.z = sm[c][lane * 4 + 2] + r.z;
+            o.w = sm[c][lane * 4 + 3] + r.w;
+            *(float4*)(out + idx) = o;
+        }
+    } else {
+        for (int c = wid; c < 32; c += 8)
+            for (int j = 0; j < 4; ++j) {
+                int p = p0 + lane * 4 + j;
+                if (p < HW) {
+                    long idx = nb + (long)(c0 + c) * HW + p;
+                    out[idx] = sm[c][lane * 4 + j] + res[idx];
+                }
+            }
+    }
 }
 
-// x: channels-last (B,256,H,W); res: contiguous NCHW -> out contiguous NCHW
-torch::Tensor gn_silu_res_nchw(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta,
-                               double eps, torch::Tensor res) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat);
-  TORCH_CHECK(x.size(1) == CC, "channels must be 256");
-  TORCH_CHECK(res.is_contiguous(), "residual must be contiguous NCHW");
-  const int B = x.size(0), H = x.size(2), W = x.size(3);
-  const long N = (long)H * W;
-  auto mr = gn_stats_nhwc_run(x, eps);
-  auto out = torch::empty({B, CC, H, W}, x.options());
-  auto stream = at::cuda::getCurrentCUDAStream();
-  dim3 grid((unsigned)((N + TP - 1) / TP), CC / TC, B);
-  gn_apply_nhwc2nchw<<<grid, 256, 0, stream>>>(x.data_ptr<float>(), mr[0].data_ptr<float>(),
-      mr[1].data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(),
-      res.data_ptr<float>(), out.data_ptr<float>(), N);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-"""
+// ---------------------------------------------------------------- CUTLASS conv
+using ElementA = cutlass::tfloat32_t;
+using ElementB = cutlass::tfloat32_t;
+using ElementC = float;
+using ElementAcc = float;
 
-_CPP = (
-    "torch::Tensor gn_silu(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, "
-    "double eps, int64_t groups, c10::optional<torch::Tensor> res_opt);\n"
-    "torch::Tensor gn_silu_nhwc(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, double eps);\n"
-    "torch::Tensor gn_silu_res_nchw(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, "
-    "double eps, torch::Tensor res);"
-)
+template <typename TB, typename WS, int Stages>
+struct MakeConv {
+  using Kernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
+      ElementA, cutlass::layout::TensorNHWC,
+      ElementB, cutlass::layout::TensorNHWC,
+      ElementC, cutlass::layout::TensorNHWC,
+      ElementAcc,
+      cutlass::arch::OpClassTensorOp,
+      cutlass::arch::Sm80,
+      TB, WS, cutlass::gemm::GemmShape<16, 8, 8>,
+      cutlass::epilogue::thread::LinearCombination<ElementC, 4, ElementAcc, ElementAcc>,
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<4>,
+      Stages,
+      cutlass::arch::OpMultiplyAdd,
+      cutlass::conv::IteratorAlgorithm::kOptimized,
+      cutlass::conv::StrideSupport::kStrided,
+      4, 4>::Kernel;
+  using Op = cutlass::conv::device::ImplicitGemmConvolution<Kernel>;
+};
+
+// Two threadblock-tile configurations: the incumbent 128x64x16 (fallback / low-CTA path
+// with split-k) and a new 128x128x16 tile used when the grid alone reaches >=2 waves.
+using ConvSmall = MakeConv<cutlass::gemm::GemmShape<128,64,16>, cutlass::gemm::GemmShape<64,32,16>, 4>::Op;
+using ConvBig   = MakeConv<cutlass::gemm::GemmShape<128,128,16>, cutlass::gemm::GemmShape<64,64,16>, 4>::Op;
+
+template <typename Conv>
+static bool run_conv_t(const float* xp, const float* wp, float* yp,
+                       int N, int H, int W, int C, int K, const torch::Tensor& proto,
+                       int split_k, bool must_succeed) {
+    cutlass::conv::Conv2dProblemSize problem(
+        {N, H, W, C}, {K, 3, 3, C}, {1, 1, 1, 1}, {1, 1}, {1, 1},
+        {N, H, W, K}, cutlass::conv::Mode::kCrossCorrelation, split_k);
+    using E = cutlass::tfloat32_t;
+    cutlass::TensorRef<E, cutlass::layout::TensorNHWC> ra(
+        reinterpret_cast<E*>(const_cast<float*>(xp)),
+        cutlass::layout::TensorNHWC::packed({N, H, W, C}));
+    cutlass::TensorRef<E, cutlass::layout::TensorNHWC> rb(
+        reinterpret_cast<E*>(const_cast<float*>(wp)),
+        cutlass::layout::TensorNHWC::packed({K, 3, 3, C}));
+    cutlass::TensorRef<float, cutlass::layout::TensorNHWC> rc(
+        yp, cutlass::layout::TensorNHWC::packed({N, H, W, K}));
+    typename Conv::Arguments args(problem, ra, rb, rc, rc, {1.0f, 0.0f});
+    Conv op;
+    if (!must_succeed && op.can_implement(args) != cutlass::Status::kSuccess) return false;
+    TORCH_CHECK(op.can_implement(args) == cutlass::Status::kSuccess, "conv can_implement failed");
+    size_t ws = op.get_workspace_size(args);
+    auto wsb = torch::empty({(long)ws + 1}, proto.options().dtype(torch::kUInt8));
+    // Serial split-k (CUTLASS default SplitKMode::kSerial) uses a semaphore in the
+    // workspace that must start at zero; for split_k==1 this is a tiny/no-op-sized buffer.
+    if (ws > 0) wsb.zero_();
+    if (!must_succeed && op.initialize(args, wsb.data_ptr()) != cutlass::Status::kSuccess) return false;
+    TORCH_CHECK(op.initialize(args, wsb.data_ptr()) == cutlass::Status::kSuccess, "conv init failed");
+    TORCH_CHECK(op(at::cuda::getCurrentCUDAStream()) == cutlass::Status::kSuccess, "conv run failed");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
+
+// Shape-dispatch: pick the tile/split-k configuration that reaches >=2 full waves
+// on 170 SMs (target 340 CTAs). ConvBig is preferred when its own grid already
+// clears the target; otherwise ConvSmall is used, with split-k>=2 added only when
+// even ConvSmall's grid is below the wave target.
+static void conv3x3(const float* xp, const float* wp, float* yp,
+                    int N, int H, int W, int C, int K, const torch::Tensor& proto) {
+    long M = (long)N * H * W;
+    long ctas_big   = ((M + 127) / 128) * 2;   // K/128 = 2 N-tiles for K=256
+    long ctas_small = ((M + 127) / 128) * 4;   // K/64  = 4 N-tiles for K=256
+    const long target = 340; // 2 full waves on 170 SMs
+
+    if (ctas_big >= target) {
+        bool ok = run_conv_t<ConvBig>(xp, wp, yp, N, H, W, C, K, proto, 1, /*must_succeed=*/false);
+        if (ok) return;
+        // fall through to the guaranteed-success ConvSmall path below
+    }
+    if (ctas_small >= target) {
+        run_conv_t<ConvSmall>(xp, wp, yp, N, H, W, C, K, proto, 1, /*must_succeed=*/true);
+        return;
+    }
+    long sk = (target + ctas_small - 1) / ctas_small;
+    if (sk < 2) sk = 2;
+    if (sk > 4) sk = 4;
+    run_conv_t<ConvSmall>(xp, wp, yp, N, H, W, C, K, proto, (int)sk, /*must_succeed=*/true);
+}
+
+// ---------------------------------------------------------------- driver
+static void gn_stats(const float* y, const float* w, const float* b, double eps,
+                     int B, int HW, float* scale, float* shift, const torch::Tensor& proto) {
+    int chunks = (680 + B - 1) / B;
+    int maxc = (HW + 31) / 32;
+    if (chunks > maxc) chunks = maxc;
+    if (chunks < 1) chunks = 1;
+    if (chunks > 2048) chunks = 2048;
+    auto psum = torch::empty({B, GRPS, chunks}, proto.options());
+    auto psq  = torch::empty({B, GRPS, chunks}, proto.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    gn_partial_kernel<<<dim3(chunks, B), 256, 0, stream>>>(
+        y, psum.data_ptr<float>(), psq.data_ptr<float>(), HW, chunks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    gn_finalize_kernel<<<dim3(GRPS, B), 256, 0, stream>>>(
+        psum.data_ptr<float>(), psq.data_ptr<float>(), w, b, scale, shift,
+        chunks, (float)((long)HW * CPG), (float)eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor fused_block(torch::Tensor x, torch::Tensor w1, torch::Tensor n1w,
+                          torch::Tensor n1b, torch::Tensor w2, torch::Tensor n2w,
+                          torch::Tensor n2b, double eps) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat32, "x must be cuda float32");
+    TORCH_CHECK(x.dim() == 4 && x.size(1) == CH, "expects (B,256,H,W)");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous NCHW");
+    const int B = x.size(0), H = x.size(2), W = x.size(3);
+    const int HW = H * W;
+    const int vec = (HW % 4 == 0) ? 1 : 0;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto opt = x.options();
+    auto opt_cl = opt.memory_format(at::MemoryFormat::ChannelsLast);
+
+    auto w1c = w1.is_contiguous() ? w1 : w1.contiguous();
+    auto w2c = w2.is_contiguous() ? w2 : w2.contiguous();
+    auto n1wc = n1w.is_contiguous() ? n1w : n1w.contiguous();
+    auto n1bc = n1b.is_contiguous() ? n1b : n1b.contiguous();
+    auto n2wc = n2w.is_contiguous() ? n2w : n2w.contiguous();
+    auto n2bc = n2b.is_contiguous() ? n2b : n2b.contiguous();
+
+    // weights -> KRSC + tf32 round
+    auto w1r = torch::empty({CH, 3, 3, CH}, opt);
+    auto w2r = torch::empty({CH, 3, 3, CH}, opt);
+    weight_krsc_round_kernel<<<CH, 256, 0, stream>>>(w1c.data_ptr<float>(),
+                                                     w1r.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    weight_krsc_round_kernel<<<CH, 256, 0, stream>>>(w2c.data_ptr<float>(),
+                                                     w2r.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // x -> NHWC + tf32 round
+    auto xn = torch::empty({B, CH, H, W}, opt_cl);
+    nchw2nhwc_round_kernel<<<dim3((HW + 127) / 128, CH / 32, B), 256, 0, stream>>>(
+        x.data_ptr<float>(), xn.data_ptr<float>(), HW, vec);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    auto y1 = torch::empty({B, CH, H, W}, opt_cl);
+    conv3x3(xn.data_ptr<float>(), w1r.data_ptr<float>(), y1.data_ptr<float>(),
+            B, H, W, CH, CH, x);
+
+    auto scale = torch::empty({B, CH}, opt);
+    auto shift = torch::empty({B, CH}, opt);
+    gn_stats(y1.data_ptr<float>(), n1wc.data_ptr<float>(), n1bc.data_ptr<float>(),
+             eps, B, HW, scale.data_ptr<float>(), shift.data_ptr<float>(), x);
+
+    auto z1 = torch::empty({B, CH, H, W}, opt_cl);
+    {
+        long hwc4 = (long)HW * CH4;
+        int thr = 256;
+        long nb = (hwc4 + thr - 1) / thr;
+        gn_silu_round_kernel<<<dim3((unsigned)nb, B), thr, 0, stream>>>(
+            y1.data_ptr<float>(), scale.data_ptr<float>(), shift.data_ptr<float>(),
+            z1.data_ptr<float>(), (int)hwc4);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    auto y2 = torch::empty({B, CH, H, W}, opt_cl);
+    conv3x3(z1.data_ptr<float>(), w2r.data_ptr<float>(), y2.data_ptr<float>(),
+            B, H, W, CH, CH, x);
+
+    gn_stats(y2.data_ptr<float>(), n2wc.data_ptr<float>(), n2bc.data_ptr<float>(),
+             eps, B, HW, scale.data_ptr<float>(), shift.data_ptr<float>(), x);
+
+    auto out = torch::empty({B, CH, H, W}, opt);
+    gn_silu_add_nchw_kernel<<<dim3((HW + 127) / 128, CH / 32, B), 256, 0, stream>>>(
+        y2.data_ptr<float>(), x.data_ptr<float>(), scale.data_ptr<float>(),
+        shift.data_ptr<float>(), out.data_ptr<float>(), HW, vec);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+'''
+
+_CPP = ("torch::Tensor fused_block(torch::Tensor x, torch::Tensor w1, torch::Tensor n1w,"
+        "torch::Tensor n1b, torch::Tensor w2, torch::Tensor n2w, torch::Tensor n2b, double eps);")
 
 _ext = load_inline(
-    name="vae_resblock_ext_v2",
+    name="vae_res_block_d3_v2",
     cpp_sources=_CPP,
-    cuda_sources=_SRC,
-    functions=["gn_silu", "gn_silu_nhwc", "gn_silu_res_nchw"],
-    verbose=False,
+    cuda_sources=_CUDA,
+    functions=["fused_block"],
+    verbose=True,
     extra_cflags=["-O3", "-std=c++20"],
-    extra_cuda_cflags=["-O3", "-std=c++20", "--expt-relaxed-constexpr", "-lineinfo",
-                       "-gencode=arch=compute_90,code=sm_90", "--use_fast_math"],
+    extra_cuda_cflags=[
+        "-O3", "-std=c++20", "--expt-relaxed-constexpr", "-lineinfo",
+        "-gencode=arch=compute_120,code=sm_120",
+        "-I/home/otter77/git_project/KernelMem/third_party/cutlass/include",
+    ],
 )
+
+
+@torch.no_grad()
+def _ref(x, c1, n1w, n1b, c2, n2w, n2b, eps):
+    out = F.conv2d(x, c1, None, 1, 1)
+    out = F.group_norm(out, 32, n1w, n1b, eps)
+    out = F.silu(out)
+    out = F.conv2d(out, c2, None, 1, 1)
+    out = F.group_norm(out, 32, n2w, n2b, eps)
+    out = F.silu(out)
+    return out + x
 
 
 class ModelNew(nn.Module):
-    # ---------------------------------------------------------------------
-    # 1) GRANULARITY: (C) fuse many ops into one/few custom kernels.
-    # 2) REPLACED OPS: both GroupNorms, both SiLUs, the residual add, and the
-    #    NHWC->NCHW layout conversion cuDNN would otherwise perform.
-    # 3) FUSION MAP:
-    #    - kernel gn_stats_nhwc + gn_finalize_nhwc: group mean/var over the
-    #      NHWC conv output (two-stage reduction, fp32 accumulation).
-    #    - kernel gn_apply_nhwc: normalize + affine + SiLU, NHWC->NHWC,
-    #      float4-vectorised over channels (feeds conv2 directly in NHWC).
-    #    - kernel gn_apply_nhwc2nchw: normalize + affine + SiLU + residual add
-    #      + shared-memory transpose, so the final NCHW result is produced in a
-    #      single pass instead of GroupNorm/SiLU/add/layout kernels.
-    #    - the whole pipeline runs channels_last, which removes the four
-    #      nchwToNhwc / two nhwcToNchw cuDNN conversion kernels (~20% of time).
-    # 4) LEFT IN PYTORCH: the two 3x3 convolutions -> the vendor cuDNN TF32
-    #      NHWC kernels already run at ~250 TFLOPs here (at roofline), so
-    #      reimplementing them cannot win; a generic NCHW fallback path
-    #      (gn_silu) is kept for channel counts other than 256.
-    # ---------------------------------------------------------------------
     def __init__(self):
         super().__init__()
+        self.ext = _ext
 
-    def forward(self, x, conv1_weight, norm1_weight, norm1_bias,
-                conv2_weight, norm2_weight, norm2_bias, eps):
-        G = 32
-        x = x if x.is_contiguous() else x.contiguous()
-        if x.size(1) == 256:
-            cl = torch.channels_last
-            xc = x.contiguous(memory_format=cl)
-            w1 = conv1_weight.contiguous(memory_format=cl)
-            w2 = conv2_weight.contiguous(memory_format=cl)
-            o = F.conv2d(xc, w1, bias=None, stride=1, padding=1)
-            o = _ext.gn_silu_nhwc(o, norm1_weight, norm1_bias, float(eps))
-            o = F.conv2d(o, w2, bias=None, stride=1, padding=1)
-            return _ext.gn_silu_res_nchw(o, norm2_weight, norm2_bias, float(eps), x)
-        out = F.conv2d(x, conv1_weight, bias=None, stride=1, padding=1)
-        out = _ext.gn_silu(out, norm1_weight, norm1_bias, float(eps), G, None)
-        out = F.conv2d(out, conv2_weight, bias=None, stride=1, padding=1)
-        return _ext.gn_silu(out, norm2_weight, norm2_bias, float(eps), G, x)
+    @torch.no_grad()
+    def forward(self, x, conv1_weight, norm1_weight, norm1_bias, conv2_weight,
+                norm2_weight, norm2_bias, eps):
+        if (x.dtype != torch.float32 or x.dim() != 4 or x.size(1) != 256
+                or not x.is_cuda):
+            return _ref(x, conv1_weight, norm1_weight, norm1_bias, conv2_weight,
+                        norm2_weight, norm2_bias, eps)
+        xc = x if x.is_contiguous() else x.contiguous()
+        return self.ext.fused_block(xc, conv1_weight, norm1_weight, norm1_bias,
+                                    conv2_weight, norm2_weight, norm2_bias,
+                                    float(eps))

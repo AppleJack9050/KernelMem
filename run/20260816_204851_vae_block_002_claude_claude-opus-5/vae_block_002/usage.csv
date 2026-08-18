@@ -2,3 +2,10 @@ timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens,model,effo
 2026-08-16 21:24:16,1,judge_optimization,68913,23922,92835,claude-opus-5,high
 2026-08-16 21:27:31,1,optimization,347772,22785,370557,claude-sonnet-5,high
 2026-08-16 21:36:45,2,judge_optimization,70113,30309,100422,claude-opus-5,high
+2026-08-17 22:06:24,2,judge_optimization,140288,54136,194424,claude-opus-5,high
+2026-08-17 23:36:36,2,judge_optimization,0,0,0,claude-opus-5,high
+2026-08-17 23:40:20,2,optimization,378938,26821,405759,claude-sonnet-5,high
+2026-08-17 23:47:45,3,judge_optimization,114899,21739,136638,claude-opus-5,high
+2026-08-17 23:51:12,3,optimization,979023,22572,1001595,claude-sonnet-5,high
+2026-08-18 00:01:45,4,judge_optimization,65246,9133,74379,claude-opus-5,high
+2026-08-18 00:05:19,4,optimization,387198,25079,412277,claude-sonnet-5,high

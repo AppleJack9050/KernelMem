@@ -188,6 +188,24 @@ REMOVABLE/TRIVIAL KERNEL RULE (CRITICAL):
   - You are FORBIDDEN to use the primary method to optimize removable/trivial kernels.
 SPECIALIZATION FOCUS (CRITICAL):
   - Optimize for the SPECIFIC fixed tensor shapes/layouts in the candidate; you MAY hardcode sizes, unroll, and use compile-time constants.
+IMPLEMENTATION BUDGET (HARD):
+  - The engineer who executes your plan is an agent with roughly 30 tool-turns
+    (KERNELMEM_AGENT_MAX_TURNS) in ONE call. A turn is one model step: a read, an
+    edit, a compile, a test. A write-compile-diagnose-fix cycle costs 4 to 6 turns,
+    so the plan gets about five cycles total. Running out is a hard failure: the
+    call is cut off mid-work and the round scores nothing.
+  - You already price a plan's PAYOFF. Price its COST the same way and reject your
+    own best idea when it does not fit. Out of budget: porting or forking a vendor
+    header, reproducing a large template struct, discovering an undocumented layout
+    empirically before the real change can begin, or any change whose first
+    compilable state is more than roughly 100 new or moved lines.
+  - ORDER THE PLAN SO THE FIRST MILESTONE COMPILES. Step 1 must be the smallest
+    change that builds and still matches the reference, even if not yet faster.
+    An implementer who runs out at step 4 then still leaves a working kernel;
+    a plan whose first compilable state is step 9 leaves nothing.
+  - If the idea is good but too big, propose only the part that fits and say what
+    the next round should do with it. A measured no-op scores 0.5 and stays a live
+    candidate, so a setup round is not wasted.
 
 Metrics usage:
   - Use metrics JSON as primary for selecting hottest non-removable kernel and choosing the one method.
@@ -206,7 +224,9 @@ OUTPUT FORMAT (JSON ONLY; no extra prose):
   "evidence": "<>=1 numeric metrics + 1 root-cause line + brief refutation of one alternative bottleneck>",
   "expected_metric_change": "<>=2 metric directions + anti-regression constraint>",
   "headroom": "high|medium|low",
-  "structural_rewrite": true|false
+  "structural_rewrite": true|false,
+  "first_milestone": "<which numbered step is the last one needed before the kernel COMPILES and matches; must be an early step>",
+  "estimated_turns": "<your honest estimate of tool-turns to reach that milestone, out of ~30; if over 20, cut the plan down before answering>"
 }
 
 STRUCTURAL_REWRITE (default false; set it deliberately):
@@ -441,6 +461,33 @@ If your plan includes mechanisms that trigger multiple rules, you MUST choose th
 
 (4) Practicality constraints (avoid “good idea but not implementable here”)
 - The modification plan must be directly actionable on THIS kernel (no generic advice).
+- IMPLEMENTATION BUDGET (HARD). The engineer who executes your plan is an agent with
+  roughly 30 tool-turns (KERNELMEM_AGENT_MAX_TURNS) in ONE call. A turn is one model
+  step: a read, an edit, a compile, a test. A normal write-compile-diagnose-fix cycle
+  costs 4 to 6 turns, so the whole plan gets about five such cycles. Running out is a
+  hard failure -- the call is cut off mid-work, the round scores nothing, and the
+  search records only that this state produced nothing.
+- You already price the PAYOFF of a plan. You MUST now price its COST the same way,
+  and you MUST reject your own best idea when it does not fit. A plan is out of budget
+  when it requires any of:
+    * porting or forking a vendor header, or reproducing a large template struct
+    * discovering an undocumented layout empirically before the real change can start
+    * a change whose first compilable state is more than roughly 100 new or moved lines
+  Measured 2026-08-16 on this task: a plan to fork cutlass/conv/kernel/implicit_gemm_convolution.h
+  (455 lines, 79 transitive conv headers) and empirically verify its accumulator
+  fragment ordering was issued for a self-computed 4.1 percent prize. The implementer
+  spent all 30 turns reading and never compiled once. The round scored nothing.
+- ORDER THE PLAN SO THE FIRST MILESTONE COMPILES. Step 1 must be the smallest change
+  that builds and still matches the reference, even when it is not yet faster. Later
+  steps refine it. This is what makes a partial execution worth something: an engineer
+  who runs out of turns at step 4 still leaves a working kernel behind, whereas a plan
+  whose first compilable state is step 9 leaves nothing at all.
+- IF THE IDEA IS GOOD BUT TOO BIG, SPLIT IT ACROSS ROUNDS -- do not shrink it into
+  something pointless, and do not attempt it whole. Propose only the part that fits,
+  and say in the plan what the next round should do with the result. This is safe:
+  a measured no-op scores 0.5 and stays a live candidate in the search, so a round
+  that only sets up the real change is not wasted. Set "structural_rewrite": true
+  when that first part is expected to be slower until the follow-up lands.
 - Do NOT propose kernel fusion unless the CUDA candidate explicitly contains multiple distinct kernel launches that share producer-consumer tensors AND you can pinpoint the exact fusion boundary.
 - If the CUDA candidate code is empty, your plan must describe the FIRST concrete kernel-level change to implement, aligned with the PyTorch reference semantics.
 - You MUST NOT propose changing the benchmark workflow, adding caching outside the kernel, or altering evaluation settings.
@@ -486,7 +533,9 @@ OUTPUT FORMAT (JSON ONLY; no extra prose):
   "evidence": "<must include >=1 numeric metrics + >=1 section-analysis statement + 1 ruled-out bottleneck>",
   "expected_metric_change": "<>=2 metric directions + anti-regression constraint>",
   "headroom": "high|medium|low",
-  "structural_rewrite": true|false
+  "structural_rewrite": true|false,
+  "first_milestone": "<which numbered step is the last one needed before the kernel COMPILES and matches; must be an early step>",
+  "estimated_turns": "<your honest estimate of tool-turns to reach that milestone, out of ~30; if over 20, cut the plan down before answering>"
 }
 
 STRUCTURAL_REWRITE: true ONLY when the plan replaces the kernel's core structure

@@ -1,0 +1,7 @@
+timestamp,round_idx,call_type,outcome,num_turns,duration_s,salvaged,model,effort,detail
+2026-08-17 23:36:36,2,judge_optimization,ok,1,652.1,none,claude-opus-5,high,
+2026-08-17 23:40:20,2,optimization,ok,8,222.7,none,claude-sonnet-5,high,
+2026-08-17 23:47:45,3,judge_optimization,ok,1,295.6,none,claude-opus-5,high,
+2026-08-17 23:51:12,3,optimization,ok,19,206.1,none,claude-sonnet-5,high,
+2026-08-18 00:01:45,4,judge_optimization,ok,1,129.2,none,claude-opus-5,high,
+2026-08-18 00:05:19,4,optimization,ok,8,213.1,none,claude-sonnet-5,high,

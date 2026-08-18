@@ -1,26 +1,26 @@
 {
   "version": 1,
   "task": "tasks/vae_block_002.py",
-  "next_round": 2,
+  "next_round": 5,
   "total_rounds": 10,
   "base": {
-    "code_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260816_211655.py",
-    "eval_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json",
-    "score": 1.1926346977281466
+    "code_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_235112.py",
+    "eval_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0003.json",
+    "score": 1.2236223051032358
   },
   "best": {
-    "code_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260816_211655.py",
-    "eval_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json",
-    "score": 1.1926346977281466
+    "code_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_234020.py",
+    "eval_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0002.json",
+    "score": 1.2452697404383097
   },
   "current": {
-    "code_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260816_212731.py",
-    "eval_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json",
-    "score": 1.1372656847838933
+    "code_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260818_000519.py",
+    "eval_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0004.json",
+    "score": 1.2088351342223318
   },
   "repair_chain": null,
-  "base_score": 1.1926346977281466,
-  "best_score": 1.1926346977281466,
+  "base_score": 1.2144138759766347,
+  "best_score": 1.2452697404383097,
   "optimization_tree": {
     "kernel_20260816_211655": {
       "parent": null,
@@ -68,25 +68,137 @@
         "sigma_equiv": -3.840566673538323,
         "sigma_ok": false,
         "method": "paired_log_ratio_t"
+      },
+      "ncu_profile_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260816_212731_ncu.csv"
+    },
+    "kernel_20260817_234020": {
+      "parent": "kernel_20260816_212731",
+      "kernel_name": "kernel_20260817_234020",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_234020.py",
+      "speedup": 1.2452697404383097,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 2,
+      "strategy": {
+        "bottleneck": "The CUTLASS ImplicitGemm conv holds 86.7% of steady-state GPU time and runs at only ~75% of TF32 peak (~1953us vs 1475us roofline for the two convs); every satellite kernel is already at 85-89% of DRAM peak, so all remaining headroom is in the conv's tile/stage configuration.",
+        "optimisation method": "Widen the owned conv's configuration space (add 3-stage 128x128x16 and 256x128x16 tiles) and replace the CTA-count heuristic with a one-time, per-shape measured pick over those tiles plus the existing split-k variants, keeping the current shape dispatch as fallback.",
+        "method_name": "conv_tile_stage_autotune",
+        "modification plan": "1. Leave all non-conv kernels (nchw2nhwc_round, gn_partial, gn_finalize, gn_silu_round, gn_silu_add_nchw, weight_krsc_round) and their launch shapes completely unchanged; they are already at DRAM roofline.\n2. Add two new instantiations next to ConvSmall/ConvBig using the existing MakeConv template: `using ConvBigS3 = MakeConv<GemmShape<128,128,16>, GemmShape<64,64,16>, 3>::Op;` (smem drops from 64KB to 48KB, allowing 2 CTAs/SM on the 100KB SM instead of 1) and `using ConvWide = MakeConv<GemmShape<256,128,16>, GemmShape<64,64,16>, 3>::Op;` (8 warps, 72KB smem). Keep ConvSmall<128,64,16,4> and ConvBig<128,128,16,4> exactly as they are.\n3. Refactor the call sites into one dispatcher `static bool launch_id(int id, int split_k, const float* xp, const float* wp, float* yp, int N,int H,int W,int C,int K, const torch::Tensor& proto, bool must_succeed)` that switches id 0->ConvSmall, 1->ConvBig, 2->ConvBigS3, 3->ConvWide and forwards to the existing run_conv_t<>.\n4. FIRST COMPILABLE MILESTONE (do this before any autotune): in conv3x3, keep the existing ctas_big/ctas_small/target=340 logic but try id=2 first when ctas_big>=340, falling back to id=1, then to id=0 with the current split-k formula. Compile, run all four shapes, confirm numerical match (atol 2.8e-3) and record times. This alone preserves conv_config_shape_dispatch_splitk and should already win from the 1->2 CTA/SM change.\n5. Then add the measured pick: a file-static `std::map<uint64_t,std::pair<int,int>> g_cfg;` keyed by ((uint64_t)N<<40)|(H<<20)|W (C=K=256 always).\n6. On cache miss, build the candidate list {(2,1),(1,1),(3,1),(0,1),(0,2),(0,3),(0,4)}, drop any whose can_implement/initialize fails (use the must_succeed=false path already in run_conv_t), then time each with cudaEvent pairs on at::cuda::getCurrentCUDAStream(): 1 warmup launch + 3 timed launches, cudaStreamSynchronize, keep the minimum. Write the winning (id, split_k) into g_cfg. Timing runs on the real xn/w1r/y1 pointers of the current call, so no extra buffers are needed; y1 is fully overwritten by the final launch.\n7. If the candidate list ends up empty (should not happen), fall back to the step-4 heuristic path with must_succeed=true.\n8. After autotune, always execute exactly one conv launch with the cached (id, split_k) — do not leave the timing launches in the steady-state path; kernel launch count per forward must stay at its current value.\n9. Autotune both conv1 and conv2 with the same cache entry (identical problem size), so the one-time cost is 7 candidates x 4 launches once per distinct shape.\n10. Anti-regression checks: keep split-k candidates in the list so 2x64x64 (ctas_small=256<340) and 1x131x131 do not lose the accepted split-k mechanism; re-measure all four shapes and reject any config change that regresses any single shape, since the score is a geometric mean.\n11. If turns run short, stop after step 4 (already a valid, correct kernel) and leave the autotune for the next round.",
+        "evidence": "nsys steady-state table: the CUTLASS ImplicitGemmConvolution is 86.7% of per-forward GPU time (22,790us / 24 launches), so everything else is capped at 13.3%. NCU durations for the profiled 8x256x64x128 shape sum to 369us of non-conv work (71.6+2*47.6+2*4.2+2*5.0+67.6+116.0), leaving ~1953us for the two convs versus a 1475us TF32 roofline (2*2*65536*589824 FLOP at 104.8 TFLOPS) = 75.5% of peak, i.e. ~1.3x headroom. Ruled out as #1: the memory-bound satellite kernels — gn_silu_add_nchw gpu__dram_throughput = 88.17%, gn_partial = 87.77%, gn_silu_round = 87.20%, nchw2nhwc = 86.06% of peak, and the section analysis states for nchw2nhwc 'This workload is utilizing greater than 80.0% of the available compute or memory performance of this device'; they are within ~13% of the DRAM floor and carry no deletable bytes without forking a CUTLASS iterator/epilogue, so the maximum obtainable there is ~2% of total runtime. Also ruled out: occupancy/ILP in those kernels (sm__warps_active = 96.53% of peak, achieved occupancy 79.47%, branch divergence 0.0) — their 77.37% long-scoreboard stall is pure DRAM latency at 85% SOL, not a schedulable deficit.",
+        "expected_metric_change": "CUTLASS conv kernel duration down >=8% (target 1953us -> <1800us for the profiled shape) driven by shared-memory-per-block dropping 64KB -> 48KB for the 128x128x16 tile, so blocks-per-SM rises 1 -> 2 and sm__warps_active / warps_eligible for the conv rise; overall forward time down and conv steady-share falling below 86.7%. Anti-regression: kernel launch count per forward must NOT rise above its current value (the timing launches must be one-time and cached, not per-call); registers per thread must not rise enough to spill (local memory spilling requests must stay 0); the accepted conv_config_shape_dispatch_splitk mechanism must remain operational — split-k candidates stay in the candidate list, so the low-CTA shapes 2x64x64 and 1x131x131 must not regress; DRAM throughput of the six satellite kernels must stay at their current 86-89% of peak (they are untouched).",
+        "headroom": "medium",
+        "structural_rewrite": false
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-17T23:40:57.173461",
+      "paired_verdict": {
+        "rel_pct": 10.339846664660858,
+        "se_pct": 0.4058152950312958,
+        "t": 26.753259090220183,
+        "dof": 4,
+        "reps": 5,
+        "resolved": true,
+        "p_one_sided": 5.802031324266862e-06,
+        "sigma_equiv": 4.384897084923908,
+        "sigma_ok": true,
+        "method": "paired_log_ratio_t"
+      }
+    },
+    "kernel_20260817_235112": {
+      "parent": "kernel_20260816_211655",
+      "kernel_name": "kernel_20260817_235112",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_235112.py",
+      "speedup": 1.2236223051032358,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 3,
+      "strategy": {
+        "bottleneck": "Whole-forward serialization: the CUTLASS conv holds 87.8% of GPU time using only ~8% of DRAM bandwidth, while the 12.2% of satellite kernels sit at 86-89% DRAM with 3-15% SM throughput. The two never run at the same time.",
+        "optimisation method": "Decompose the forward along the batch axis into NC independent chunks and issue each chunk's full 9-kernel sequence on its own CUDA stream, so the DRAM-bound layout/GroupNorm/SiLU passes of one chunk execute concurrently with the compute-bound conv of another. Kernels themselves are unchanged.",
+        "method_name": "concurrent_stream_batch_decomposition",
+        "modification plan": "1. Do NOT edit any __global__ kernel body, block size, or per-launch grid formula. All changes are confined to the host function `fused_block`.\n2. Compute a chunk count from B only (every op in the block is independent per batch element): `int NC = (B>=4 && B%4==0) ? 4 : ((B>=2 && B%2==0) ? 2 : 1);`. Concrete: B=8 -> 4 chunks of 2; B=4 -> 4 chunks of 1; B=2 -> 2 chunks of 1; B=1 -> NC=1. When NC==1 execute exactly the present code path (no streams, no events) so the 1x256x131x131 shape is untouched.\n3. MILESTONE 1 (must compile and match reference before anything else): keep a single stream and simply wrap the existing body in `for (int c=0;c<NC;++c)`, with `int b0 = c*(B/NC), Bc = B/NC;` and every pointer offset by `(long)b0*CH*(long)HW` for x/xn/y1/z1/y2/out and by `(long)b0*CH` for scale/shift; pass `Bc` wherever `B` was passed (grid.z of nchw2nhwc_round and gn_silu_add_nchw, grid.y of gn_silu_round/gn_partial/gn_finalize, and N of `conv3x3`). Allocate xn, y1, z1, y2, out, scale, shift ONCE at full size before the loop. Verify numerics (chunking is bit-exact: GroupNorm reduces over (n,group) only, conv has no cross-batch reuse, residual is elementwise).\n4. Hoist the two `weight_krsc_round_kernel` launches and `w1r`/`w2r` allocation OUT of the chunk loop; they run once on the entering stream before the loop.\n5. MILESTONE 2 (the actual win): obtain NC streams once per call via `at::cuda::getStreamFromPool()` into a small stack array. Create an `at::cuda::CUDAEvent start_ev`, record it on the entering stream after step 4, and call `start_ev.block(streams[c])` for each c so every side stream waits for the allocations and the rounded weights.\n6. Inside the chunk loop, open `at::cuda::CUDAStreamGuard guard(streams[c]);` before the launches. This makes `at::cuda::getCurrentCUDAStream()` inside `gn_stats`, `run_conv_t` (both the CUTLASS `op(stream)` call and its workspace `torch::empty`) and the raw `<<<...>>>` launches resolve to the side stream with no signature changes.\n7. After the loop, for each c record an `at::cuda::CUDAEvent end_ev[c]` on streams[c] and call `end_ev[c].block(at::cuda::getCurrentCUDAStream())` on the entering stream, then return `out`. This join makes it safe for the caching allocator that x/out/xn were allocated on the entering stream and used on side streams.\n8. Keep the psum/psq temporaries allocated inside `gn_stats` (they are now per-chunk and allocated under the stream guard, so they stay on their own stream's pool).\n9. Do not add any in-place write, device transfer, or change to `get_inputs()`.\n10. Verify after building: (a) all four scored shapes still pass tolerance; (b) nsys shows conv kernels overlapping nchw2nhwc/gn_silu_* in time; (c) if the 2x256x64x64 shape regresses (its per-chunk conv grid is only 128 CTAs), tighten step 2 to require `(long)Bc*H*W >= 8192` before allowing NC>1, which drops that shape back to NC=1.\n11. Next round, if this lands, raise NC to 8 for B=8 and consider splitting along H with a 1-row halo so B=1 shapes can also pipeline.",
+        "evidence": "Previous-attempt verdict = (ii): the re-profiled attempt (scored 1.2453) has the identical kernel set and identical grid sizes as the base, and its per-kernel durations are all slightly WORSE, not better (nchw2nhwc 75104 vs 72224 ns; gn_silu_add_nchw 116224 vs 113632 ns; gn_silu_round 74944 vs 70688 ns) - no predicted metric moved, so its +4.41% is noise and its direction is unproven; I therefore pick an independent target. Attempt #1 (conv tile/split-k dispatch) regressed -4.64% because its 128x128x16x4-stage ConvBig needs 64KB smem, leaving 1 CTA/SM. Numbers driving this round: nsys steady-state table gives the CUTLASS conv 87.8% of per-forward GPU time (22,740us/24 launches = 947us) while it moves only ~134MB per launch = ~150 GB/s = 8% of the 1792 GB/s peak; the satellites are 12.2% of time and are pinned at the DRAM roof - gpu__dram_throughput.avg.pct 86.01 (nchw2nhwc), 88.83 (gn_silu_add_nchw), 88.20 (gn_partial), 86.59 (gn_silu_round) - while their sm__throughput.avg.pct is 6.52 / 9.08 / 3.24 / 15.05. Section analysis for nchw2nhwc states verbatim: 'This workload is utilizing greater than 80.0% of the available compute or memory performance of this device. To further improve performance, work will likely need to be shifted from the most utilized to another unit', and its ComputeWorkloadAnalysis says 'All compute pipelines are under-utilized' - i.e. the SMs are idle exactly when DRAM is saturated, and vice-versa during the conv. Ruled out as #1: per-kernel optimisation of the satellites - at 86-89% of DRAM peak with l1tex__t_sector_hit_rate 0.0% and lts__t_sector_hit_rate 0.17%, they are streaming at the memory roof and no rewrite can shrink their standalone time; ruled out as #2: conv tensor-core throughput - 77.3 GFLOP / 947us = 81.6 TFLOPS = 78-81% of the 104.8 TFLOPS TF32 peak, and the one attempt to retune it lost 4.6%. Departure from allowed_methods is deliberate and stated: Own_And_Fuse_Vendor_Operator / KernelFusion here would require forking the CUTLASS conv activation iterator or epilogue to absorb gn_silu_round (1.9%) or gn_partial (1.7%), which the budget rules exclude, and the remaining satellites are separated by grid-wide GroupNorm dependencies that make in-kernel fusion illegal; the mechanism I use instead - concurrent independent batch chunks on multiple streams - composes with every mechanism the base already has (no kernel, tile, layout or epilogue is touched).",
+        "expected_metric_change": "Wall-clock forward time down on the two large shapes by up to the satellite share (target 6-10%; ceiling 12.2%). gpu__dram_throughput.avg.pct measured over the conv window up from ~8% toward 40-70% as satellite traffic is absorbed there; sm__throughput during the satellite windows up from 3-15% as conv CTAs co-reside. Per-kernel gpu__time_duration of nchw2nhwc/gn_silu_* will INCREASE (they now share bandwidth) - this is expected and is not a regression; only end-to-end time counts. Anti-regression: (a) per-chunk conv grid must stay >=128 CTAs, so NC is gated on B and on B_chunk*H*W>=8192, and B=1 shapes keep NC=1 and the exact current code path; (b) kernel launch count per forward rises from 11 to 2+9*NC (max 38) - CPU issue cost must stay well under the ~2.08ms GPU time, so NC is capped at 4; (c) no increase in registers/shared memory of any kernel (kernel bodies untouched, so occupancy limits stay at 20/25/31/42 regs and 1-18KB smem); (d) numerics must remain bit-identical since chunking is exact per batch element; (e) if any scored shape regresses, that shape must fall back to NC=1.",
+        "headroom": "medium",
+        "structural_rewrite": false
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-17T23:51:47.248039",
+      "paired_verdict": {
+        "rel_pct": 1.826139914424374,
+        "se_pct": 0.3946058214222395,
+        "t": 4.669756931003689,
+        "dof": 5,
+        "reps": 6,
+        "resolved": true,
+        "p_one_sided": 0.0027418892049894767,
+        "sigma_equiv": 2.7771504795355058,
+        "sigma_ok": false,
+        "method": "paired_log_ratio_t"
+      },
+      "ncu_profile_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260817_235112_ncu.csv"
+    },
+    "kernel_20260818_000519": {
+      "parent": "kernel_20260817_235112",
+      "kernel_name": "kernel_20260818_000519",
+      "kernel_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260818_000519.py",
+      "speedup": 1.2088351342223318,
+      "runnable": true,
+      "ncu_passed": true,
+      "phase": "opt",
+      "round": 4,
+      "strategy": {
+        "bottleneck": "[compute/L2-traffic bound] The CUTLASS ImplicitGemmConvolution mainloop is 85.8% of steady per-forward GPU time (31,794us / 96 launches). It runs one hardcoded 128x64x16 threadblock tile; the narrow 64-wide N tile forces each activation K-slice to be re-fetched 4x (N/N_tile=256/64) through L2, so the conv sits at ~88% of TF32 roofline on the mid shape and lower on the 256x256 shape. All satellites together are only 14.2%.",
+        "primary_optimisation_method": "Threadblock tile-geometry retune of the CUTLASS conv mainloop: add a 128x128x16 (warp 64x64, 3-stage) instantiation and dispatch to it whenever M=N*H*W gives >=2 full CTA waves, keeping the existing 128x64x16 config for small-M shapes. Algebraically identical output; halves activation L2->SMEM re-fetch (N/N_tile 4->2) and doubles MACs per loaded fragment, which is the work/traffic term limiting the 85.8% hot kernel. Amdahl cap is 85.8%, versus 14.2% for any satellite fusion.",
+        "method_name": "conv_tile_geometry_retune",
+        "modification_plan": "SMEM BUDGET CHECK (mandatory, conv-like target): new tile 128x128x16 tf32, bytes_per_stage = (128+128)*16*4 = 16 KB; 3 stages = 48 KB <= 99 KB per-block limit and 2 CTAs/SM = 96 KB <= 100 KB per SM. PASSES. No custom smem staging is introduced; CUTLASS iterators already give coalesced 128-bit NHWC loads (alignment 4), so the coalescing-first rule is satisfied by construction.\n\n1. In the CUDA source, keep `MakeConv` unchanged and add a second instantiation next to the existing one inside `conv3x3`:\n   `using ConvBig = typename MakeConv<cutlass::gemm::GemmShape<128,128,16>, cutlass::gemm::GemmShape<64,64,16>, 3>::Op;`\n   and keep `using ConvSmall = typename MakeConv<GemmShape<128,64,16>, GemmShape<64,32,16>, 4>::Op;` (today's config, bit-identical path for small shapes).\n2. Replace the single call in `conv3x3` with an exact dispatch on CTA count:\n   `long M = (long)N*H*W; long ctas_big = ((M+127)/128) * 2; if (ctas_big >= 340) run_conv_t<ConvBig>(...); else run_conv_t<ConvSmall>(...);`\n   340 = 2 waves x 170 SMs. This routes 8x64x128 (1024 CTAs) and 4x256x256 (4096 CTAs) to the 128x128 tile, and keeps 2x64x64 (128 CTAs) and 1x131x131 (268 CTAs) on the current 128x64 tile so those two shapes cannot regress. Note the dispatch must use the CHUNK batch `Bc`, not `B`, since streams split the batch.\n3. Leave `run_conv_t` templated exactly as-is; it already takes the Op as a template parameter, so no other code changes. Keep `IteratorAlgorithm::kOptimized`, `LinearCombination<float,4,float,float>`, alignment 4,4, and the Sm80 op class (TF32 in, fp32 accumulate) — precision class is unchanged.\n4. Verify `can_implement` for ConvBig at every scored shape (it is already TORCH_CHECKed); if it ever fails, fall through to ConvSmall instead of aborting: wrap the big call in a status test and re-run with ConvSmall on failure.\n5. Preserve the accepted `concurrent_stream_batch_decomposition` mechanism verbatim: the dispatch lives entirely inside `conv3x3`, which is called from both the NC==1 path and the per-chunk loop under `CUDAStreamGuard`; do not hoist any state out of `conv3x3`, and keep the per-call workspace `torch::empty` so the two streams do not share a workspace buffer. Confirm after the edit that stream count, event pattern and the 456 launch total are unchanged.\n6. Build and correctness-check all four shapes against `_ref` (max_atol budget 0.0027-0.003). Numerics are unaffected by tile shape apart from K-accumulation order inside a fixed K=2304 loop, which is unchanged (no split-K introduced).\n7. Time each shape separately. Accept only if 8x64x128 and 4x256x256 improve and the other two are unchanged (they take the identical old code path).\n8. If 128x128x16/3-stage underperforms on 4x256x256, try, in order and one at a time: stages 4 (64 KB, 1 CTA/SM), then warp shape 64x32 with 256 threads. Do not add split-K, do not change the epilogue, and do not touch any satellite kernel this round — they hold only 14.2% combined.\n9. Keep `weight_krsc_round_kernel`, `nchw2nhwc_round_kernel`, `gn_*` kernels and the NC chunk heuristic byte-identical so the only variable measured is tile geometry.",
+        "evidence": "CUTLASS conv = 85.8% steady GPU time, 31,794us over 96 launches; mid-shape conv time = 1.956ms x 0.858 = 1.678ms vs 1.475ms TF32 roofline (2 x 77.3 GFLOP at 104.8 TFLOPS) => 88% of peak, and the 4x256x256 shape scores only 1.269x, consistent with extra L2 re-fetch. Root cause: N_tile=64 with K=256 makes every activation K-fragment travel L2->SMEM 4 times (~9.7GB per conv at 4x256x256); N_tile=128 halves it. Refutation of the alternative 'DRAM-bound satellites' story: nchw2nhwc (4.4%), gn_silu_add (3.6%), gn_partial (3.3%), gn_silu (1.7%), finalize (1.0%) sum to 14.2%, so fusing all of them caps the round below what a 5-10% conv gain yields.",
+        "expected_metric_change": "cutlass conv total us: 31,794 -> <=29,500 (-8% or better) with launches still 96; conv activation L2 read traffic (lts__t_sectors read for the conv) down ~2x on 4x256x256; per-shape speedup 8x256x64x128 >=1.42 and 4x256x256 >=1.34. Anti-regression constraints: 2x64x64 and 1x131x131 speedups must stay within noise of 1.1337/1.1481 (they keep the old tile), total launch count stays 456, the 4-stream chunked timeline must still show conv/GN overlap (stream count unchanged), no CUTLASS smem-limit or can_implement failure, max_atol still under the per-shape tolerance.",
+        "headroom": "medium",
+        "structural_rewrite": false,
+        "first_milestone": "Step 4 — both Op instantiations compile, the CTA-count dispatch in conv3x3 is wired with a can_implement fallback, and all four shapes match the reference.",
+        "estimated_turns": "8"
+      },
+      "method_matched": true,
+      "timestamp": "2026-08-18T00:05:54.719899",
+      "paired_verdict": {
+        "rel_pct": 0.7352380008584625,
+        "se_pct": 0.30611397295759235,
+        "t": 2.4106520469356867,
+        "dof": 4,
+        "reps": 5,
+        "resolved": true,
+        "p_one_sided": 0.03675143692913395,
+        "sigma_equiv": 1.7896955147213243,
+        "sigma_ok": false,
+        "method": "paired_log_ratio_t"
       }
     }
   },
   "scores": [
     1.1926346977281466,
-    1.1372656847838933
+    1.1372656847838933,
+    1.2452697404383097,
+    1.2236223051032358,
+    1.2088351342223318
   ],
   "err_flags": [
     false,
+    false,
+    false,
+    false,
     false
   ],
-  "last_score_for_curve": 1.1372656847838933,
-  "rounds_since_improvement": 1,
+  "last_score_for_curve": 1.2088351342223318,
+  "rounds_since_improvement": 2,
   "structural_debt": null,
   "stop_reason": null,
   "mcgs": {
     "version": 1,
     "root": "x:1777914b439bb78e",
-    "total_visits": 1,
+    "total_visits": 4,
     "params": {
       "c_puct": 0.8,
       "lam": 0.7,
@@ -113,13 +225,14 @@
         "rep": "kernel_20260816_211655",
         "rep_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260816_211655.py",
         "rep_value": 1.1926346977281466,
-        "N": 1,
-        "W": 0.052664085078747425,
-        "M": 0.052664085078747425,
+        "N": 4,
+        "W": 2.4434046564123673,
+        "M": 0.9989863982734168,
         "failures": 0,
         "parents": [],
         "children": [
-          "m:2268675ccea549fe"
+          "m:2268675ccea549fe",
+          "m:ce27801a122e01bb"
         ],
         "tried": [
           {
@@ -128,12 +241,19 @@
             "note": "round 1, -4.33% paired",
             "value": 1.140938992299763,
             "runnable": true
+          },
+          {
+            "mechanism": "concurrent_stream_batch_decomposition",
+            "child": "kernel_20260817_235112",
+            "note": "round 3, +1.83% paired",
+            "value": 1.2144138759766347,
+            "runnable": true
           }
         ],
         "runnable": true,
         "via": null,
-        "credit": 1.1926346977281466,
-        "credit_key": "x:1777914b439bb78e"
+        "credit": 1.2589103346408852,
+        "credit_key": "m:88b9ec4abee2109c"
       },
       "m:2268675ccea549fe": {
         "key": "m:2268675ccea549fe",
@@ -144,25 +264,117 @@
         "rep": "kernel_20260816_212731",
         "rep_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260816_212731.py",
         "rep_value": 1.140938992299763,
-        "N": 1,
-        "W": 0.052664085078747425,
-        "M": 0.052664085078747425,
+        "N": 2,
+        "W": 1.0516504833521643,
+        "M": 0.9989863982734168,
         "failures": 0,
         "parents": [
           "x:1777914b439bb78e"
         ],
+        "children": [
+          "m:88b9ec4abee2109c"
+        ],
+        "tried": [
+          {
+            "mechanism": "conv_tile_stage_autotune",
+            "child": "kernel_20260817_234020",
+            "note": "round 2, +10.34% paired",
+            "value": 1.2589103346408852,
+            "runnable": true
+          }
+        ],
+        "runnable": true,
+        "via": "conv_config_shape_dispatch_splitk",
+        "credit": 1.2589103346408852,
+        "credit_key": "m:88b9ec4abee2109c"
+      },
+      "m:88b9ec4abee2109c": {
+        "key": "m:88b9ec4abee2109c",
+        "depth": 2,
+        "members": [
+          "kernel_20260817_234020"
+        ],
+        "rep": "kernel_20260817_234020",
+        "rep_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_234020.py",
+        "rep_value": 1.2589103346408852,
+        "N": 1,
+        "W": 0.9989863982734168,
+        "M": 0.9989863982734168,
+        "failures": 0,
+        "parents": [
+          "m:2268675ccea549fe"
+        ],
         "children": [],
         "tried": [],
         "runnable": true,
-        "via": "conv_config_shape_dispatch_splitk",
-        "credit": 1.140938992299763,
-        "credit_key": "m:2268675ccea549fe"
+        "via": "conv_tile_stage_autotune",
+        "credit": 1.2589103346408852,
+        "credit_key": "m:88b9ec4abee2109c"
+      },
+      "m:ce27801a122e01bb": {
+        "key": "m:ce27801a122e01bb",
+        "depth": 1,
+        "members": [
+          "kernel_20260817_235112"
+        ],
+        "rep": "kernel_20260817_235112",
+        "rep_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_235112.py",
+        "rep_value": 1.2144138759766347,
+        "N": 2,
+        "W": 1.3917541730602032,
+        "M": 0.771610363482741,
+        "failures": 0,
+        "parents": [
+          "x:1777914b439bb78e"
+        ],
+        "children": [
+          "m:8fa119c120a96cc4"
+        ],
+        "tried": [
+          {
+            "mechanism": "conv_tile_geometry_retune",
+            "child": "kernel_20260818_000519",
+            "note": "round 4, +0.74% paired",
+            "value": 1.223342708280513,
+            "runnable": true
+          }
+        ],
+        "runnable": true,
+        "via": "concurrent_stream_batch_decomposition",
+        "credit": 1.223342708280513,
+        "credit_key": "m:8fa119c120a96cc4"
+      },
+      "m:8fa119c120a96cc4": {
+        "key": "m:8fa119c120a96cc4",
+        "depth": 2,
+        "members": [
+          "kernel_20260818_000519"
+        ],
+        "rep": "kernel_20260818_000519",
+        "rep_path": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260818_000519.py",
+        "rep_value": 1.223342708280513,
+        "N": 1,
+        "W": 0.6201438095774623,
+        "M": 0.6201438095774623,
+        "failures": 0,
+        "parents": [
+          "m:ce27801a122e01bb"
+        ],
+        "children": [],
+        "tried": [],
+        "runnable": true,
+        "via": "conv_tile_geometry_retune",
+        "credit": 1.223342708280513,
+        "credit_key": "m:8fa119c120a96cc4"
       }
     }
   },
   "opt_history_files": {
-    "1": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260816_211655/opt_round_001.json"
+    "1": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260816_211655/opt_round_001.json",
+    "2": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260816_212731/opt_round_002.json",
+    "3": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260816_211655/opt_round_003.json",
+    "4": "/home/otter77/git_project/KernelMem/run/20260816_204851_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260817_235112/opt_round_004.json"
   },
-  "next_individual_id": 2,
-  "timestamp": "2026-08-16T21:28:27.947819"
+  "next_individual_id": 5,
+  "timestamp": "2026-08-18T00:06:15.613115"
 }

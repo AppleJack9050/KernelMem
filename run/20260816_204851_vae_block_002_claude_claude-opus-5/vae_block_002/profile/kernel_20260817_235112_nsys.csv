@@ -1,0 +1,7 @@
+Kernel Name,kernel_launch_count
+nchw2nhwc_round_kernel,48
+gn_silu_add_nchw_kernel,48
+gn_partial_kernel,96
+gn_silu_round_kernel,48
+gn_finalize_kernel,96
+weight_krsc_round_kernel,24

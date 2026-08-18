@@ -1,4 +1,7 @@
 Kernel Name,kernel_launch_count
-gn_apply_nhwc,24
-gn_stats_nhwc,24
-gn_finalize_nhwc,24
+gn_silu_add_nchw_kernel,12
+nchw2nhwc_round_kernel,12
+gn_silu_round_kernel,12
+gn_partial_kernel,24
+weight_krsc_round_kernel,24
+gn_finalize_kernel,24

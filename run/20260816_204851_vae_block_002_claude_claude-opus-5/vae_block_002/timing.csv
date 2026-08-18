@@ -41,3 +41,79 @@ timestamp,round_idx,phase,seconds,detail
 2026-08-16 21:29:47,2,llm:judge_gate,4.526,
 2026-08-16 21:36:45,2,llm:judge_optimization,417.156,
 2026-08-16 22:03:49,2,llm:optimization,1624.054,failed:
+2026-08-17 21:53:34,-1,process_start,0.000,pid=20363 subproc_id=0 task=vae_block_002
+2026-08-17 21:53:34,2,resume,0.000,start_round=2 best=1.1926
+2026-08-17 21:53:35,2,ncu:base,0.001,cache_hit
+2026-08-17 21:53:38,2,nsys,2.832,
+2026-08-17 21:53:43,2,llm:judge_gate,4.465,
+2026-08-17 22:06:24,2,llm:judge_optimization,761.615,
+2026-08-17 22:21:06,2,llm:optimization,881.076,failed:
+2026-08-17 23:25:32,-1,process_start,0.000,pid=40451 subproc_id=0 task=vae_block_002
+2026-08-17 23:25:32,2,resume,0.000,start_round=2 best=1.1926
+2026-08-17 23:25:34,2,ncu:base,0.000,cache_hit
+2026-08-17 23:25:36,2,nsys,2.770,
+2026-08-17 23:25:44,2,llm:judge_gate,7.077,
+2026-08-17 23:36:36,2,llm:judge_optimization,652.584,
+2026-08-17 23:40:20,2,llm:optimization,223.433,
+2026-08-17 23:40:57,2,bench:opt,36.898,ok
+2026-08-17 23:41:19,2,round_total,947.057,best=1.2453
+2026-08-17 23:41:21,3,ncu:base,0.002,cache_hit
+2026-08-17 23:41:28,3,ncu_invocation:metrics[kernel0],7.365,ok
+2026-08-17 23:41:34,3,ncu_invocation:section[kernel0],6.000,ok
+2026-08-17 23:41:41,3,ncu_invocation:metrics[kernel1],7.237,ok
+2026-08-17 23:41:48,3,ncu_invocation:section[kernel1],6.290,ok
+2026-08-17 23:41:55,3,ncu_invocation:metrics[kernel2],7.336,ok
+2026-08-17 23:42:01,3,ncu_invocation:section[kernel2],5.999,ok
+2026-08-17 23:42:08,3,ncu_invocation:metrics[kernel3],7.232,ok
+2026-08-17 23:42:14,3,ncu_invocation:section[kernel3],5.892,ok
+2026-08-17 23:42:21,3,ncu_invocation:metrics[kernel4],7.379,ok
+2026-08-17 23:42:27,3,ncu_invocation:section[kernel4],6.034,ok
+2026-08-17 23:42:35,3,ncu_invocation:metrics[kernel5],7.274,ok
+2026-08-17 23:42:41,3,ncu_invocation:section[kernel5],5.831,ok
+2026-08-17 23:42:41,3,ncu_profile_total,79.922,names=6 csv=ncu_rejected_0.csv
+2026-08-17 23:42:41,3,ncu:rejected,79.926,names=6
+2026-08-17 23:42:43,3,nsys,2.771,
+2026-08-17 23:42:48,3,llm:judge_gate,4.932,
+2026-08-17 23:47:45,3,llm:judge_optimization,296.306,
+2026-08-17 23:51:12,3,llm:optimization,206.617,
+2026-08-17 23:51:47,3,bench:opt,35.158,ok
+2026-08-17 23:57:48,3,round_total,988.649,best=1.2453
+2026-08-17 23:58:24,4,ncu_invocation:metrics[kernel0],6.282,ok
+2026-08-17 23:58:30,4,ncu_invocation:section[kernel0],5.334,ok
+2026-08-17 23:58:36,4,ncu_invocation:metrics[kernel1],6.273,ok
+2026-08-17 23:58:41,4,ncu_invocation:section[kernel1],5.087,ok
+2026-08-17 23:58:47,4,ncu_invocation:metrics[kernel2],6.174,ok
+2026-08-17 23:58:52,4,ncu_invocation:section[kernel2],5.082,ok
+2026-08-17 23:58:59,4,ncu_invocation:metrics[kernel3],6.372,ok
+2026-08-17 23:59:04,4,ncu_invocation:section[kernel3],5.286,ok
+2026-08-17 23:59:10,4,ncu_invocation:metrics[kernel4],6.277,ok
+2026-08-17 23:59:16,4,ncu_invocation:section[kernel4],5.279,ok
+2026-08-17 23:59:22,4,ncu_invocation:metrics[kernel5],6.275,ok
+2026-08-17 23:59:27,4,ncu_invocation:section[kernel5],5.229,ok
+2026-08-17 23:59:27,4,ncu_profile_total,69.362,names=6 csv=ncu_temp_0.csv
+2026-08-17 23:59:27,4,ncu:base,69.366,names=6
+2026-08-17 23:59:30,4,nsys,2.767,
+2026-08-17 23:59:35,4,llm:judge_gate,4.530,
+2026-08-18 00:01:45,4,llm:judge_optimization,129.999,
+2026-08-18 00:05:19,4,llm:optimization,213.899,
+2026-08-18 00:05:54,4,bench:opt,35.420,ok
+2026-08-18 00:06:15,4,round_total,506.955,best=1.2453
+2026-08-18 00:06:16,5,ncu:base,0.000,cache_hit
+2026-08-18 00:06:23,5,ncu_invocation:metrics[kernel0],6.585,ok
+2026-08-18 00:06:28,5,ncu_invocation:section[kernel0],5.436,ok
+2026-08-18 00:06:36,5,ncu_invocation:metrics[kernel1],6.833,ok
+2026-08-18 00:06:41,5,ncu_invocation:section[kernel1],5.301,ok
+2026-08-18 00:06:47,5,ncu_invocation:metrics[kernel2],6.482,ok
+2026-08-18 00:06:53,5,ncu_invocation:section[kernel2],5.295,ok
+2026-08-18 00:06:59,5,ncu_invocation:metrics[kernel3],6.235,ok
+2026-08-18 00:07:04,5,ncu_invocation:section[kernel3],5.356,ok
+2026-08-18 00:07:11,5,ncu_invocation:metrics[kernel4],6.382,ok
+2026-08-18 00:07:16,5,ncu_invocation:section[kernel4],5.499,ok
+2026-08-18 00:07:23,5,ncu_invocation:metrics[kernel5],6.685,ok
+2026-08-18 00:07:29,5,ncu_invocation:section[kernel5],5.500,ok
+2026-08-18 00:07:29,5,ncu_profile_total,72.227,names=6 csv=ncu_rejected_0.csv
+2026-08-18 00:07:29,5,ncu:rejected,72.231,names=6
+2026-08-18 00:07:32,5,nsys,2.981,
+2026-08-18 00:07:36,5,llm:judge_gate,4.255,
+2026-08-18 00:09:50,5,stop_signal,0.000,signum=15 graceful
+2026-08-18 00:10:32,5,abort_signal,0.000,signum=15 round_abandoned

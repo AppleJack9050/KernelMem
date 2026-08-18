@@ -52,7 +52,8 @@ def _newest_workdir() -> str:
     return ds[-1]
 
 
-def _run(*, outcome, answer_file: str | None, call_type: str = "seed"):
+def _run(*, outcome, answer_file: str | None, call_type: str = "seed",
+         baseline: str | None = None):
     """Drive query_server with a faked agent call.
 
     Intercepts at ``retry_with_backoff`` -- the module global query_server calls
@@ -66,6 +67,8 @@ def _run(*, outcome, answer_file: str | None, call_type: str = "seed"):
         seen["workdir"] = wd
         if answer_file is not None:                 # the agent writing its answer
             Path(wd, qs._ANSWER_FILE).write_text(answer_file, encoding="utf-8")
+        seen["answer_at_call"] = (Path(wd, qs._ANSWER_FILE).read_text(encoding="utf-8")
+                                  if Path(wd, qs._ANSWER_FILE).exists() else None)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
@@ -73,7 +76,8 @@ def _run(*, outcome, answer_file: str | None, call_type: str = "seed"):
     real = qs.retry_with_backoff
     qs.retry_with_backoff = fake_retry
     try:
-        out = qs.query_server(prompt="x", call_type=call_type, model_name="claude-opus-5")
+        out = qs.query_server(prompt="x", call_type=call_type, model_name="claude-opus-5",
+                              baseline_code=baseline)
         return out, None, seen
     except Exception as exc:
         return None, exc, seen
@@ -135,3 +139,44 @@ for ct in ("optimization", "repair"):
     _check(err is None and out is not None, f"{ct} calls salvage as well")
 
 print("\n[salvage] all checks passed")
+
+
+# ---------------------------------------------------------------------------
+# The seeded ratchet.
+#
+# The instruction alone was not enough: it asks the agent to write ANSWER.py
+# "the moment you have a complete kernel that compiles", and an optimization
+# agent that spends its whole budget reading counters never reaches that
+# condition. Measured 2026-08-17 -- two consecutive rollouts hit the 30-turn wall
+# having written nothing at all, so salvage had nothing and the run died, while
+# the parent kernel sat unused in the prompt. Seeding it harness-side makes the
+# floor independent of what the agent does.
+# ---------------------------------------------------------------------------
+PARENT = "import torch\nclass ModelNew:\n    pass  # the parent kernel\n"
+BETTER = "import torch\nclass ModelNew:\n    pass  # improved by the agent\n"
+
+print("\n[ratchet] a rollout that writes NOTHING still returns the parent")
+out, err, _ = _run(outcome=([], _result(is_error=True, subtype="error_max_turns")),
+                   answer_file=None, call_type="optimization", baseline=PARENT)
+_check(err is None, "no longer raises -- the run survives a do-nothing rollout")
+_check(out is not None and "the parent kernel" in out, "the parent came back")
+
+print("[ratchet] an agent that improves on it wins")
+out, err, _ = _run(outcome=([], _result(is_error=True, subtype="error_max_turns")),
+                   answer_file=BETTER, call_type="optimization", baseline=PARENT)
+_check(err is None and "improved by the agent" in out and "the parent kernel" not in out,
+       "the agent's version replaces the seeded floor")
+
+print("[ratchet] a seed call has no parent, so nothing is seeded")
+out, err, _ = _run(outcome=([], _result(is_error=True, subtype="error_max_turns")),
+                   answer_file=None, call_type="seed", baseline=None)
+_check(err is not None, "a seed with nothing written still fails, as before")
+
+print("[ratchet] a delivered reply still beats the file")
+out, err, _ = _run(outcome=(["ok\n```python\nclass ModelNew: pass  # replied\n```"],
+                            _result(is_error=False)),
+                   answer_file=None, call_type="optimization", baseline=PARENT)
+_check(err is None and "replied" in out and "the parent kernel" not in out,
+       "seeding the floor never preempts a real answer")
+
+print("\n[ratchet] all checks passed")

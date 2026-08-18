@@ -1399,15 +1399,15 @@ owning the op (e.g. via CUTLASS) can delete it outright.
 
 | kernel | steady % | raw % | total (us) | launches |
 |---|---|---|---|---|
-| `void cutlass::Kernel<cutlass::conv::kernel::ImplicitGemmConvolution<cutlass::conv::thre...` | 88.5% | 88.5% | 24,134 | 24 |
-| `gn_silu_add_nchw_kernel(const float *, const float *, const float *, const float *, flo...` | 3.9% | 3.9% | 1,060 | 12 |
-| `nchw2nhwc_round_kernel(const float *, float *, int, int)` | 3.7% | 3.7% | 1,020 | 12 |
-| `gn_silu_round_kernel(const float *, const float *, const float *, float *, int)` | 1.8% | 1.8% | 498 | 12 |
-| `gn_partial_kernel(const float *, float *, float *, int, int)` | 1.4% | 1.4% | 394 | 24 |
-| `weight_krsc_round_kernel(const float *, float *)` | 0.4% | 0.4% | 108 | 24 |
-| `gn_finalize_kernel(const float *, const float *, const float *, const float *, float *,...` | 0.2% | 0.2% | 49 | 24 |
+| `void cutlass::Kernel<cutlass::conv::kernel::ImplicitGemmConvolution<cutlass::conv::thre...` | 86.7% | 86.7% | 22,790 | 24 |
+| `nchw2nhwc_round_kernel(const float *, float *, int, int)` | 5.2% | 5.2% | 1,378 | 12 |
+| `gn_silu_add_nchw_kernel(const float *, const float *, const float *, const float *, flo...` | 4.0% | 4.0% | 1,064 | 12 |
+| `gn_silu_round_kernel(const float *, const float *, const float *, float *, int)` | 1.9% | 1.9% | 488 | 12 |
+| `gn_partial_kernel(const float *, float *, float *, int, int)` | 1.5% | 1.5% | 403 | 24 |
+| `weight_krsc_round_kernel(const float *, float *)` | 0.4% | 0.4% | 105 | 24 |
+| `gn_finalize_kernel(const float *, const float *, const float *, const float *, float *,...` | 0.2% | 0.2% | 48 | 24 |
 
-Hottest STEADY-STATE kernel: `void cutlass::Kernel<cutlass::conv::kernel::ImplicitGemmConv` at **88.5%** of per-forward GPU time. By Amdahl, a round that leaves it untouched is capped at 11.5% even if it drives everything else to zero. (One-time autotune probes are excluded; they inflate the raw column but do not run per forward.)
+Hottest STEADY-STATE kernel: `void cutlass::Kernel<cutlass::conv::kernel::ImplicitGemmConv` at **86.7%** of per-forward GPU time. By Amdahl, a round that leaves it untouched is capped at 13.3% even if it drives everything else to zero. (One-time autotune probes are excluded; they inflate the raw column but do not run per forward.)
 
 Total kernel launches in the forward pass: **132**
 
@@ -1422,8 +1422,8 @@ The metrics above include:
 
 # Kernel Launch Counts (from nsys profiling)
 
-- **gn_silu_add_nchw_kernel**: 12 launches
 - **nchw2nhwc_round_kernel**: 12 launches
+- **gn_silu_add_nchw_kernel**: 12 launches
 - **gn_silu_round_kernel**: 12 launches
 - **gn_partial_kernel**: 24 launches
 - **weight_krsc_round_kernel**: 24 launches

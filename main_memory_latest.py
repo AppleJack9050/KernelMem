@@ -549,6 +549,7 @@ def _make_llm_caller(args):
         round_idx: int = -1,
         model_name: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        baseline_code: Optional[str] = None,
     ) -> str:
         """One model call. *model_name*/*reasoning_effort* override the run defaults.
 
@@ -576,6 +577,7 @@ def _make_llm_caller(args):
                 log_path=str(log_path) if log_path else None,
                 call_type=call_type,
                 round_idx=round_idx,
+                baseline_code=baseline_code,
             )
         if isinstance(res, list):
             return res[0] if res else ""
@@ -620,6 +622,7 @@ def _llm_to_kernel(
     io_tag: Optional[str] = None,
     model_name: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    baseline_code: Optional[str] = None,
 ) -> KernelIndividual:
     """LLM → code → save → KernelIndividual (no evaluation).
 
@@ -639,6 +642,7 @@ def _llm_to_kernel(
         round_idx=round_idx,
         model_name=model_name,
         reasoning_effort=reasoning_effort,
+        baseline_code=baseline_code,
     )
     # Ensure io_dir exists before writing
     io_dir.mkdir(parents=True, exist_ok=True)
@@ -1831,6 +1835,44 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # the model, not by the round index. See utils/torch_ext_cache.
     sweep_stale_batons()
 
+    def _snapshot(next_round: int, *, stop_reason: Optional[str] = None) -> None:
+        """Persist the round's outcome, from the end of a round OR before a skip.
+
+        This used to be written inline at the bottom of the loop body, and its own
+        comment -- "Round finished (whatever its outcome)" -- was not true of the
+        paths that `continue` past it. Those paths do real work first: a failed
+        rollout backs reward 0.0 up the selected path, which is the only record
+        the search keeps that a state was expanded and produced nothing. Leaving
+        it unsaved meant a --resume rebuilt the graph without it, reselected the
+        same node, and drew the same dead plan again.
+
+        Reads its state through the closure, so it always snapshots the values as
+        they stand at the call, not as they stood when it was defined.
+        """
+        _save_checkpoint(
+            task_root, eval_dir,
+            task_path=task_path,
+            next_round=next_round,
+            total_rounds=args.round,
+            state={
+                "base_kernel": base_kernel,
+                "best_kernel": best_kernel,
+                "current_kernel": current_kernel,
+                "repair_chain_kernel": repair_chain_kernel,
+                "base_score": base_score,
+                "best_score": best_score,
+                "optimization_tree": optimization_tree,
+                "scores": scores,
+                "err_flags": err_flags,
+                "last_score_for_curve": last_score_for_curve,
+                "rounds_since_improvement": rounds_since_improvement,
+                "structural_debt": structural_debt,
+                "stop_reason": stop_reason,
+                "mcgs": graph.to_dict() if _use_mcgs else None,
+                "opt_history_files": opt_history_files,
+            },
+        )
+
     for round_idx in range(start_round, args.round):
         if _STOP_REQUESTED:
             print(f"[stop] Stopping before round {round_idx}. Completed {round_idx} of "
@@ -2847,6 +2889,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             print(f"[judge] Could not parse optimization strategy "
                                   f"({exc.__class__.__name__}); skipping round {round_idx}. "
                                   f"Raw reply kept at {reply_file}", flush=True)
+                            _snapshot(round_idx + 1)
                             continue  # `round_idx` advances via the enclosing for-loop
 
                         # Does this round's plan ask for structural grace? Only
@@ -2968,10 +3011,61 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         print(f"[rollout] Expanding with {args.rollout_model} at "
                               f"effort={args.rollout_effort} (subscription credit); "
                               f"judge/analysis remain on {args.model_name}", flush=True)
-                        ind = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, round_idx,
-                                             log_path=log_path, call_type="optimization",
-                                             model_name=args.rollout_model,
-                                             reasoning_effort=args.rollout_effort)
+                        # The ratchet's floor for this call. `arch_src` in the
+                        # prompt is exactly this kernel, so the agent has a valid
+                        # answer before it acts -- seeding ANSWER.py with it means
+                        # the worst case a rollout can produce is "no change"
+                        # rather than "nothing", whatever it does with its turns.
+                        # GUARDED. Every other failure in this round already
+                        # degrades to "skip the round" -- a malformed judge reply
+                        # `continue`s above, a bad pathway block is caught and
+                        # skipped. This call was the one exception: zero enclosing
+                        # try-blocks, so anything the agent raised unwound past the
+                        # round loop and killed the run. Three runs on 002 died here.
+                        #
+                        # Not catching it cost more than the round. It also skipped
+                        # `graph.backup` far below, so the selected node kept N=1 and
+                        # an untouched Q: the search held no record that it had been
+                        # expanded and yielded nothing, and would select it again.
+                        # utils/mcgs.reward_from_gain already specifies the handling
+                        # -- "a state that keeps emitting uncompilable code should
+                        # fall out of contention on its own rather than needing a
+                        # separate rule" -- and returns 0.0 for exactly this case.
+                        # The mechanism existed; nothing ever reached it.
+                        try:
+                            ind = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, round_idx,
+                                                 log_path=log_path, call_type="optimization",
+                                                 model_name=args.rollout_model,
+                                                 reasoning_effort=args.rollout_effort,
+                                                 baseline_code=parent_kernel_code or None)
+                        except Exception as _exc:
+                            # Exception, not BaseException: a Ctrl-C or the graceful
+                            # stop must keep unwinding rather than be recorded as a
+                            # bad rollout and swallowed.
+                            print(f"[rollout] FAILED ({type(_exc).__name__}: {_exc})", flush=True)
+                            if _use_mcgs and _mcgs_sel is not None:
+                                _r = reward_from_gain(None, scale=args.mcgs_reward_scale,
+                                                      failed=True)
+                                graph.backup(list(_mcgs_sel.path), _r, failed=True)
+                                try:
+                                    from utils.pathmemory import broadcast_credit
+                                    broadcast_credit(graph)
+                                except Exception as _bc:
+                                    print(f"[pathway] credit broadcast skipped "
+                                          f"({type(_bc).__name__}: {_bc})", flush=True)
+                                _pn = graph.nodes.get(_mcgs_sel.node.key)
+                                if _pn is not None:
+                                    print(f"[mcgs] Rollout produced nothing -> reward "
+                                          f"{_r:.3f} backed up the selected path; "
+                                          f"{_mcgs_sel.node.key} now N={_pn.N}, "
+                                          f"failures={_pn.failures}, "
+                                          f"Q={_pn.q(args.mcgs_lam):.3f}", flush=True)
+                            run_timing.record("rollout_failed", 0.0, round_idx=round_idx,
+                                              detail=type(_exc).__name__)
+                            _snapshot(round_idx + 1)
+                            print(f"[rollout] Skipping round {round_idx}; best kernel retained.",
+                                  flush=True)
+                            continue  # `round_idx` advances via the enclosing for-loop
                         _bench_and_score(
                             ind,
                             ref_py=task_path,
@@ -3458,29 +3552,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
         # Round finished (whatever its outcome) -- snapshot so a stop or a crash
         # after this point resumes from the NEXT round rather than replaying this one.
-        _save_checkpoint(
-            task_root, eval_dir,
-            task_path=task_path,
-            next_round=round_idx + 1,
-            total_rounds=args.round,
-            state={
-                "base_kernel": base_kernel,
-                "best_kernel": best_kernel,
-                "current_kernel": current_kernel,
-                "repair_chain_kernel": repair_chain_kernel,
-                "base_score": base_score,
-                "best_score": best_score,
-                "optimization_tree": optimization_tree,
-                "scores": scores,
-                "err_flags": err_flags,
-                "last_score_for_curve": last_score_for_curve,
-                "rounds_since_improvement": rounds_since_improvement,
-                "structural_debt": structural_debt,
-                "stop_reason": "plateau" if _plateau_stop else None,
-                "mcgs": graph.to_dict() if _use_mcgs else None,
-                "opt_history_files": opt_history_files,
-            },
-        )
+        _snapshot(round_idx + 1, stop_reason="plateau" if _plateau_stop else None)
 
         if _plateau_stop:
             _best_txt = f"{best_score:.4f}" if best_score != float("-inf") else "none"

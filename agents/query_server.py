@@ -135,9 +135,12 @@ this without a reason:
   retry, and the round is then scored from whatever `ANSWER.py` holds -- which is
   usually an EARLIER draft than your best work, so your later work is lost.
 
-DELIVER EARLY AND OFTEN, TO A FILE. The moment you have a complete kernel that
-compiles -- however unambitious -- write it to `ANSWER.py` in your working
-directory. Overwrite it whenever you have something better that still compiles.
+DELIVER EARLY AND OFTEN, TO A FILE. `ANSWER.py` in your working directory is
+what gets scored if this call ends without a final message. On an OPTIMIZATION
+call it ALREADY EXISTS and already holds the kernel you were asked to improve --
+so the floor is already "no change", and your only job is to raise it. On a seed
+call you start with nothing there, so the moment you have a complete kernel that
+compiles -- however unambitious -- write it. Overwrite it whenever you have something better that still compiles.
 Treat it as a ratchet: `ANSWER.py` should always hold the best COMPLETE kernel
 you have so far, never a partial edit.
 
@@ -252,6 +255,19 @@ def _agent_build_env(workdir: str) -> Dict[str, str]:
 # rather than a bad kernel silently promoted.
 # ---------------------------------------------------------------------------
 _ANSWER_FILE = "ANSWER.py"
+
+
+def _seed_answer(workdir: str, code: str) -> None:
+    """Pre-fill ANSWER.py with the kernel this call is meant to improve.
+
+    Never raises: a failure to seed must not fail the call, it only costs the
+    floor it would have provided.
+    """
+    try:
+        with open(os.path.join(workdir, _ANSWER_FILE), "w", encoding="utf-8") as fh:
+            fh.write(code)
+    except OSError:
+        pass
 
 
 def _salvage_answer(workdir: Optional[str]) -> Optional[str]:
@@ -410,6 +426,58 @@ def _flatten_prompt(prompt: str | list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+def _write_call_outcome(
+    log_path: Optional[str],
+    round_idx: int,
+    call_type: str,
+    *,
+    outcome: str,
+    num_turns: Optional[int],
+    duration_s: Optional[float],
+    salvaged: str,
+    model: str = "",
+    effort: str = "",
+    detail: str = "",
+) -> None:
+    """Append one agentic call to calls.csv, next to usage.csv.
+
+    Written for EVERY agentic call, including the ones that raise -- which is the
+    point. usage.csv is written after the is_error raise, so a call that failed
+    left no row at all: the run that motivated this had three rows for four calls,
+    and the missing one was the call that killed it. Rather than relocate that
+    block (usage is genuinely about tokens, and a failed call's token count is
+    only in `result`, which may be None), failures get their own record.
+
+    `num_turns` comes free off ResultMessage and is the number nothing else in
+    this repo could answer. Diagnosing a 30-turn wall previously meant inferring
+    from token ratios, because the transcript lives in the scratch dir and the
+    scratch dir is deleted in the `finally` above.
+
+    `salvaged` distinguishes the three outcomes that used to look identical
+    downstream, where a failed round records only `speedup: None`:
+      none    -- nothing on disk; the round produces no kernel at all
+      parent  -- the ratchet floor came back untouched; the agent built nothing new
+      moved   -- the agent wrote something of its own before it ran out
+    """
+    if not log_path:
+        return
+    try:
+        path = os.path.join(os.path.dirname(log_path), "calls.csv")
+        file_exists = os.path.exists(path)
+        with open(path, "a", encoding="utf-8") as f:
+            if not file_exists:
+                f.write("timestamp,round_idx,call_type,outcome,num_turns,duration_s,"
+                        "salvaged,model,effort,detail" + "\n")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            det = str(detail).replace(",", ";").replace("\n", " ")[:160]
+            f.write(f"{timestamp},{round_idx},{call_type},{outcome},"
+                    f"{'' if num_turns is None else num_turns},"
+                    f"{'' if duration_s is None else f'{duration_s:.1f}'},"
+                    f"{salvaged},{model},{effort},{det}\n")
+    except Exception as e:
+        print(f"Warning: Failed to write call outcome log: {e}")
+
+
 def _write_usage_row(
     log_path: Optional[str],
     round_idx: int,
@@ -489,6 +557,7 @@ def query_server(
     log_path: Optional[str] = None,
     call_type: str = "unknown",
     round_idx: int = -1,
+    baseline_code: Optional[str] = None,
 ):
     # temperature/top_p/top_k, budget_tokens, num_completions, and the server_*
     # params are accepted for caller compatibility but have no Agent SDK
@@ -520,6 +589,21 @@ def query_server(
         # A private scratch cwd, so the agent's files land nowhere near the repo
         # or the run artifacts even though it holds a real Bash.
         workdir = tempfile.mkdtemp(prefix=f"kernelmem_agent_{call_type}_")
+        # Seed the ratchet from the kernel this call was asked to IMPROVE, before
+        # the agent gets a turn. An optimization or repair call is handed a
+        # working kernel in its prompt, so a valid answer exists at turn 0 -- but
+        # the instruction only asks the agent to write ANSWER.py "the moment you
+        # have a complete kernel that compiles", and an agent that spends its
+        # whole budget reading counters never reaches that condition. Measured
+        # 2026-08-17: two consecutive rollouts hit the 30-turn wall having written
+        # NOTHING to disk, so salvage had nothing and the run died -- while the
+        # parent kernel, already scoring 1.1409, sat unused in the prompt.
+        #
+        # Writing it here makes the floor "no change" instead of "nothing", and
+        # makes the ratchet independent of whether the agent complies. The agent
+        # can only ever overwrite it with something better.
+        if baseline_code:
+            _seed_answer(workdir, baseline_code)
         _skills, _sources, _tools = _skills_config()
         options = ClaudeAgentOptions(
             system_prompt=((system_prompt or "") + _TOOL_MODE_INSTRUCTION
@@ -578,9 +662,18 @@ def query_server(
         why = (f"{type(call_error).__name__}: {call_error}" if call_error is not None
                else f"{result.subtype}: {result.result}" if result is not None
                else "the model returned no text")
+        # Say plainly whether the agent moved the ratchet at all. "Recovered a
+        # kernel" reads like a save either way, but recovering the untouched
+        # baseline means the call produced NOTHING and the round is about to
+        # re-score its own parent -- which is worth seeing in the log rather than
+        # inferring later from two identical scores.
+        moved = (baseline_code is None) or (salvaged.strip() != baseline_code.strip())
+        what = (f"Recovered {len(salvaged)} chars from {_ANSWER_FILE}"
+                if moved else
+                f"{_ANSWER_FILE} is still the UNCHANGED parent kernel -- this call "
+                f"produced no improvement")
         print(f"[salvage] {call_type}: no kernel arrived in the reply ({why}). "
-              f"Recovered {len(salvaged)} chars from {_ANSWER_FILE} in the agent's "
-              f"scratch dir; it still has to compile, match the reference and beat "
+              f"{what}; it still has to compile, match the reference and beat "
               f"the base like any other candidate.", flush=True)
         # Re-enter the normal path rather than returning early, so usage logging
         # and the finish-reason print below happen for a salvaged call exactly as
@@ -588,6 +681,24 @@ def query_server(
         # would be worse than the failure this is fixing.
         texts = [f"```python\n{salvaged}\n```"]
         salvage_used = True
+
+    # Before the raises, so a call that dies is recorded exactly as one that
+    # lives. This is the row that was missing for every failure so far.
+    _write_call_outcome(
+        log_path, round_idx, call_type,
+        outcome=("ok" if not failed else
+                 "max_turns" if "maximum number of turns" in str(call_error or
+                                                                 getattr(result, "subtype", ""))
+                 else "error"),
+        num_turns=getattr(result, "num_turns", None),
+        duration_s=(getattr(result, "duration_ms", None) or 0) / 1000.0 if result else None,
+        salvaged=("moved" if salvage_used and (baseline_code is None
+                                               or salvaged.strip() != baseline_code.strip())
+                  else "parent" if salvage_used else "none"),
+        model=model, effort=effort,
+        detail=(f"{type(call_error).__name__}: {call_error}" if call_error is not None
+                else getattr(result, "subtype", "") if failed else ""),
+    )
 
     if call_error is not None and not salvage_used:
         raise call_error
