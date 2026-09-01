@@ -35,7 +35,7 @@ lessons:
     Restart from a different granularity rather than editing further.
 
     '
-  source: utils/mcgs.py max_depth rationale
+  source: utils/mcts.py max_depth rationale
 - id: seed-choice-dominates-the-final-score
   confidence: measured
   claim: 'Which granularity and algorithm the seed picks decides almost the whole result;

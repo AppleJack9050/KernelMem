@@ -35,8 +35,7 @@ from utils.gpu_lock import gpu_section
 from utils import clock_lock
 from utils.torch_ext_cache import sweep_stale_batons, sweep_unheld_batons
 from utils import run_timing
-from utils.mcgs import (MechanismPrior, MonteCarloGraphSearch, load_code_features,
-                        reward_from_gain, state_key)
+from utils.mcts import MechanismPrior, MonteCarloTreeSearch, reward_from_gain
 
 # ---------------------------------------------------------------------------
 # Serialize every GPU-touching entry point behind one cross-process mutex.
@@ -93,8 +92,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--server_port", type=int, default=8000, help="Unused (kept for compatibility)")
     p.add_argument("--model_name", default="claude-opus-5", help="Claude model (non-Claude names fall back to claude-opus-5)")
     p.add_argument("--rollout_model", default="claude-sonnet-5",
-                   help="Model for the MCGS ROLLOUT -- the `optimization` call that writes the "
-                        "next kernel from the selected state. This is the call the search repeats "
+                   help="Model for the MCTS ROLLOUT -- the `optimization` call that writes the "
+                        "next kernel from the selected node. This is the call the search repeats "
                         "every round, and generation is ~95%% of the wall clock, so it is the one "
                         "worth moving off the most expensive model. The judge, problem-identify "
                         "and repair calls stay on --model_name. Both go through the Claude Agent "
@@ -153,9 +152,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "Was 0.005 (0.5%%), which was calibrated to sit just below the drift-"
                         "attenuated value of a real gain (a verified +1.26%% same-session "
                         "improvement read as only +0.57%% cross-round). Use 0 to accept any "
-                        "improvement. NOTE: under --search mcgs (the default) the base is chosen "
-                        "by graph selection rather than by this ratchet, so this gate governs the "
-                        "recorded accept evidence and best_kernel promotion, not which state the "
+                        "improvement. NOTE: under --search mcts (the default) the base is chosen "
+                        "by tree selection rather than by this ratchet, so this gate governs the "
+                        "recorded accept evidence and best_kernel promotion, not which node the "
                         "next round branches from; use --search ratchet for a literal one-way "
                         "5%%-or-nothing incumbent.")
     p.add_argument("--base_reps", type=int, default=5,
@@ -209,60 +208,43 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "the old base is restored. best_kernel is never affected, so a run can "
                         "only report a kernel that genuinely measured best. Try 3.")
     # ---- search policy: what the next round branches from -------------------
-    p.add_argument("--search", default="mcgs", choices=["ratchet", "mcgs"],
+    p.add_argument("--search", default="mcts", choices=["ratchet", "mcts", "mcgs"],
                    help="How the parent for each round is chosen. 'ratchet' is the original "
                         "hill-climber: keep one incumbent, branch from it forever, discard every "
                         "rejected candidate. Measured over the 18 saved trees in run/, that left "
                         "113 of 169 nodes (66.9%%) visited exactly once and never revisited. "
-                        "'mcgs' (default on this branch) runs Monte Carlo Graph Search over kernel "
-                        "STATES instead: transpositions merge, so two edit orders that reach the "
-                        "same structure pool their statistics rather than splitting a budget that "
-                        "only affords ~30 evaluations per run. Keep 'ratchet' available for A/B -- "
-                        "cross-method claims on this codebase have been overturned before.")
-    p.add_argument("--mcgs_state_key", default="mechanisms",
-                   choices=["mechanisms", "features", "code"],
-                   help="What makes two kernels the SAME state, i.e. what may merge. Measured by "
-                        "replaying the 145 scored kernels in run/ that still have sources: "
-                        "'mechanisms' (order-independent MULTISET of method_names along the path) "
-                        "gives 85 states, 1.71 kernels/state -- the default. 'features' (the "
-                        "code_features_used vector) gives 11 states for 145 kernels, one holding 47 "
-                        "kernels across a 457%% speedup range against a 516%% total range: it pools "
-                        "nearly everything, because is_aligned_vector_access and is_pointwise never "
-                        "vary and three more are ~constant, so the vector carries about two bits. "
-                        "'code' gives 104 states, 1.39/state, and is effectively a tree -- keep it "
-                        "as the A/B control for whether merging is what helped. NOTE: genuine "
-                        "commuting transpositions are ~absent from the recorded history; the "
-                        "merging you actually get is re-derivation of an identical recipe.")
-    p.add_argument("--mcgs_merge_tol", type=float, default=0.15,
-                   help="Refuse to pool a kernel into a state whose representative differs from it "
-                        "by more than this relative amount; it is split into its own state instead. "
-                        "Exists because of the 'features' measurement above: without it a coarse "
-                        "key makes Q an average over kernels 5x apart in speed. With it, a bad "
-                        "abstraction degrades toward a tree rather than corrupting the values. "
-                        "Set 0 to trust the key completely.")
-    p.add_argument("--mcgs_c_puct", type=float, default=0.8,
+                        "'mcts' (default on this branch) runs Monte Carlo Tree Search over those "
+                        "kernels instead, so a node the ratchet threw away stays a candidate "
+                        "parent and earns visits on its measured Q. Keep 'ratchet' available for "
+                        "A/B -- cross-method claims on this codebase have been overturned before. "
+                        "'mcgs' is the retired Monte Carlo GRAPH Search spelling and is accepted "
+                        "as a deprecated alias for 'mcts'; the graph's transposition merging never "
+                        "once fired in production (5 saved checkpoints, 16 nodes: zero merged "
+                        "states, zero multi-parent nodes, zero back-edges), so the graph was "
+                        "replaced by the tree it always was. See utils/mcts.py.")
+    p.add_argument("--mcts_c_puct", "--mcgs_c_puct", type=float, default=0.8,
                    help="Exploration weight in Q + c*sqrt(ln N_parent / N_child). Rewards are "
                         "mapped into [0,1] so this is comparable across tasks. Low because the "
                         "budget is ~30 evaluations: a large c spends all of it on first visits.")
-    p.add_argument("--mcgs_lam", type=float, default=0.7,
+    p.add_argument("--mcts_lam", "--mcgs_lam", type=float, default=0.7,
                    help="Weight on the MAX term in Q = (1-lam)*mean + lam*max. High on purpose. "
                         "The measured gain distribution is bimodal -- 42%% of edges regress past "
                         "-1%%, 33%% win past +1%%, only 25%% land inside the +-1%% noise band -- and "
                         "the loop keeps the best kernel, not the average one. Mean-backup buries a "
-                        "state that produced one +6%% child among four regressions, which is the "
+                        "node that produced one +6%% child among four regressions, which is the "
                         "shape of every real win in the data.")
-    p.add_argument("--mcgs_widen_k", type=float, default=1.0,
-                   help="Progressive widening: a state may have ceil(k * N**alpha) children. The "
+    p.add_argument("--mcts_widen_k", "--mcgs_widen_k", type=float, default=1.0,
+                   help="Progressive widening: a node may have ceil(k * N**alpha) children. The "
                         "action space is LLM-generated and unbounded, so there is no move list to "
-                        "argmax over; a state earns another child only by being visited.")
-    p.add_argument("--mcgs_widen_alpha", type=float, default=0.5)
-    p.add_argument("--mcgs_max_depth", type=int, default=10,
+                        "argmax over; a node earns another child only by being visited.")
+    p.add_argument("--mcts_widen_alpha", "--mcgs_widen_alpha", type=float, default=0.5)
+    p.add_argument("--mcts_max_depth", "--mcgs_max_depth", type=int, default=10,
                    help="Edits from the seed after which selection expands sideways instead of "
                         "deeper. Measured, not chosen: win rate over the saved runs is 41%% for "
                         "rounds 0-4 and 5-9, then 0%% for rounds 10-14, 15-19 and 20-24 -- zero "
                         "wins in 22 edges past round 10. Calibrated on vae_block_002; re-derive it "
                         "before trusting it on a task whose kernels have more structural room.")
-    p.add_argument("--mcgs_prior", default="",
+    p.add_argument("--mcts_prior", "--mcgs_prior", default="",
                    help="Path to a mechanism prior fitted by "
                         "scripts/build_mechanism_prior.py. With one loaded, selection "
                         "switches from UCT to PUCT: the exploration term is weighted "
@@ -274,48 +256,52 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "default) keeps plain UCT -- a close cousin of this idea "
                         "(bound-type focus routing) lost its A/B at SOL 0.500 vs "
                         "0.516, so this is opt-in and wants its own A/B.")
-    p.add_argument("--mcgs_c_prior", type=float, default=1.0,
-                   help="PUCT exploration weight, used only when --mcgs_prior is set: "
+    p.add_argument("--mcts_c_prior", "--mcgs_c_prior", type=float, default=1.0,
+                   help="PUCT exploration weight, used only when --mcts_prior is set: "
                         "U = Q + c_prior * P(a) * sqrt(N_parent) / (1 + N_child).")
-    p.add_argument("--mcgs_epsilon", type=float, default=0.0,
+    p.add_argument("--mcts_epsilon", "--mcgs_epsilon", type=float, default=0.0,
                    help="Probability of taking a RANDOM child instead of the argmax at "
                         "each descent step. The argmax is deterministic within a call, so "
-                        "a state that merely looks best keeps being re-entered while its "
+                        "a node that merely looks best keeps being re-entered while its "
                         "rivals never get the visits that would correct them; Czech et al. "
                         "(2021) add a random exploration trajectory for exactly this. "
-                        "Seeded from (--mcgs_rng_seed, total_visits, depth), so a --resume "
+                        "Seeded from (--mcts_rng_seed, total_visits, depth), so a --resume "
                         "at the same visit count makes the same draw and replays stay "
                         "reproducible. Default 0.0 = OFF: it changes the search policy, and "
                         "the convention here is that such a change is opt-in until it wins "
-                        "its own A/B, exactly as --mcgs_prior is. Note this is NOT what "
-                        "keeps the walk out of a cycle -- the trajectory mask in select() "
-                        "does that unconditionally.")
-    p.add_argument("--mcgs_rng_seed", type=int, default=0,
-                   help="Seed for --mcgs_epsilon. Fixed default so two runs at the same "
+                        "its own A/B, exactly as --mcts_prior is.")
+    p.add_argument("--mcts_rng_seed", "--mcgs_rng_seed", type=int, default=0,
+                   help="Seed for --mcts_epsilon. Fixed default so two runs at the same "
                         "epsilon are comparable; vary it to get independent samples.")
-    p.add_argument("--mcgs_pv_bonus", type=float, default=0.0,
+    p.add_argument("--mcts_pv_bonus", "--mcgs_pv_bonus", type=float, default=0.0,
                    help="Selection bonus for children on the PRINCIPAL VARIATION -- the "
                         "chain of edits that actually reached the best kernel, computed by "
                         "utils.pathmemory.broadcast_credit. Q and credit are denominated "
                         "differently: backup stores reward_from_gain, a function of the "
                         "PERCENTAGE GAIN OVER THE PARENT, so a line climbing hard off a bad "
                         "seed outranks one inching forward from a good one -- while being "
-                        "worse on absolute score, the only number the run reports. The state "
+                        "worse on absolute score, the only number the run reports. The node "
                         "holding the record can therefore lose the argmax to a line that has "
                         "never come near it. Added as a constant "
                         "rather than scaled by N, so it breaks ties and near-ties without "
                         "swamping a real Q gap -- 0.05-0.15 is the useful range against a Q "
                         "in [0,1]. Default 0.0 = OFF: it changes the search policy, and the "
                         "convention here is that such a change is opt-in until it wins its "
-                        "own A/B, exactly as --mcgs_prior and --mcgs_epsilon are. The "
+                        "own A/B, exactly as --mcts_prior and --mcts_epsilon are. The "
                         "PROMPT half of path memory is separate and on by default; disable "
                         "that with KERNELMEM_PATHWAY=0.")
-    p.add_argument("--mcgs_reward_scale", type=float, default=3.0,
+    p.add_argument("--mcts_reward_scale", "--mcgs_reward_scale", type=float, default=3.0,
                    help="Percent gain that maps to a near-saturated reward via tanh(rel/scale). "
                         "At 3.0: 0%% -> 0.50, +1%% -> 0.58, +3%% -> 0.88. The reward is the PAIRED "
                         "relative gain, never the blocked score -- score carries +0.9..+1.7%% "
                         "cross-round drift and a corruptible T_ref denominator, and backing a max "
-                        "over that up a graph compounds the bias at every level.")
+                        "over that up the tree compounds the bias at every level.")
+    # Retired with the graph: node identity is minted per kernel now, so there is
+    # no abstraction to key on and nothing to refuse a merge into. Accepted and
+    # ignored rather than removed, so a saved command line or a --resume script
+    # that still carries them does not die at argparse.
+    p.add_argument("--mcgs_state_key", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--mcgs_merge_tol", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--plateau_margin", type=float, default=0.005,
                    help="Relative improvement in best_score that counts as PROGRESS for the "
                         "--patience plateau counter (0.005 = 0.5%%). Deliberately decoupled from "
@@ -361,9 +347,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "folder and continues each task from its checkpoint.json instead of "
                         "starting a new run. Combine with a larger --round to extend a finished run.")
     p.add_argument("--no_viewer", action="store_true",
-                   help="Do not start the live MCGS graph viewer. The viewer runs by "
+                   help="Do not start the live MCTS tree viewer. The viewer runs by "
                         "default, as a DAEMON THREAD inside this process serving loopback "
-                        "only: it polls the graph file the loop has already written, never "
+                        "only: it polls the tree file the loop has already written, never "
                         "imports the loop, and does no GPU work, so it cannot perturb a "
                         "measurement. A daemon thread cannot outlive the run, so unlike a "
                         "subprocess it leaves no orphan holding the port after a kill -9. "
@@ -553,7 +539,7 @@ def _make_llm_caller(args):
     ) -> str:
         """One model call. *model_name*/*reasoning_effort* override the run defaults.
 
-        The override exists for the MCGS rollout: expansion is the call the search
+        The override exists for the MCTS rollout: expansion is the call the search
         makes over and over, so it runs on a cheaper model at high effort while the
         judge, problem-identify and repair calls stay on --model_name. Both go
         through the same Agent SDK path, so both bill subscription credit.
@@ -631,7 +617,7 @@ def _llm_to_kernel(
     would overwrite the previous one's saved reply.
 
     *model_name*/*reasoning_effort* override the run defaults for this one call.
-    Used to put the MCGS rollout on a cheaper model at high effort while the
+    Used to put the MCTS rollout on a cheaper model at high effort while the
     judge and analysis calls stay put.
     """
     raw = call_llm(
@@ -1346,10 +1332,11 @@ def _save_checkpoint(task_root: Path, eval_dir: Path, *, task_path: Path,
             if state.get("structural_debt") else None
         ),
         "stop_reason": state.get("stop_reason"),
-        # Visit counts are the only part of the MCGS state that cannot be
+        # Visit counts are the only part of the MCTS state that cannot be
         # recomputed from artifacts on disk, so they must survive a restart or a
         # resumed run restarts its exploration with the budget already spent.
-        "mcgs": state.get("mcgs"),
+        # "mcgs" is the graph-era key, still read on resume; see the restore path.
+        "mcts": state.get("mcts"),
         "opt_history_files": {str(k): str(v) for k, v in (state.get("opt_history_files") or {}).items()},
         # Ids name the eval_XXXX.json files; rewinding this would overwrite
         # results from rounds that already finished.
@@ -1633,61 +1620,60 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # displaced so it can be restored if the rewrite never pays off.
     structural_debt: Optional[Dict[str, Any]] = None
 
-    # ---- Monte Carlo Graph Search state -------------------------------------
+    # ---- Monte Carlo Tree Search state --------------------------------------
     # Replaces the ratchet's rule for choosing what the next round branches from.
-    # `graph` owns SELECTION only: measurement (paired verdict), repair, ncu and
+    # `tree` owns SELECTION only: measurement (paired verdict), repair, ncu and
     # reporting are untouched, so a regression here cannot silently corrupt the
     # numbers -- it can only send the loop to a worse parent, which shows up in
     # the score curve rather than hiding in it.
-    _use_mcgs = (getattr(args, "search", "ratchet") == "mcgs")
-    graph = MonteCarloGraphSearch(
-        c_puct=args.mcgs_c_puct, lam=args.mcgs_lam,
-        widen_k=args.mcgs_widen_k, widen_alpha=args.mcgs_widen_alpha,
-        max_depth=args.mcgs_max_depth, reward_scale=args.mcgs_reward_scale,
-        state_key_mode=args.mcgs_state_key, merge_tolerance=args.mcgs_merge_tol,
-        c_prior=args.mcgs_c_prior,
-        epsilon=getattr(args, "mcgs_epsilon", 0.0),
-        rng_seed=getattr(args, "mcgs_rng_seed", 0),
-        pv_bonus=getattr(args, "mcgs_pv_bonus", 0.0))
-    if _use_mcgs and getattr(args, "mcgs_prior", ""):
-        _pp = Path(args.mcgs_prior)
+    _use_mcts = (getattr(args, "search", "ratchet") == "mcts")
+    tree = MonteCarloTreeSearch(
+        c_puct=args.mcts_c_puct, lam=args.mcts_lam,
+        widen_k=args.mcts_widen_k, widen_alpha=args.mcts_widen_alpha,
+        max_depth=args.mcts_max_depth, reward_scale=args.mcts_reward_scale,
+        c_prior=args.mcts_c_prior,
+        epsilon=getattr(args, "mcts_epsilon", 0.0),
+        rng_seed=getattr(args, "mcts_rng_seed", 0),
+        pv_bonus=getattr(args, "mcts_pv_bonus", 0.0))
+    if _use_mcts and getattr(args, "mcts_prior", ""):
+        _pp = Path(args.mcts_prior)
         if not _pp.exists():
-            print(f"[mcgs] WARNING: --mcgs_prior {_pp} does not exist; continuing with "
+            print(f"[mcts] WARNING: --mcts_prior {_pp} does not exist; continuing with "
                   f"plain UCT. Fit one with scripts/build_mechanism_prior.py.", flush=True)
         else:
             try:
-                graph.prior = MechanismPrior.from_dict(
+                tree.prior = MechanismPrior.from_dict(
                     json.loads(_pp.read_text(encoding="utf-8")))
             except Exception as _exc:
-                print(f"[mcgs] WARNING: could not read the prior ({_exc}); continuing "
+                print(f"[mcts] WARNING: could not read the prior ({_exc}); continuing "
                       f"with plain UCT.", flush=True)
-            if graph.prior is not None and graph.prior.table:
+            if tree.prior is not None and tree.prior.table:
                 _top = ", ".join(f"{m} {a:+.2f}%(n={n})"
-                                 for m, a, n in graph.prior.ranked(4))
-                print(f"[mcgs] PUCT prior loaded from {_pp}: "
-                      f"{len(graph.prior.table)} mechanisms, fitted on "
-                      f"{graph.prior.fitted_on} edges. Top: {_top}", flush=True)
-                if graph.prior.note:
-                    print(f"[mcgs]   fit: {graph.prior.note}", flush=True)
+                                 for m, a, n in tree.prior.ranked(4))
+                print(f"[mcts] PUCT prior loaded from {_pp}: "
+                      f"{len(tree.prior.table)} mechanisms, fitted on "
+                      f"{tree.prior.fitted_on} edges. Top: {_top}", flush=True)
+                if tree.prior.note:
+                    print(f"[mcts]   fit: {tree.prior.note}", flush=True)
             else:
-                print(f"[mcgs] WARNING: the prior at {_pp} is empty; plain UCT it is.",
+                print(f"[mcts] WARNING: the prior at {_pp} is empty; plain UCT it is.",
                       flush=True)
-    # Live objects for the graph's state representatives. The graph stores kernel
-    # NAMES (it has to be JSON-serialisable for the checkpoint), and selection
-    # needs `.code`/`.code_path`, so names are resolved through here and fall
-    # back to reading the file when a resume has no live object.
+    # Live objects for the tree's kernels. The tree stores kernel NAMES (it has
+    # to be JSON-serialisable for the checkpoint), and selection needs
+    # `.code`/`.code_path`, so names are resolved through here and fall back to
+    # reading the file when a resume has no live object.
     _kernel_registry: Dict[str, KernelIndividual] = {}
-    # The state the current round was selected from, and its value: needed at
+    # The node the current round was selected from, and its value: needed at
     # backup time, one full round after selection happened.
-    _mcgs_sel = None
-    _mcgs_parent_key: Optional[str] = None
+    _mcts_sel = None
+    _mcts_parent_key: Optional[str] = None
 
     def _register(ind: Optional[KernelIndividual]) -> None:
         if ind is not None and getattr(ind, "code_path", None):
             _kernel_registry[Path(ind.code_path).stem] = ind
 
     def _resolve(name: Optional[str], path: Optional[str]) -> Optional[KernelIndividual]:
-        """A graph state's representative as a live KernelIndividual."""
+        """A tree node's kernel as a live KernelIndividual."""
         if not name:
             return None
         got = _kernel_registry.get(name)
@@ -1700,40 +1686,6 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             _kernel_registry[name] = ind
             return ind
         return None
-
-    def _state_key_for(ind: Optional[KernelIndividual], *, round_idx: int,
-                       mechanisms: Optional[List[str]] = None) -> str:
-        """State identity for a kernel, under --mcgs_state_key.
-
-        Features come from the kernel's OWN code via the heuristic extractor, not
-        from round*_machine_check_result.json. That file records the features of
-        the kernel machine_check PROFILED, which is the round's PARENT (see the
-        `cuda_code=parent_kernel_code` call site) -- keying a child by its
-        parent's features would merge every child of a parent into one state
-        regardless of what the edit did. The heuristic extractor needs no LLM
-        call and is deterministic, so it can run on a kernel the same round it is
-        produced; the profiled vector is only a fallback.
-        """
-        name = (Path(ind.code_path).stem
-                if (ind is not None and getattr(ind, "code_path", None)) else f"r{round_idx}")
-        feats = None
-        if args.mcgs_state_key == "features":
-            code = getattr(ind, "code", None)
-            if code:
-                try:
-                    from prompts.machine_check_ver2 import extract_code_features_from_cuda
-                    feats = extract_code_features_from_cuda(code)
-                except Exception as _exc:
-                    print(f"[mcgs] feature extraction failed ({_exc}); falling back to the "
-                          f"profiled vector for this kernel.", flush=True)
-            if not feats:
-                feats = load_code_features(io_dir, round_idx)
-        return state_key(
-            mode=args.mcgs_state_key,
-            features=feats,
-            mechanisms=mechanisms,
-            code=getattr(ind, "code", None),
-            fallback=name)
 
     # ---- resume: rebuild the loop's state from the last completed round ----
     start_round = 0
@@ -1776,29 +1728,39 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                       f"round(s) of grace left.", flush=True)
             rounds_since_improvement = int(ckpt.get("rounds_since_improvement") or 0)
             opt_history_files = {int(k): Path(v) for k, v in (ckpt.get("opt_history_files") or {}).items()}
-            # The graph carries the visit counts, which are the only thing in this
+            # The tree carries the visit counts, which are the only thing in this
             # method that cannot be recomputed from artifacts on disk. Dropping
             # them on resume would reset every Q to zero and restart exploration
             # from scratch with the budget already spent.
-            if ckpt.get("mcgs"):
-                graph = MonteCarloGraphSearch.from_dict(ckpt["mcgs"])
-                # `pv` is derived, not stored, so a restored graph has an empty one
+            #
+            # "mcgs" is the graph-era key. A checkpoint written under it is read,
+            # not refused: MonteCarloTreeSearch.from_dict flattens the saved DAG
+            # (BFS from the root, shallowest route in) and reports on stdout what
+            # that dropped. Measured on the five saved checkpoints, it drops
+            # nothing -- every graph the graph search ever wrote was already a
+            # tree -- but a resume must not depend on that holding.
+            _saved = ckpt.get("mcts") or ckpt.get("mcgs")
+            if _saved:
+                tree = MonteCarloTreeSearch.from_dict(_saved)
+                if tree.migration_note:
+                    print(f"[mcts] {tree.migration_note}", flush=True)
+                # `pv` is derived, not stored, so a restored tree has an empty one
                 # and would select the first round after a resume with no PV bonus
                 # -- a silent one-round policy change across a restart. Rebuild it
                 # here, before any selection happens.
                 try:
                     from utils.pathmemory import broadcast_credit
-                    broadcast_credit(graph)
+                    broadcast_credit(tree)
                 except Exception as _exc:
                     print(f"[pathway] credit broadcast skipped on resume "
                           f"({type(_exc).__name__}: {_exc})", flush=True)
-                _g = graph.stats()
-                print(f"[mcgs] Restored the search graph: {_g['states']} states over "
-                      f"{_g['kernels']} kernels, {_g['merged_states']} merged, "
+                _g = tree.stats()
+                print(f"[mcts] Restored the search tree: {_g['nodes']} nodes "
+                      f"({_g['leaves']} leaves), depth {_g['max_depth_seen']}, "
                       f"mean N={_g['mean_N']:.2f}, {_g['total_visits']} visits.", flush=True)
-            elif _use_mcgs:
-                print("[mcgs] WARNING: this checkpoint predates --search mcgs and carries no "
-                      "graph. Rebuilding from the best kernel as a fresh root; the earlier "
+            elif _use_mcts:
+                print("[mcts] WARNING: this checkpoint predates --search mcts and carries no "
+                      "tree. Rebuilding from the best kernel as a fresh root; the earlier "
                       "rounds' visit statistics are not recoverable.", flush=True)
             for _ind in (base_kernel, best_kernel, current_kernel):
                 _register(_ind)
@@ -1843,7 +1805,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         paths that `continue` past it. Those paths do real work first: a failed
         rollout backs reward 0.0 up the selected path, which is the only record
         the search keeps that a state was expanded and produced nothing. Leaving
-        it unsaved meant a --resume rebuilt the graph without it, reselected the
+        it unsaved meant a --resume rebuilt the tree without it, reselected the
         same node, and drew the same dead plan again.
 
         Reads its state through the closure, so it always snapshots the values as
@@ -1868,7 +1830,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 "rounds_since_improvement": rounds_since_improvement,
                 "structural_debt": structural_debt,
                 "stop_reason": stop_reason,
-                "mcgs": graph.to_dict() if _use_mcgs else None,
+                "mcts": tree.to_dict() if _use_mcts else None,
                 "opt_history_files": opt_history_files,
             },
         )
@@ -1893,11 +1855,11 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         # but consumed in the accept block outside it, so a round that goes to
         # repair instead would otherwise still be holding the previous round's
         # selection -- and would back its result up that stale path, crediting a
-        # state that had nothing to do with it. Cleared here so a round with no
+        # node that had nothing to do with it. Cleared here so a round with no
         # selection of its own records nothing.
-        _mcgs_sel = None
-        _mcgs_parent_key = None
-        # Assigned only on the opt path; read by the MCGS mechanism key. Reset so
+        _mcts_sel = None
+        _mcts_parent_key = None
+        # Assigned only on the opt path; read by the MCTS mechanism label. Reset so
         # a repair round cannot inherit the previous round's method name.
         strategy_json = None
         # Snapshot for the plateau test. best_score is updated from several
@@ -2014,18 +1976,18 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     "method_matched": False,  # Seed doesn't have optimization method matching
                     "timestamp": datetime.now().isoformat(),
                 }
-                # Root of the search graph. Seeded with the measured score as the
+                # Root of the search tree. Seeded with the measured score as the
                 # chain anchor: every later value is this number times a product
                 # of PAIRED relative gains, so the whole ledger stays on the basis
                 # the accept decisions are actually made on.
-                if _use_mcgs and speedup is not None:
+                if _use_mcts and speedup is not None:
                     _register(ind)
-                    _rk = _state_key_for(ind, round_idx=round_idx, mechanisms=[])
-                    graph.observe(key=_rk, kernel_name=kernel_name,
-                                  kernel_path=str(ind.code_path), value=float(speedup),
-                                  parent_key=None, runnable=True, note="seed")
-                    print(f"[mcgs] Root state {_rk} <- {kernel_name} at {speedup:.4f} "
-                          f"(key mode: {args.mcgs_state_key})", flush=True)
+                    _root = tree.observe(kernel_name=kernel_name,
+                                         kernel_path=str(ind.code_path),
+                                         value=float(speedup),
+                                         parent_key=None, runnable=True, note="seed")
+                    print(f"[mcts] Root node {_root.key} <- {kernel_name} at "
+                          f"{speedup:.4f}", flush=True)
 
         else:
             is_runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False)) if current_kernel else False
@@ -2260,43 +2222,42 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 # The optimization phase should keep iterating on base_kernel rather than current_kernel,
                 # because current_kernel may have been generated in the previous round, yet is not as good as base_kernel.
                 # ---- choose what this round branches from --------------------
-                # Under --search mcgs the graph decides, and it decides by moving
+                # Under --search mcts the tree decides, and it decides by moving
                 # base_kernel rather than by bypassing it. Everything downstream
                 # (ncu naming, the `parent_kernel == base_kernel` repair path, the
                 # paired verdict, prompt construction) keeps working unchanged,
                 # and the paired comparison then measures the candidate against
-                # exactly the state it was branched from -- which is precisely the
+                # exactly the node it was branched from -- which is precisely the
                 # reward the backup needs. Under 'ratchet' this block is inert.
-                _mcgs_sel = None
-                _mcgs_parent_key = None
-                if _use_mcgs and graph.root is not None:
-                    _mcgs_sel = graph.select()
-                    if _mcgs_sel is not None:
-                        _sel_ind = _resolve(_mcgs_sel.node.rep, _mcgs_sel.node.rep_path)
+                _mcts_sel = None
+                _mcts_parent_key = None
+                if _use_mcts and tree.root is not None:
+                    _mcts_sel = tree.select()
+                    if _mcts_sel is not None:
+                        _sel_ind = _resolve(_mcts_sel.node.kernel, _mcts_sel.node.kernel_path)
                         if _sel_ind is not None:
-                            _mcgs_parent_key = _mcgs_sel.node.key
+                            _mcts_parent_key = _mcts_sel.node.key
                             _switched = (base_kernel is not _sel_ind)
                             base_kernel = _sel_ind
-                            base_score = float(_mcgs_sel.node.rep_value)
-                            _g = graph.stats()
-                            print(f"[mcgs] Round {round_idx}: branching from state "
-                                  f"{_mcgs_sel.node.key} (depth {_mcgs_sel.node.depth}, "
-                                  f"N={_mcgs_sel.node.N}, Q={_mcgs_sel.node.q(args.mcgs_lam):.3f}, "
-                                  f"value {base_score:.4f}) via {_mcgs_sel.node.rep}"
+                            base_score = float(_mcts_sel.node.value)
+                            _g = tree.stats()
+                            print(f"[mcts] Round {round_idx}: branching from node "
+                                  f"{_mcts_sel.node.key} (depth {_mcts_sel.node.depth}, "
+                                  f"N={_mcts_sel.node.N}, Q={_mcts_sel.node.q(args.mcts_lam):.3f}, "
+                                  f"value {base_score:.4f}) via {_mcts_sel.node.kernel}"
                                   f"{' [SWITCHED parent]' if _switched else ''}", flush=True)
-                            print(f"[mcgs]   why: {_mcgs_sel.reason}", flush=True)
-                            print(f"[mcgs]   graph: {_g['states']} states / "
-                                  f"{_g['kernels']} kernels, {_g['merged_states']} merged, "
-                                  f"mean N={_g['mean_N']:.2f}, depth seen "
-                                  f"{_g['max_depth_seen']}", flush=True)
+                            print(f"[mcts]   why: {_mcts_sel.reason}", flush=True)
+                            print(f"[mcts]   tree: {_g['nodes']} nodes "
+                                  f"({_g['leaves']} leaves), mean N={_g['mean_N']:.2f}, "
+                                  f"depth seen {_g['max_depth_seen']}", flush=True)
                         else:
-                            # The representative's file is gone (hand-cleaned run
-                            # dir, or a resume against moved artifacts). Fall through
-                            # to the incumbent rather than dying mid-run.
-                            print(f"[mcgs] WARNING: could not resolve the code for state "
-                                  f"{_mcgs_sel.node.key} (rep {_mcgs_sel.node.rep}); "
+                            # The node's file is gone (hand-cleaned run dir, or a
+                            # resume against moved artifacts). Fall through to the
+                            # incumbent rather than dying mid-run.
+                            print(f"[mcts] WARNING: could not resolve the code for node "
+                                  f"{_mcts_sel.node.key} (kernel {_mcts_sel.node.kernel}); "
                                   f"falling back to the incumbent for this round.", flush=True)
-                            _mcgs_sel = None
+                            _mcts_sel = None
                 # parent_kernel is base_kernel_temp; it only counts as a real base_kernel once ncu profiling passes
                 parent_kernel = base_kernel if base_kernel is not None else current_kernel
                 
@@ -2965,31 +2926,31 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         # For round 0, keep_last=0 means no history; for round 1+, keep_last should be round_idx to include all previous rounds
                         history_block = _build_history_block(code_dir, keep_last=max(round_idx, 5))
                         # Just-in-time memory: the chain of edits that actually
-                        # reached the best kernel, with each state's own context.
-                        # Built here because it needs the live graph. "" under the
+                        # reached the best kernel, with each node's own context.
+                        # Built here because it needs the live tree. "" under the
                         # ratchet, on round 1, or with KERNELMEM_PATHWAY=0 -- and a
                         # failure to build it must never cost a round, so it
                         # degrades to "" exactly as lessons_block does.
                         pathway_block = ""
-                        if _use_mcgs:
+                        if _use_mcts:
                             try:
                                 from utils.pathmemory import (broadcast_credit,
                                                               render_pathway)
                                 # Broadcast HERE as well as after backup, not only
                                 # after it. Credit is written at the end of a round,
-                                # so on round 1 -- when the graph holds the seed and
+                                # so on round 1 -- when the tree holds the seed and
                                 # nothing else -- it had never run, every node still
                                 # read credit=0.0, and render_pathway correctly
-                                # reported "no pathway" for a graph that plainly had
+                                # reported "no pathway" for a tree that plainly had
                                 # one. Re-running it at prompt time is a cheap pass
                                 # over the nodes and makes the block correct whenever
                                 # it is built, rather than only when the round loop
                                 # happens to have refreshed it first.
-                                broadcast_credit(graph)
+                                broadcast_credit(tree)
                                 pathway_block = render_pathway(
-                                    graph,
-                                    current_key=(_mcgs_sel.node.key if _mcgs_sel else None),
-                                    lam=args.mcgs_lam)
+                                    tree,
+                                    current_key=(_mcts_sel.node.key if _mcts_sel else None),
+                                    lam=args.mcts_lam)
                             except Exception as _exc:
                                 print(f"[pathway] block skipped "
                                       f"({type(_exc).__name__}: {_exc})", flush=True)
@@ -3003,7 +2964,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         )
                         prompt_file = io_dir / f"round{round_idx:03d}_opt_prompt.txt"
                         prompt_file.write_text(opt_prompt, encoding="utf-8")
-                        # THE ROLLOUT. In MCGS terms this is the expansion: one
+                        # THE ROLLOUT. In MCTS terms this is the expansion: one
                         # child drawn from the selected state. It is the call the
                         # search repeats every round and ~95% of the wall clock,
                         # so it runs on --rollout_model at --rollout_effort while
@@ -3024,11 +2985,11 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         # round loop and killed the run. Three runs on 002 died here.
                         #
                         # Not catching it cost more than the round. It also skipped
-                        # `graph.backup` far below, so the selected node kept N=1 and
+                        # `tree.backup` far below, so the selected node kept N=1 and
                         # an untouched Q: the search held no record that it had been
                         # expanded and yielded nothing, and would select it again.
-                        # utils/mcgs.reward_from_gain already specifies the handling
-                        # -- "a state that keeps emitting uncompilable code should
+                        # utils/mcts.reward_from_gain already specifies the handling
+                        # -- "a node that keeps emitting uncompilable code should
                         # fall out of contention on its own rather than needing a
                         # separate rule" -- and returns 0.0 for exactly this case.
                         # The mechanism existed; nothing ever reached it.
@@ -3043,23 +3004,23 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             # stop must keep unwinding rather than be recorded as a
                             # bad rollout and swallowed.
                             print(f"[rollout] FAILED ({type(_exc).__name__}: {_exc})", flush=True)
-                            if _use_mcgs and _mcgs_sel is not None:
-                                _r = reward_from_gain(None, scale=args.mcgs_reward_scale,
+                            if _use_mcts and _mcts_sel is not None:
+                                _r = reward_from_gain(None, scale=args.mcts_reward_scale,
                                                       failed=True)
-                                graph.backup(list(_mcgs_sel.path), _r, failed=True)
+                                tree.backup(list(_mcts_sel.path), _r, failed=True)
                                 try:
                                     from utils.pathmemory import broadcast_credit
-                                    broadcast_credit(graph)
+                                    broadcast_credit(tree)
                                 except Exception as _bc:
                                     print(f"[pathway] credit broadcast skipped "
                                           f"({type(_bc).__name__}: {_bc})", flush=True)
-                                _pn = graph.nodes.get(_mcgs_sel.node.key)
+                                _pn = tree.nodes.get(_mcts_sel.node.key)
                                 if _pn is not None:
-                                    print(f"[mcgs] Rollout produced nothing -> reward "
+                                    print(f"[mcts] Rollout produced nothing -> reward "
                                           f"{_r:.3f} backed up the selected path; "
-                                          f"{_mcgs_sel.node.key} now N={_pn.N}, "
+                                          f"{_mcts_sel.node.key} now N={_pn.N}, "
                                           f"failures={_pn.failures}, "
-                                          f"Q={_pn.q(args.mcgs_lam):.3f}", flush=True)
+                                          f"Q={_pn.q(args.mcts_lam):.3f}", flush=True)
                             run_timing.record("rollout_failed", 0.0, round_idx=round_idx,
                                               detail=type(_exc).__name__)
                             _snapshot(round_idx + 1)
@@ -3302,14 +3263,14 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     should_update_base = this_score >= base_score * (1.0 + args.base_margin)
                     _paired_note = None
 
-            # ---- MCGS: record the candidate and back its result up ------------
+            # ---- MCTS: record the candidate and back its result up ------------
             # This replaces the ratchet's one-way base mutation. The reward is the
-            # PAIRED relative gain against the state we branched from, so the value
+            # PAIRED relative gain against the node we branched from, so the value
             # chain is `seed x prod(1 + verified gain)` -- one basis end to end.
             # Falling back to the blocked delta only when no verdict exists keeps
             # --base_max_reps 0 working, and is flagged in the log because that
             # number carries the drift the paired path removes.
-            if _use_mcgs and _mcgs_sel is not None and _mcgs_parent_key:
+            if _use_mcts and _mcts_sel is not None and _mcts_parent_key:
                 _cand_name = (Path(ind.code_path).stem
                               if (ind and getattr(ind, "code_path", None)) else None)
                 if _cand_name:
@@ -3322,68 +3283,70 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         _basis = "blocked (drift-contaminated; no paired verdict)"
                     else:
                         _rel, _basis = 0.0, "unmeasurable"
-                    _parent_node = graph.nodes.get(_mcgs_parent_key)
-                    _parent_value = float(_parent_node.rep_value) if _parent_node else 1.0
+                    _parent_node = tree.nodes.get(_mcts_parent_key)
+                    _parent_value = float(_parent_node.value) if _parent_node else 1.0
                     _child_value = _parent_value * (1.0 + _rel / 100.0)
                     _failed = not runnable
-                    # Mechanism set: the path's applied methods plus this round's,
-                    # so 'mechanisms' keying can recognise a commuting reorder.
+                    # The edit's name, as the judge declared it. It labels the edge
+                    # (`node.via`) and is what the PUCT prior's repeat damping reads
+                    # back off the path. It is no longer a state key -- there are no
+                    # state keys -- so an unnamed change costs nothing but a label.
                     _mech = (strategy_json.get("method_name")
                              if isinstance(strategy_json, dict) else None)
-                    _mechs = None
-                    if args.mcgs_state_key == "mechanisms":
-                        # Path-accumulated and order-preserving: graph.path_mechanisms
-                        # walks the `via` edge labels root-to-leaf. Repeats are kept,
-                        # so applying one method twice stays distinct from once.
-                        _mechs = graph.path_mechanisms(_mcgs_sel.path) + (
-                            [_mech] if _mech else [])
-                    _ck = _state_key_for(ind, round_idx=round_idx, mechanisms=_mechs)
-                    graph.observe(key=_ck, kernel_name=_cand_name,
-                                  kernel_path=str(ind.code_path) if ind.code_path else None,
-                                  value=_child_value, parent_key=_mcgs_parent_key,
-                                  runnable=bool(runnable), mechanism=_mech,
-                                  note=f"round {round_idx}, {_rel:+.2f}% {_basis}")
-                    _r = reward_from_gain(_rel, scale=args.mcgs_reward_scale, failed=_failed)
-                    _path = list(_mcgs_sel.path)
-                    if _ck not in _path:
-                        _path.append(_ck)
-                    graph.backup(_path, _r, failed=_failed)
+                    # The node's id comes back from observe(); it is minted there
+                    # and cannot be predicted. The graph version passed a key IN and
+                    # then reused it, which silently desynced whenever the merge
+                    # guard rehomed the kernel under a split key -- backup() skipped
+                    # the child and the next line raised KeyError.
+                    _child = tree.observe(
+                        kernel_name=_cand_name,
+                        kernel_path=str(ind.code_path) if ind.code_path else None,
+                        value=_child_value, parent_key=_mcts_parent_key,
+                        runnable=bool(runnable), mechanism=_mech,
+                        note=f"round {round_idx}, {_rel:+.2f}% {_basis}")
+                    _ck = _child.key
+                    _r = reward_from_gain(_rel, scale=args.mcts_reward_scale, failed=_failed)
+                    # The child is always fresh -- observe() mints an id that is
+                    # not in `nodes`, and every key on the path is -- so it is
+                    # appended unconditionally. The graph needed a membership test
+                    # here because a merge could land the child ON the path, and
+                    # backing that node up twice double-counted one evaluation.
+                    _path = list(_mcts_sel.path) + [_ck]
+                    tree.backup(_path, _r, failed=_failed)
                     # Second pass, opposite direction: backup credits this path
-                    # with THIS rollout's reward, broadcast credits every state
+                    # with THIS rollout's reward, broadcast credits every node
                     # with the best value anywhere below it. Run here rather than
                     # at prompt-build time so `credit` is correct in the
                     # checkpoint too, and a --resume or the viewer sees the same
                     # numbers the round saw. Never allowed to break a round: it
-                    # is a read of the graph, and a bad read must not cost the
+                    # is a read of the tree, and a bad read must not cost the
                     # kernel that was just measured.
                     try:
                         from utils.pathmemory import broadcast_credit
-                        broadcast_credit(graph)
+                        broadcast_credit(tree)
                     except Exception as _exc:
                         print(f"[pathway] credit broadcast skipped "
                               f"({type(_exc).__name__}: {_exc})", flush=True)
-                    _merged = len(graph.nodes[_ck].members) > 1
-                    print(f"[mcgs] Child state {_ck}: {_rel:+.2f}% ({_basis}) -> reward "
-                          f"{_r:.3f}, value {_child_value:.4f}, N={graph.nodes[_ck].N}"
-                          f"{'  [TRANSPOSITION: merged into an existing state]' if _merged else ''}",
-                          flush=True)
-                    _bn = graph.best()
+                    print(f"[mcts] Child node {_ck} (depth {_child.depth}): {_rel:+.2f}% "
+                          f"({_basis}) -> reward {_r:.3f}, value {_child_value:.4f}, "
+                          f"N={_child.N}", flush=True)
+                    _bn = tree.best()
                     if _bn is not None:
-                        print(f"[mcgs] Best state so far: {_bn.key} at {_bn.rep_value:.4f} "
-                              f"via {_bn.rep} (N={_bn.N}, Q={_bn.q(args.mcgs_lam):.3f})",
+                        print(f"[mcts] Best node so far: {_bn.key} at {_bn.value:.4f} "
+                              f"via {_bn.kernel} (N={_bn.N}, Q={_bn.q(args.mcts_lam):.3f})",
                               flush=True)
 
-            # The ratchet's base MUTATION is MCGS's job now -- base_kernel is set at
-            # selection time from the chosen state, and re-deciding it here would
-            # overwrite that choice one round later and collapse the graph back to a
+            # The ratchet's base MUTATION is MCTS's job now -- base_kernel is set at
+            # selection time from the chosen node, and re-deciding it here would
+            # overwrite that choice one round later and collapse the tree back to a
             # hill-climber. But `should_update_base` is deliberately left intact:
             # it is the accept EVIDENCE (paired, margin-and-significance gated) and
             # the best_kernel gate below reads it. Zeroing it would leave best
             # promoted only by the blocked-score branch, i.e. exactly the
             # drift-driven path that shipped a non-reproducing number before.
-            _mcgs_base_frozen = bool(_use_mcgs and _mcgs_sel is not None)
+            _mcts_base_frozen = bool(_use_mcts and _mcts_sel is not None)
 
-            if should_update_base and not _mcgs_base_frozen:
+            if should_update_base and not _mcts_base_frozen:
                 if base_score == float("-inf"):
                     print(f"[base] Setting initial base_kernel: {this_score:.4f}", flush=True)
                 else:
@@ -3398,10 +3361,10 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     f.write(base_kernel.code)
             elif (args.structural_grace > 0 and structural_debt is None
                   and _structural_declared and base_score > 0 and this_score > 0
-                  and not _mcgs_base_frozen):
-                # Inert under MCGS by design. structural_debt is a one-slot,
+                  and not _mcts_base_frozen):
+                # Inert under MCTS by design. structural_debt is a one-slot,
                 # N-round-grace hand-rolled version of "keep a worse node around
-                # because it may lead somewhere" -- which is what the graph does
+                # because it may lead somewhere" -- which is what the tree does
                 # natively for every node, without a grace clock or a restore.
                 # Declared structural rewrite, rejected by the ratchet. Adopt it
                 # anyway and remember what it displaced: a rewrite is slower
@@ -3428,12 +3391,12 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             elif base_score not in (float("-inf"), 0):
                 delta = (this_score / base_score - 1.0) * 100.0 if base_score > 0 else float("nan")
                 _how = _paired_note or f"stored-score {delta:+.2f}%"
-                if _mcgs_base_frozen:
-                    # Not "kept" -- the graph will re-pick next round, possibly this
+                if _mcts_base_frozen:
+                    # Not "kept" -- the tree will re-pick next round, possibly this
                     # very candidate. Saying "keeping base_kernel" here would read as
-                    # a rejection and the state was in fact recorded and is selectable.
-                    print(f"[base] MCGS holds selection ({this_score:.4f}: {_how}); the "
-                          f"candidate is a graph state and may be branched from later",
+                    # a rejection and the node was in fact recorded and is selectable.
+                    print(f"[base] MCTS holds selection ({this_score:.4f}: {_how}); the "
+                          f"candidate is a tree node and may be branched from later",
                           flush=True)
                 else:
                     print(f"[base] Keeping base_kernel {base_score:.4f} ({this_score:.4f}: "
@@ -3669,8 +3632,37 @@ def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_spe
 
 
 # --------------------------- main ----------------------
+def _normalise_retired_search_flags(args) -> None:
+    """Accept the graph-era spellings, then say plainly what happened to them.
+
+    The value flags (--mcgs_c_puct and friends) are argparse aliases of their
+    --mcts_ counterparts, so they land on the right dest with no work here. Two
+    flags have no counterpart because the concept is gone: node identity is
+    minted per kernel now, so there is no abstraction to key on (--mcgs_state_key)
+    and no merge for a value guard to refuse (--mcgs_merge_tol). They are accepted
+    and ignored rather than removed, so a saved command line or a --resume script
+    still starts -- but ignoring a flag in silence is how a run ends up not being
+    the run someone thought they launched, so each one is named on stderr.
+    """
+    if getattr(args, "search", None) == "mcgs":
+        args.search = "mcts"
+        print("[mcts] NOTE: --search mcgs is the retired graph spelling; running "
+              "--search mcts. The graph's transposition merging never fired in "
+              "production, so the tree is what it always was. See utils/mcts.py.",
+              flush=True)
+    for flag, why in (("mcgs_state_key",
+                       "node identity is minted per kernel; there is no state "
+                       "abstraction left to key on"),
+                      ("mcgs_merge_tol",
+                       "nothing merges, so there is no merge for a tolerance to "
+                       "refuse")):
+        if getattr(args, flag, None) is not None:
+            print(f"[mcts] NOTE: --{flag} is retired and IGNORED -- {why}.", flush=True)
+
+
 def main():
     args = _build_arg_parser().parse_args()
+    _normalise_retired_search_flags(args)
     _install_stop_handler()
 
     # ---- Preflight: the GPU clock is pinned before anything is measured ----
@@ -3771,8 +3763,8 @@ def main():
     if not args.no_viewer and os.environ.get("KERNELMEM_VIEWER", "1").strip().lower() \
             not in ("0", "off", "false", "no"):
         try:
-            from utils.mcgs_serve import serve_background
-            _viewer = serve_background(batch_dir, lam=args.mcgs_lam,
+            from utils.mcts_serve import serve_background
+            _viewer = serve_background(batch_dir, lam=args.mcts_lam,
                                        port=args.viewer_port,
                                        open_browser=args.viewer_open)
         except Exception as exc:

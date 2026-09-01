@@ -1,8 +1,8 @@
-"""A quick path for the MCGS rollout: no ncu, no judge, everything else intact.
+"""A quick path for the MCTS rollout: no ncu, no judge, everything else intact.
 
 What this is for
 ----------------
-The normal pathway (``main_memory_latest.py --search mcgs``) costs 9.5 min per
+The normal pathway (``main_memory_latest.py --search mcts``) costs 9.5 min per
 round, measured as the median over 122 clean consecutive rounds:
 
     ncu profile of the base kernel .... 1.1 min  (12 subprocess launches:
@@ -15,8 +15,8 @@ round, measured as the median over 122 clean consecutive rounds:
     optimization LLM (THE ROLLOUT) ... 2.6 min  (claude-sonnet-5, effort=high)
     build + bench + paired verdict .... 2.7 min  (cold nvcc alone is 30.5 s)
 
-Only the rollout grows the graph. The other ~6.6 min is overhead the search does
-not consume: MCGS needs a parent, a candidate, and a paired gain between them.
+Only the rollout grows the tree. The other ~6.6 min is overhead the search does
+not consume: MCTS needs a parent, a candidate, and a paired gain between them.
 Dropping ncu and the judge leaves ~5.3 min per rollout -- ~11 rollouts/hour
 against ~6 -- and the search gets 1.8x more edges per wall-clock hour.
 
@@ -24,8 +24,8 @@ What is deliberately KEPT, and why
 ----------------------------------
 `_paired_base_verdict`. Between-process CV on this machine is 0.3-1.4% on score,
 and one unchanged kernel drifted +1.06% in 30 minutes -- twice the accept margin.
-An unverified single-shot score therefore enters the graph as a fake gain, and
-the graph is a ledger of gains: a fake +1.4% at depth 2 is multiplied into every
+An unverified single-shot score therefore enters the tree as a fake gain, and
+the tree is a ledger of gains: a fake +1.4% at depth 2 is multiplied into every
 descendant's chained value forever. The verdict is the one part of the 2.7-min
 bench block that cannot be cut without making the numbers this path produces
 incomparable with the numbers a normal run produces -- which is the entire point
@@ -34,8 +34,8 @@ of the merge below.
 What replaces the judge
 -----------------------
 The judge's only product that reaches the rollout is ``strategy_json``, and its
-only load-bearing field is ``method_name``: under ``--mcgs_state_key mechanisms``
-it becomes the state key, ``node.via``, ``path_mechanisms`` and the PUCT prior.
+only load-bearing field is ``method_name``: it becomes ``node.via``, and through
+that ``path_mechanisms`` and the PUCT prior's repeat damping.
 Here the SEARCH picks the mechanism before the rollout -- a prior-weighted draw
 over mechanisms not already spent on this path -- and the same string goes into
 both the prompt and ``observe(mechanism=...)``. That makes the mechanism a
@@ -43,7 +43,7 @@ decision of the search rather than a report from a profile, which is where
 `MechanismPrior.hint`'s own docstring says the prior has more leverage than it
 can reach from selection alone.
 
-The rest of the strategy dict is built from measured graph evidence
+The rest of the strategy dict is built from measured tree evidence
 (``prior.hint`` advantages with n=, ``siblings_context`` outcomes,
 ``path_mechanisms``). ``bottleneck`` says plainly that no profile was taken. No
 metric number is ever fabricated: the optimization template tells the model those
@@ -51,7 +51,7 @@ fields carry evidence, so inventing one is worse than admitting there is none.
 
 State, and concurrency
 ----------------------
-This owns its own run directory and its own ``graph.json``. It NEVER writes a
+This owns its own run directory and its own ``tree.json``. It NEVER writes a
 normal run's ``checkpoint.json`` during the rollout loop -- folding results back
 is a separate, explicit ``merge`` invocation with its own preconditions. That is
 what makes it safe to run beside a live normal run, provided both processes have
@@ -60,9 +60,9 @@ file refuses to start without it, but it cannot retrofit it onto a normal run
 that was launched without it).
 
 Run:
-    python -m utils.mcgs_quick run --from_run run/<batch>/<task> --rounds 20
-    python -m utils.mcgs_quick run --resume run/quick_20260814_101500_vae_block_002
-    python -m utils.mcgs_quick merge --quick_run <quick dir> --host <task_root>
+    python -m utils.mcts_quick run --from_run run/<batch>/<task> --rounds 20
+    python -m utils.mcts_quick run --resume run/quick_20260814_101500_vae_block_002
+    python -m utils.mcts_quick merge --quick_run <quick dir> --host <task_root>
 """
 from __future__ import annotations
 
@@ -100,18 +100,22 @@ if str(_REPO) not in sys.path:
 os.environ.setdefault("SOLBENCH_SRC",
                       str(_REPO / "third_party" / "SOL-ExecBench" / "src"))
 
-# utils.mcgs pulls in only json/math/hashlib/re/dataclasses. Everything heavier --
+# utils.mcts pulls in only json/math/hashlib/re/dataclasses. Everything heavier --
 # main_memory_latest, and through it torch and matplotlib -- is imported lazily
 # inside cmd_run. Module scope here is re-executed as __mp_main__ in EVERY spawned
 # bench child and EVERY spawned paired-verdict child, i.e. twice per rollout, so
 # anything expensive at module scope is paid twice per rollout for nothing.
-from utils.mcgs import (MechanismPrior, MonteCarloGraphSearch,  # noqa: E402
-                        Selection, _norm_code, reward_from_gain, state_key)
+from utils.mcts import (MechanismPrior, MonteCarloTreeSearch,  # noqa: E402
+                        Selection, _norm_code, reward_from_gain)
 
 _QUICK_VERSION = 1
-_GRAPH_NAME = "graph.json"
+_TREE_NAME = "tree.json"
+# The graph era's filename for the same file. Read, never written: a quick run
+# made before the refactor still resumes and still merges, and the first
+# _write_tree of a resumed run moves it to _TREE_NAME.
+_TREE_NAME_LEGACY = "graph.json"
 _JOURNAL_NAME = "journal.jsonl"
-_LEDGER_NAME = "mcgs_quick_merged.json"    # lives beside the HOST checkpoint.json
+_LEDGER_NAME = "mcts_quick_merged.json"    # lives beside the HOST checkpoint.json
 _CHECKPOINT_NAME = "checkpoint.json"
 
 # Set by the SIGINT/SIGTERM handler, read only at the top of the rollout loop.
@@ -121,17 +125,17 @@ _CHECKPOINT_NAME = "checkpoint.json"
 _STOP: Dict[str, bool] = {"requested": False}
 
 # Mechanisms the model has actually produced on this task, as a floor under
-# --mcgs_prior. Measured 2026-08-14 with
+# --mcts_prior. Measured 2026-08-14 with
 #   scripts.build_mechanism_prior.collect(Path("run"), "vae_block_002", 30)
 # -> 108 parent->child edges naming a method, 47 distinct method_name strings, of
 # which exactly these 17 reached n>=3; the other 30 include 27 that appear exactly
 # once, i.e. names the model invented and never reused.
 #
 # This list exists because a None mechanism is NOT a neutral default. With
-# mechanisms=[] the key is "x:" + sha1("m-empty:" + kernel_name) (utils/mcgs.py
+# mechanisms=[] the key is "x:" + sha1("m-empty:" + kernel_name) (utils/mcts.py
 # :172-176), so every child gets a unique key: no transposition ever merges, every
 # node stays at N=1, path_mechanisms returns [] forever, PUCT degenerates to plain
-# UCT, and the graph quietly becomes a list. The measured cost of that bucket when
+# UCT, and the tree quietly becomes a list. The measured cost of that bucket when
 # it was shared instead was 37 kernels spanning a 457% speedup range.
 _FALLBACK_MECHANISMS: Tuple[str, ...] = (
     "CUDA_Graph_Capture_Replay_StaticBuffers", "l2_cache_blocking",
@@ -164,7 +168,7 @@ def _load_host_helpers():
     (a) spawn re-executes THIS file in every bench and verdict child, and
     main_memory_latest drags in torch, matplotlib and the whole prompt package --
     twice per rollout, for a child that only needs `_bench_worker_entry`; and
-    (b) utils/test_mcgs_quick.py has to run with no GPU and no torch, and it
+    (b) utils/test_mcts_quick.py has to run with no GPU and no torch, and it
     asserts `"main_memory_latest" not in sys.modules` right after importing this
     module. That assertion is the tripwire for anyone who later hoists this to
     the top of the file.
@@ -195,9 +199,9 @@ def _register(registry: Dict[str, Any], ind: Optional[Any]) -> None:
 
 def _resolve(registry: Dict[str, Any], name: Optional[str], path: Optional[str],
              *, kernel_cls) -> Optional[Any]:
-    """A graph state's representative as a live KernelIndividual.
+    """A tree node's kernel as a live KernelIndividual.
 
-    The graph stores kernel NAMES (it has to be JSON-serialisable), and the
+    The tree stores kernel NAMES (it has to be JSON-serialisable), and the
     prompt needs `.code`/`.code_path`, so names resolve through the registry and
     fall back to reading the file when a resume has no live object.
     """
@@ -218,11 +222,11 @@ def _resolve(registry: Dict[str, Any], name: Optional[str], path: Optional[str],
 # ===========================================================================
 # mechanism selection -- the judge's job, done by the search
 # ===========================================================================
-def _mechanism_candidates(graph: MonteCarloGraphSearch) -> List[str]:
+def _mechanism_candidates(tree: MonteCarloTreeSearch) -> List[str]:
     """Every mechanism name the search may propose, most-informed first.
 
     The union of three sources, because none alone is sufficient: the prior's
-    table is empty until --mcgs_prior points at a fitted file; the graph's own
+    table is empty until --mcts_prior points at a fitted file; the tree's own
     `via` labels do not exist until a few rollouts have landed; and the measured
     fallback list is the floor that guarantees the returned name is never empty.
 
@@ -240,19 +244,19 @@ def _mechanism_candidates(graph: MonteCarloGraphSearch) -> List[str]:
             seen.add(m)
             out.append(m)
 
-    if graph.prior is not None and graph.prior.table:
+    if tree.prior is not None and tree.prior.table:
         # Ranked, so the highest-advantage names come first; only matters for
         # `argmax` ties and for how the list reads in the log.
-        for m, _adv, _n in graph.prior.ranked(10_000):
+        for m, _adv, _n in tree.prior.ranked(10_000):
             _add(m)
-    for node in graph.nodes.values():
+    for node in tree.nodes.values():
         _add(node.via)
     for m in _FALLBACK_MECHANISMS:
         _add(m)
     return out
 
 
-def _choose_mechanism(graph: MonteCarloGraphSearch, sel: Selection,
+def _choose_mechanism(tree: MonteCarloTreeSearch, sel: Selection,
                       rng: random.Random, policy: str,
                       candidates: Optional[Sequence[str]] = None) -> str:
     """Pick the mechanism this rollout will be asked for, and keyed by.
@@ -260,29 +264,29 @@ def _choose_mechanism(graph: MonteCarloGraphSearch, sel: Selection,
     Two dampings, not one. `MechanismPrior.weights` damps mechanisms already on
     the PATH (root->parent), which stops the prior recommending the same edit all
     the way down a branch. It says nothing about mechanisms already tried FROM
-    this state and rejected -- and that is the failure `siblings_context` exists
+    this node and rejected -- and that is the failure `siblings_context` exists
     to warn the model about, which means it is an observed failure mode and the
-    prompt-side warning alone did not stop it. So the state's own `tried` list
+    prompt-side warning alone did not stop it. So the node's own `tried` list
     damps by the same repeat_penalty (default 0.25) before the draw.
 
     `sample` rather than `argmax` by default: argmax hands every child of a node
     the same mechanism, so progressive widening spends its k-th child slot
     re-asking for the edit that was just refused.
     """
-    cands = list(candidates) if candidates else _mechanism_candidates(graph)
+    cands = list(candidates) if candidates else _mechanism_candidates(tree)
     if not cands:
         # Unreachable while _FALLBACK_MECHANISMS is non-empty, and asserted rather
         # than tolerated because the failure it guards against is silent.
         raise RuntimeError("no mechanism candidates; the key space would collapse "
                            "into the x:m-empty bucket")
 
-    applied = graph.path_mechanisms(sel.path)
-    if graph.prior is not None and graph.prior.table:
-        w = list(graph.prior.weights(cands, already_applied=applied))
+    applied = tree.path_mechanisms(sel.path)
+    if tree.prior is not None and tree.prior.table:
+        w = list(tree.prior.weights(cands, already_applied=applied))
     else:
         w = [1.0 / len(cands)] * len(cands)
 
-    penalty = float(graph.prior.repeat_penalty) if graph.prior is not None else 0.25
+    penalty = float(tree.prior.repeat_penalty) if tree.prior is not None else 0.25
     tried = {str(t.get("mechanism")).strip()
              for t in sel.node.tried if t.get("mechanism")}
     if tried and penalty >= 0.0:
@@ -295,9 +299,9 @@ def _choose_mechanism(graph: MonteCarloGraphSearch, sel: Selection,
     return rng.choices(cands, weights=w, k=1)[0]
 
 
-def _build_strategy(graph: MonteCarloGraphSearch, sel: Selection,
+def _build_strategy(tree: MonteCarloTreeSearch, sel: Selection,
                     mech: str) -> Dict[str, str]:
-    """The judge substitute: a strategy dict built from measured graph evidence.
+    """The judge substitute: a strategy dict built from measured tree evidence.
 
     Only keys `_format_problem` reads are emitted. Three the judge emits are
     dropped on purpose:
@@ -306,20 +310,20 @@ def _build_strategy(graph: MonteCarloGraphSearch, sel: Selection,
         claim, not evidence.
       * structural_rewrite -- _format_problem drops it anyway, and the only
         consumer (main_memory_latest.py:2770-2777, the --structural_grace
-        ratchet) is inert under MCGS because :3177 requires not _mcgs_base_frozen.
+        ratchet) is inert under MCTS because the base gate requires not _mcts_base_frozen.
       * the spaced legacy aliases "optimisation method" / "modification plan" --
         pure back-compat, and emitting both spellings duplicates the field in the
         rendered JSON the model reads.
     """
-    applied = graph.path_mechanisms(sel.path)
-    siblings = graph.siblings_context(sel.node, limit=8)
-    hint = (graph.prior.hint(already_applied=applied)
-            if graph.prior is not None else "(no mechanism prior loaded)")
+    applied = tree.path_mechanisms(sel.path)
+    siblings = tree.siblings_context(sel.node, limit=8)
+    hint = (tree.prior.hint(already_applied=applied)
+            if tree.prior is not None else "(no mechanism prior loaded)")
 
     plan = [f"1. Implement {mech} in this kernel. It is the primary optimisation "
             f"method for this round and every other change must serve it."]
     plan.append("2. Do NOT re-propose anything in this list -- it has already been "
-                "tried from exactly this kernel state, with these outcomes:\n"
+                "tried from exactly this kernel, with these outcomes:\n"
                 + _indent(siblings))
     if applied:
         plan.append("3. These mechanisms are already carried by this kernel and must "
@@ -342,18 +346,18 @@ def _build_strategy(graph: MonteCarloGraphSearch, sel: Selection,
     evidence = "\n".join([
         hint,
         "",
-        "Already tried from this exact kernel state (measured, paired where marked):",
+        "Already tried from this exact kernel (measured, paired where marked):",
         _indent(siblings),
         "",
-        (f"Parent state {sel.node.key} at N={sel.node.N}, "
-         f"Q={sel.node.q(graph.lam):.4f}, chained value {sel.node.rep_value:.4f}. "
+        (f"Parent node {sel.node.key} at N={sel.node.N}, "
+         f"Q={sel.node.q(tree.lam):.4f}, chained value {sel.node.value:.4f}. "
          f"The search selected it because: {sel.reason}"),
     ])
 
     return {
         # method_name is load-bearing far beyond the prompt: it becomes
-        # observe(mechanism=) -> node.via -> path_mechanisms -> the state key and
-        # the PUCT prior. The prompt and the graph MUST see the same string, which
+        # observe(mechanism=) -> node.via -> path_mechanisms -> the PUCT prior and
+        # the PUCT prior. The prompt and the tree MUST see the same string, which
         # is why it is chosen before the rollout instead of parsed back out of the
         # reply (a parse failure here would have no judge to blame and would
         # silently key the child into the x:m-empty bucket).
@@ -361,7 +365,7 @@ def _build_strategy(graph: MonteCarloGraphSearch, sel: Selection,
         "primary_optimisation_method": (
             f"Apply {mech} to this kernel. This mechanism was selected by the search "
             f"from the measured mechanism prior and from what has already been tried "
-            f"from this state -- not from a profile of this kernel."),
+            f"from this node -- not from a profile of this kernel."),
         "modification_plan": "\n".join(plan),
         "evidence": evidence,
         # No ncu profile was taken, so there is no measured bottleneck. Saying so
@@ -386,66 +390,56 @@ def _indent(text: str, prefix: str = "   ") -> str:
 
 
 # ===========================================================================
-# graph plumbing shared by the live loop, resume replay and merge
+# tree plumbing shared by the live loop, resume replay and merge
 # ===========================================================================
-def _bfs_path(graph: MonteCarloGraphSearch, root: Optional[str],
-              target: str) -> Optional[List[str]]:
-    """Shortest root->target route over `children`, or None if unreachable.
+def _host_path(tree: MonteCarloTreeSearch, target: str) -> Optional[List[str]]:
+    """Root-to-*target* route, or None if *target* is not in the tree.
 
-    Recomputed rather than trusting the journal's recorded `sel_path`, because a
-    merge target may have acquired a shorter route to the same state since the
-    fork. Depth in this class is "shortest route known when the node was last
-    observed" (utils/mcgs.py:535 takes a min and never re-deepens descendants),
-    so the recorded path can be strictly longer than the live one.
+    Was a BFS over `children`, because on a DAG a node could be reached by
+    several routes and the shortest had to be found; `depth` there was "shortest
+    route known when the node was last observed" and a recorded `sel_path` could
+    be strictly longer than the live one. On a tree there is exactly one route
+    and `MonteCarloTreeSearch.path_to` walks it up the parents in O(depth).
+
+    `_reaches` went with it: it existed only to refuse a merge edge that would
+    close a cycle, and `observe` cannot create an edge into an existing node.
     """
-    if not root or root not in graph.nodes or target not in graph.nodes:
-        return None
-    if target == root:
-        return [root]
-    seen = {root}
-    q = deque([[root]])
-    while q:
-        path = q.popleft()
-        for k in graph.nodes[path[-1]].children:
-            if k in seen or k not in graph.nodes:
-                continue
-            if k == target:
-                return path + [k]
-            seen.add(k)
-            q.append(path + [k])
-    return None
+    return tree.path_to(target)
 
 
-def _reaches(graph: MonteCarloGraphSearch, src: str, dst: str) -> bool:
-    """Is *dst* reachable from *src* by following `children`?"""
-    if src not in graph.nodes:
-        return False
-    seen = {src}
-    q = deque([src])
-    while q:
-        cur = q.popleft()
-        if cur == dst:
-            return True
-        for k in graph.nodes[cur].children:
-            if k not in seen and k in graph.nodes:
-                seen.add(k)
-                q.append(k)
-    return False
+def _apply_record(tree: MonteCarloTreeSearch, rec: Dict[str, Any],
+                  applied_obs: set, rep_sha: Dict[str, str],
+                  id_map: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], str]:
+    """Fold one journal record into *tree*. Returns (landed_key or None, reason).
 
+    *id_map* translates the record's LOCAL node ids into *tree*'s ids, and is the
+    difference between folding a journal into the tree that produced it and
+    folding it into a different tree.
 
-def _apply_record(graph: MonteCarloGraphSearch, rec: Dict[str, Any],
-                  applied_obs: set, rep_sha: Dict[str, str]) -> Tuple[Optional[str], str]:
-    """Fold one journal record into *graph*. Returns (landed_key or None, reason).
+    Pass None when the record's ids ARE this tree's ids -- the live loop and the
+    --resume replay, which both apply into the very tree the ids were minted in.
+
+    Pass a map for merge, where they are not. Node ids are minted per tree
+    (`MonteCarloTreeSearch._mint`), so `n0002` in a quick run and `n0002` in the
+    host it forked from are the same node ONLY for nodes that existed at the
+    fork; after that both trees mint from the same counter independently and the
+    id means different kernels in each. The graph era had no such problem because
+    a key was a content hash of the path's mechanism multiset and was therefore
+    portable, which is why nothing translated. Looking a local id up directly in
+    the host silently grafts a whole quick-run subtree onto an unrelated kernel:
+    the id exists, so `parent-not-in-target` cannot fire, the chained value is
+    computed off the wrong parent, and the reward is backed up the wrong lineage.
+    An id the map does not carry is REFUSED rather than guessed at.
 
     ONE function for three callers -- the live loop, --resume replay, and merge --
     on purpose. Three copies of this would be three chances for the replay to
-    reconstruct a graph the live loop did not build, and the crash-recovery test
+    reconstruct a tree the live loop did not build, and the crash-recovery test
     would then be testing the copy rather than the thing that runs.
 
     Idempotent by content address: `obs_id` hashes
     (parent_key, mechanism, code_sha, rel_pct), so replaying a journal twice is a
     no-op. That is not a nicety. `backup` has no observation identity
-    (utils/mcgs.py:550-559), so a double-apply doubles N and W together, which
+    (utils/mcts.py:550-559), so a double-apply doubles N and W together, which
     leaves q() unchanged and therefore LOOKS harmless -- while
     ceil(widen_k * N**alpha) takes a node from N=4 (budget 2) to N=8 (budget 3)
     and hands it a child it never paid for.
@@ -465,22 +459,33 @@ def _apply_record(graph: MonteCarloGraphSearch, rec: Dict[str, Any],
         applied_obs.add(obs_id)
         return (None, "no-kernel-produced")
 
-    if graph.state_key_mode != "mechanisms":
-        # Guarded rather than assumed: under `features` the child key would need
-        # the code-feature vector, and under `code` it would need the source --
-        # neither is in the journal, so both would silently fall through to the
-        # "x:" fallback and key every child by its file stem.
-        return (None, "unsupported-state-key-mode")
-
-    parent_key = rec.get("parent_key")
-    parent = graph.nodes.get(parent_key) if parent_key else None
+    parent_local = rec.get("parent_key")
+    if id_map is None:
+        parent_key = parent_local
+    else:
+        # An unmapped local id is a parent this journal produced whose own record
+        # did not land here (refused, or from a fork this map does not describe).
+        # Its children have no parent in the target either.
+        parent_key = id_map.get(parent_local) if parent_local else None
+        if parent_local and parent_key is None:
+            return (None, "parent-not-in-target")
+    parent = tree.nodes.get(parent_key) if parent_key else None
     if parent is None:
         # NEVER call observe() with a parent_key absent from nodes. Verified: it
-        # creates a depth-0 node with empty `parents`, does not promote it to
-        # root, and leaves it permanently invisible to select() (which descends
-        # `children` from the root only) while best() and stats() still count it.
-        # The run then announces a best state it can never branch from.
+        # creates a depth-0 node with no parent, does not promote it to root, and
+        # leaves it permanently invisible to select() (which descends `children`
+        # from the root only) while best() and stats() still count it. The run
+        # then announces a best node it can never branch from.
         return (None, "parent-not-in-target")
+
+    # Belt and braces on top of the map: the journal records the parent's KERNEL
+    # NAME as well as its id, so the graft can be checked against something that
+    # is not an id at all. Written since the quick path existed and never read
+    # until now. A mismatch means the map is wrong, and a wrong map is exactly
+    # the silent corruption this function must not commit -- refuse, do not fold.
+    _parent_rep = rec.get("parent_rep")
+    if _parent_rep and parent.kernel and str(_parent_rep) != str(parent.kernel):
+        return (None, "parent-identity-mismatch")
 
     runnable = bool(rec.get("runnable"))
     if not runnable and not bool(rec.get("count_failures")):
@@ -493,65 +498,46 @@ def _apply_record(graph: MonteCarloGraphSearch, rec: Dict[str, Any],
         applied_obs.add(obs_id)
         return (None, "failed-rollout-not-counted")
 
-    host_path = _bfs_path(graph, graph.root, parent_key)
+    host_path = _host_path(tree, parent_key)
     if host_path is None:
         return (None, "parent-unreachable-from-root")
 
+    # Three refusals stood here and are all gone with the state key. The child
+    # key was recomputed in HOST space from the path's mechanism multiset, which
+    # could (a) fall through to an "x:" file-stem hash and collide with an
+    # unrelated kernel that happened to be saved in the same wall-clock second,
+    # (b) land on a node the merge tolerance then rehomed under a split key, or
+    # (c) close a cycle when the host already held the reverse edge. A node id is
+    # minted per observation now: it cannot collide, cannot be rehomed, and
+    # cannot point at an existing node, so there is nothing to refuse.
     mech = rec.get("mechanism") or None
-    mechs = graph.path_mechanisms(host_path) + ([mech] if mech else [])
-    child_key = state_key(mode="mechanisms", mechanisms=mechs, fallback=kernel_name)
-
-    if child_key.startswith("x:") and child_key in graph.nodes:
-        # "x:" keys hash the kernel's FILE STEM, not its content
-        # (utils/mcgs.py:176,181), and save_kernel_code names by wall-clock second
-        # -- so two runs can produce the same stem for unrelated code and collide
-        # by construction. Refused unless the recorded rep source matches.
-        known = rep_sha.get(child_key)
-        if known is None:
-            print(f"[quick] NOTE: x-fallback key {child_key} already exists but its "
-                  f"representative's source hash is not recorded; accepting the merge "
-                  f"unverified.", flush=True)
-        elif known != rec.get("code_sha"):
-            return (None, "x-fallback-collision")
-
-    if child_key in graph.nodes and _reaches(graph, child_key, parent_key):
-        # select() is `while True` with no visited set (utils/mcgs.py:582-623): a
-        # 2-cycle makes it HANG, not raise. Only self-edges are blocked upstream
-        # (:526). Within one run under `mechanisms` keying a cycle cannot form --
-        # the multiset strictly grows along a path -- but a merge can create one
-        # trivially when the host already holds the reverse edge.
-        return (None, "would-close-a-cycle")
 
     rel = rec.get("rel_pct")
     rel = 0.0 if rel is None else float(rel)
-    child_value = float(parent.rep_value) * (1.0 + rel / 100.0)
+    child_value = float(parent.value) * (1.0 + rel / 100.0)
 
-    node = graph.observe(
-        key=child_key, kernel_name=kernel_name,
+    node = tree.observe(
+        kernel_name=kernel_name,
         kernel_path=rec.get("kernel_path"), value=child_value,
         parent_key=parent_key, runnable=runnable, mechanism=mech,
         note=f"{rec.get('origin', 'quick')} r{rec.get('rollout_idx')}, "
              f"{rel:+.2f}% {rec.get('basis', '?')}")
 
-    # observe()'s RETURN value, never the key that was passed in. When the
-    # merge-tolerance guard fires the kernel lands under key + "/s" + sha1(name)[:6]
-    # (utils/mcgs.py:504-511), and main_memory_latest.py:3139-3142 reuses `_ck`
-    # there -- which makes backup() skip the child silently (it gets no visit at
-    # all) and then raises KeyError on graph.nodes[_ck]. utils/test_mcgs_replay.py
-    # :101-105 works around it by prefix-searching for "/s". Using the return value
-    # is the actual fix and needs no workaround.
+    # observe()'s RETURN value, never a key computed ahead of the call. The id is
+    # minted inside observe() and is not predictable from here.
     landed = node.key
 
-    reward = reward_from_gain(rel, scale=graph.reward_scale, failed=not runnable)
-    path = list(host_path)
-    if landed not in path:
-        path.append(landed)
+    reward = reward_from_gain(rel, scale=tree.reward_scale, failed=not runnable)
+    # Always fresh: observe() mints an id that is not in `nodes`, and every key on
+    # host_path is. The graph needed a membership test here because a merge could
+    # land the child ON the path, double-counting one evaluation.
+    path = list(host_path) + [landed]
     # Exactly one backup per record, so total_visits advances by one per rollout
-    # that actually landed -- never by the quick graph's total_visits, which counts
+    # that actually landed -- never by the quick tree's total_visits, which counts
     # rollouts a merge may have refused.
-    graph.backup(path, reward, failed=not runnable)
+    tree.backup(path, reward, failed=not runnable)
 
-    if node.rep == kernel_name and rec.get("code_sha"):
+    if rec.get("code_sha"):
         rep_sha[landed] = str(rec["code_sha"])
     applied_obs.add(obs_id)
     return (landed, "applied")
@@ -560,48 +546,69 @@ def _apply_record(graph: MonteCarloGraphSearch, rec: Dict[str, Any],
 # ===========================================================================
 # persistence
 # ===========================================================================
-def _write_graph(path: Path, graph: MonteCarloGraphSearch,
+def find_tree_path(quick_dir: Path) -> Optional[Path]:
+    """The quick run's tree file, under either its current or its graph-era name.
+
+    utils.mcts_view and utils.pathmemory both already fall back to graph.json, so
+    without this the refactor is internally inconsistent about whether a
+    pre-refactor quick run is readable: the viewer would render it while --resume
+    reported "no tree.json" and merge died on an uncaught FileNotFoundError.
+    """
+    for name in (_TREE_NAME, _TREE_NAME_LEGACY):
+        f = Path(quick_dir) / name
+        if f.exists():
+            return f
+    return None
+
+
+def _write_tree(path: Path, tree: MonteCarloTreeSearch,
                  meta: Dict[str, Any]) -> None:
-    """Atomically replace graph.json with the current state.
+    """Atomically replace tree.json with the current state.
 
     tmp + Path.replace, the same idiom as _save_checkpoint
     (main_memory_latest.py:1307-1310): a kill during the write leaves the previous
-    graph.json intact rather than a truncated one.
+    tree.json intact rather than a truncated one.
 
-    The graph blob is nested under "mcgs" and is byte-identical in SHAPE to
-    checkpoint["mcgs"], so merge can feed it straight to
-    MonteCarloGraphSearch.from_dict with nothing translating. Everything
+    The tree blob is nested under "mcts" and is byte-identical in SHAPE to
+    checkpoint["mcts"], so merge can feed it straight to
+    MonteCarloTreeSearch.from_dict with nothing translating. Everything
     quick-path-specific is a SIBLING of that key, never inside it, because
-    to_dict() rebuilds its dict from scratch (utils/mcgs.py:683-702) and destroys
-    any extra key stuffed into it.
+    to_dict() rebuilds its dict from scratch and destroys any extra key stuffed
+    into it.
     """
     blob = dict(meta)
     blob["updated"] = datetime.now().isoformat(timespec="seconds")
-    blob["mcgs"] = graph.to_dict()
+    # Stamp the current kind rather than copying a graph-era one forward: the
+    # payload written below IS the current schema, so a blob that still called
+    # itself "mcgs_quick_graph" would be describing a file that no longer exists.
+    blob["kind"] = "mcts_quick_tree"
+    blob["mcts"] = tree.to_dict()
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text(json.dumps(blob, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
 
-def _read_graph(path: Path) -> Tuple[MonteCarloGraphSearch, Dict[str, Any], set]:
+def _read_tree(path: Path) -> Tuple[MonteCarloTreeSearch, Dict[str, Any], set]:
     blob = json.loads(Path(path).read_text(encoding="utf-8"))
-    if blob.get("kind") != "mcgs_quick_graph":
-        raise ValueError(f"{path} is not a quick-path graph "
+    if blob.get("kind") not in ("mcts_quick_tree", "mcgs_quick_graph"):
+        raise ValueError(f"{path} is not a quick-path tree "
                          f"(kind={blob.get('kind')!r})")
     if int(blob.get("quick_version") or 0) != _QUICK_VERSION:
         raise ValueError(f"{path} was written by quick_version "
                          f"{blob.get('quick_version')}, this build is {_QUICK_VERSION}")
-    graph = MonteCarloGraphSearch.from_dict(blob.get("mcgs"))
-    meta = {k: v for k, v in blob.items() if k != "mcgs"}
+    # "mcgs" is the graph-era nesting; from_dict flattens that schema, so a
+    # quick run started before the tree existed still resumes.
+    tree = MonteCarloTreeSearch.from_dict(blob.get("mcts") or blob.get("mcgs"))
+    meta = {k: v for k, v in blob.items() if k not in ("mcts", "mcgs")}
     applied = set(meta.get("applied_obs") or [])
-    return graph, meta, applied
+    return tree, meta, applied
 
 
 def _append_journal(path: Path, rec: Dict[str, Any]) -> None:
-    """Append one record and fsync it BEFORE the graph is written.
+    """Append one record and fsync it BEFORE the tree is written.
 
     Order matters and is the reverse of the intuitive one. A crash between the
-    journal write and the graph write leaves a record the graph lacks, which
+    journal write and the tree write leaves a record the tree lacks, which
     --resume replays idempotently (_apply_record is content-addressed). A crash
     the other way round loses the observation with no trace that it happened, and
     the 5.3 minutes it cost are unrecoverable.
@@ -634,7 +641,7 @@ def _read_journal(path: Path) -> List[Dict[str, Any]]:
 # ===========================================================================
 # the rollout
 # ===========================================================================
-def _one_rollout(graph: MonteCarloGraphSearch, *, rollout_idx: int,
+def _one_rollout(tree: MonteCarloTreeSearch, *, rollout_idx: int,
                  rng: random.Random, policy: str, gpu_name: Optional[str],
                  registry: Dict[str, Any], dirs: Dict[str, Path],
                  count_failures: bool, stamp: Dict[str, Any],
@@ -648,80 +655,71 @@ def _one_rollout(graph: MonteCarloGraphSearch, *, rollout_idx: int,
     """One select -> prompt -> generate -> bench -> paired-verify cycle.
 
     Mutates NOTHING persistent: it writes artifacts (prompt, reply, strategy,
-    metrics) and returns a journal record. The graph is read here and written only
+    metrics) and returns a journal record. The tree is read here and written only
     by _apply_record, one level up, after the record has been fsync'd. That split
     is what makes the crash-recovery replay meaningful -- if this function could
-    also mutate the graph there would be a window in which the two disagreed with
+    also mutate the tree there would be a window in which the two disagreed with
     nothing on disk to reconcile them from.
 
-    Every side-effecting dependency is injected so utils/test_mcgs_quick.py can
+    Every side-effecting dependency is injected so utils/test_mcts_quick.py can
     drive the whole cycle with no GPU, no LLM and no subprocess.
     """
     now = now or datetime.now
     ts = now().isoformat(timespec="seconds")
 
-    sel = graph.select()
+    sel = tree.select()
     if sel is None:
         # select() returns None iff the root is missing or not in nodes
-        # (utils/mcgs.py:578-579). There is no other None path, so this is not a
-        # skippable round -- it means the graph has no anchor and every later
+        # (utils/mcts.py:578-579). There is no other None path, so this is not a
+        # skippable round -- it means the tree has no anchor and every later
         # rollout would fail identically.
-        raise RuntimeError("graph.select() returned None: the root is missing. "
+        raise RuntimeError("tree.select() returned None: the root is missing. "
                            "Every rollout from here would fail the same way.")
 
-    parent = resolve_fn(sel.node.rep, sel.node.rep_path)
+    parent = resolve_fn(sel.node.kernel, sel.node.kernel_path)
     if parent is None:
         # The representative's file is gone (hand-cleaned run dir, or a resume
         # against moved artifacts). main_memory_latest.py:2164-2172 prints and
         # falls back to the incumbent, which produces no observe and no backup;
         # here there is no incumbent to fall back to, so the round produces
         # nothing at all -- which is the same outcome, stated honestly.
-        print(f"[quick] WARNING: could not resolve the code for state {sel.node.key} "
-              f"(rep {sel.node.rep} at {sel.node.rep_path}); this rollout produces "
+        print(f"[quick] WARNING: could not resolve the code for node {sel.node.key} "
+              f"(rep {sel.node.kernel} at {sel.node.kernel_path}); this rollout produces "
               f"nothing. Check that the quick run's code/ directory is intact.",
               flush=True)
         return None
 
     parent_key = sel.node.key
-    parent_value = float(sel.node.rep_value)
-    g = graph.stats()
-    print(f"[quick] Rollout {rollout_idx}: branching from state {parent_key} "
+    parent_value = float(sel.node.value)
+    g = tree.stats()
+    print(f"[quick] Rollout {rollout_idx}: branching from node {parent_key} "
           f"(depth {sel.node.depth}, N={sel.node.N}, "
-          f"Q={sel.node.q(graph.lam):.3f}, value {parent_value:.4f}) "
-          f"via {sel.node.rep}", flush=True)
+          f"Q={sel.node.q(tree.lam):.3f}, value {parent_value:.4f}) "
+          f"via {sel.node.kernel}", flush=True)
     print(f"[quick]   why: {sel.reason}", flush=True)
-    print(f"[quick]   graph: {g['states']} states / {g['kernels']} kernels, "
-          f"{g['merged_states']} merged, mean N={g['mean_N']:.2f}, depth seen "
+    print(f"[quick]   tree: {g['nodes']} nodes ({g['leaves']} leaves), "
+          f"mean N={g['mean_N']:.2f}, depth seen "
           f"{g['max_depth_seen']}", flush=True)
 
-    mech = _choose_mechanism(graph, sel, rng, policy)
-    strategy = _build_strategy(graph, sel, mech)
+    mech = _choose_mechanism(tree, sel, rng, policy)
+    strategy = _build_strategy(tree, sel, mech)
     io_dir = dirs["io"]
     io_dir.mkdir(parents=True, exist_ok=True)
     (io_dir / f"{rollout_idx:03d}_strategy.json").write_text(
         json.dumps(strategy, indent=2, ensure_ascii=False), encoding="utf-8")
-    if graph.prior is not None and graph.prior.table:
-        prior_txt = (f"prior advantage {graph.prior.advantage(mech):+.2f}%, "
-                     f"n={graph.prior.support(mech)}")
+    if tree.prior is not None and tree.prior.table:
+        prior_txt = (f"prior advantage {tree.prior.advantage(mech):+.2f}%, "
+                     f"n={tree.prior.support(mech)}")
     else:
         prior_txt = "no prior loaded, so the draw is uniform over the candidates"
     print(f"[quick]   mechanism: {mech} (policy={policy}; {prior_txt})", flush=True)
 
-    # The LOCAL child key, computed before the rollout from a read-only view of
-    # the graph. Recorded so merge can track which subtree a refused record would
-    # have produced; merge never USES it as a key, it recomputes in host space.
-    child_key_local = state_key(
-        mode="mechanisms",
-        mechanisms=graph.path_mechanisms(sel.path) + [mech],
-        fallback="pending")
-
     rec: Dict[str, Any] = {
         "ts": ts, "rollout_idx": rollout_idx, "origin": "quick",
-        "parent_key": parent_key, "parent_rep": sel.node.rep,
+        "parent_key": parent_key, "parent_rep": sel.node.kernel,
         "parent_rep_value": parent_value,
         "sel_path": list(sel.path), "sel_reason": sel.reason,
         "mechanism": mech, "strategy": strategy,
-        "child_key_local": child_key_local,
         "count_failures": bool(count_failures),
         "kernel_name": None, "kernel_path": None, "code_sha": None,
         "runnable": False, "score": None, "rel_pct": None, "basis": "unmeasurable",
@@ -830,8 +828,8 @@ def _install_stop_handler() -> None:
     A local copy of main_memory_latest.py:1173-1204, writing into this module's
     _STOP dict. The signal almost always lands inside the 2.6-min model call or
     the 2.7-min bench, so the flag is only CHECKED at the top of the loop: the
-    in-flight rollout finishes, its journal record is fsync'd and its graph write
-    lands, and the run exits with graph.json current as of the last completed
+    in-flight rollout finishes, its journal record is fsync'd and its tree write
+    lands, and the run exits with tree.json current as of the last completed
     rollout. Signalling twice restores the default handler so a wedged run can
     still be killed outright -- at the cost of that rollout.
     """
@@ -841,7 +839,7 @@ def _install_stop_handler() -> None:
         if _STOP["requested"]:
             run_timing.event("abort_signal", detail=f"signum={signum} rollout_abandoned")
             print("\n[stop] Second signal - aborting immediately. The in-flight "
-                  "rollout is lost; graph.json is current as of the last completed "
+                  "rollout is lost; tree.json is current as of the last completed "
                   "one.", flush=True)
             signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
@@ -866,7 +864,7 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
 
     The suppressed parse is how "did the user pass this explicitly" is answered
     without maintaining a second list of defaults. It matters in exactly one
-    place and it matters a lot: when forking a live mcgs blob, an --mcgs_* flag
+    place and it matters a lot: when forking a live search blob, an --mcts_* flag
     that disagrees with the blob is a hard error, and telling "the user asked for
     0.9" apart from "the default is 0.8" cannot be done by comparing values.
 
@@ -875,16 +873,16 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
     argparse's parser-level argument_default is only consulted for arguments that
     declare no `default=` of their own, and every argument here declares one. The
     first version of this did pass argument_default and silently reported every
-    flag as explicitly passed, which would have made --mcgs_* fork checking fire
+    flag as explicitly passed, which would have made --mcts_* fork checking fire
     on defaults the user never typed.
     """
     p = argparse.ArgumentParser(
-        "mcgs_quick",
-        description="MCGS rollouts without ncu and without the judge LLM.")
+        "mcts_quick",
+        description="MCTS rollouts without ncu and without the judge LLM.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # ------------------------------------------------------------------ run
-    r = sub.add_parser("run", help="Run quick rollouts into a private graph.")
+    r = sub.add_parser("run", help="Run quick rollouts into a private tree.")
     entry = r.add_mutually_exclusive_group(required=True)
     entry.add_argument(
         "--from_run", type=Path, default=None,
@@ -892,8 +890,8 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
              "checkpoint.json) or the batch directory above it. Read once, "
              "read-only, and never written to -- the fork records the "
              "checkpoint's sha1 so `merge` can tell how far the host has moved "
-             "since. If that checkpoint carries an `mcgs` blob the quick graph IS "
-             "that graph, so keys, depths, the value-chain anchor and the prior "
+             "since. If that checkpoint carries a search blob the quick tree IS "
+             "that tree, so keys, depths, the value-chain anchor and the prior "
              "all match by construction and merge has nothing to translate. If it "
              "does not (measured 2026-08-14: NONE of the 8 checkpoint.json files "
              "under run/ carry one), a fresh root is seeded from its best kernel "
@@ -904,13 +902,13 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
              "Use when there is no run to fork -- e.g. starting a quick search "
              "from a hand-written or hand-picked kernel. The seed bench is a full "
              "_bench_and_score, so an unrunnable kernel is refused at startup "
-             "rather than after the first rollout: a root the graph cannot branch "
-             "from is not a graph.")
+             "rather than after the first rollout: a root the tree cannot branch "
+             "from is not a tree.")
     entry.add_argument(
         "--resume", type=Path, default=None,
         help="Continue an existing quick run directory. Replays any journal "
-             "record the graph is missing (the crash window between the journal "
-             "fsync and the graph write) and carries on at rollouts_done. "
+             "record the tree is missing (the crash window between the journal "
+             "fsync and the tree write) and carries on at rollouts_done. "
              "Idempotent: replaying records already folded in changes nothing, "
              "because each is addressed by a sha1 of "
              "(parent_key, mechanism, code_sha, rel_pct).")
@@ -934,7 +932,7 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
         help="Root for the quick run directory, created as "
              "<work_dir>/quick_<timestamp>_<task stem>/. Deliberately NOT inside a "
              "normal run's tree: the host may clean or rewrite its own code/ "
-             "directory, and the graph's rep_path entries are read from disk at "
+             "directory, and the tree's rep_path entries are read from disk at "
              "selection time.")
     r.add_argument(
         "--allow_unserialized", action="store_true",
@@ -989,8 +987,8 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
     r.add_argument("--tol", type=float, default=1e-2, help="Max |err| tolerated.")
     r.add_argument("--base_margin", type=float, default=0.05,
                    help="Relative margin fed to the paired verdict's beats_margin "
-                        "gate. Informational here -- MCGS never ratchets a base, "
-                        "graph.observe picks each state's representative by value "
+                        "gate. Informational here -- MCTS never ratchets a base, "
+                        "tree.observe picks each state's representative by value "
                         "-- but it is recorded on every edge.")
     r.add_argument("--base_reps", type=int, default=5,
                    help="Minimum interleaved rep pairs in the paired re-measure.")
@@ -998,10 +996,10 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
         "--base_max_reps", type=int, default=8,
         help="Maximum interleaved rep pairs; 0 DISABLES the paired re-measure. "
              "This is the one fidelity knob the quick path keeps, and turning it "
-             "off is the one change that makes the resulting graph unmergeable in "
+             "off is the one change that makes the resulting tree unmergeable in "
              "spirit: between-process CV on score is 0.3-1.4%% and one unchanged "
              "kernel drifted +1.06%% in 30 minutes, so an unverified single-shot "
-             "score enters the graph as a fake gain and is then multiplied into "
+             "score enters the tree as a fake gain and is then multiplied into "
              "every descendant's chained value forever.")
     r.add_argument("--base_sigma", type=float, default=3.0,
                    help="Significance target for the verdict's sigma_ok gate, "
@@ -1009,55 +1007,48 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
                         "as a z score -- at dof 2 a true 3-sigma tail needs "
                         "|t| >= 19.2).")
 
-    r.add_argument(
-        "--mcgs_state_key", default="mechanisms", choices=["mechanisms"],
-        help="Fixed to `mechanisms`, the repo default. `features` is refused "
-             "because its fallback reads round*_machine_check_result.json -- a "
-             "JUDGE artifact this path never produces -- so it would silently drop "
-             "to the x: file-stem hash on every rollout. `code` is refused because "
-             "the journal records gains, not sources, and merge could not "
-             "recompute a code key in host space. Merge additionally requires the "
-             "host's mode to match.")
-    r.add_argument("--mcgs_merge_tol", type=float, default=0.15,
-                   help="Refuse to pool a kernel into a state whose representative "
-                        "differs by more than this relative amount; it is split "
-                        "off instead. Set 0 to trust the key completely.")
-    r.add_argument("--mcgs_c_puct", type=float, default=0.8,
+    # Retired with the graph. Accepted and ignored so a saved command line still
+    # starts; there is no state abstraction to key on and nothing merges.
+    r.add_argument("--mcgs_state_key", "--mcts_state_key", default=None,
+                   help=argparse.SUPPRESS)
+    r.add_argument("--mcgs_merge_tol", "--mcts_merge_tol", type=float, default=None,
+                   help=argparse.SUPPRESS)
+    r.add_argument("--mcts_c_puct", "--mcgs_c_puct", type=float, default=0.8,
                    help="UCT exploration weight, used only when no prior is "
                         "loaded. Low because the budget is tens of evaluations.")
-    r.add_argument("--mcgs_lam", type=float, default=0.7,
+    r.add_argument("--mcts_lam", "--mcgs_lam", type=float, default=0.7,
                    help="Weight on the MAX term in Q = (1-lam)*mean + lam*max. "
                         "High because the measured gain distribution is bimodal: "
                         "42%% of edges regress past -1%%, 33%% win past +1%%, only "
                         "25%% land inside the +-1%% band.")
-    r.add_argument("--mcgs_widen_k", type=float, default=1.0,
+    r.add_argument("--mcts_widen_k", "--mcgs_widen_k", type=float, default=1.0,
                    help="Progressive widening: a state may have "
                         "ceil(k * N**alpha) children.")
-    r.add_argument("--mcgs_widen_alpha", type=float, default=0.5,
+    r.add_argument("--mcts_widen_alpha", "--mcgs_widen_alpha", type=float, default=0.5,
                    help="Widening exponent. At k=1, alpha=0.5 the budget is "
                         "N=1->1, 4->2, 9->3, 16->4.")
-    r.add_argument("--mcgs_max_depth", type=int, default=10,
+    r.add_argument("--mcts_max_depth", "--mcgs_max_depth", type=int, default=10,
                    help="Edits from the seed after which selection expands "
                         "sideways instead of deeper. Measured on vae_block_002: "
                         "win rate 41%% for rounds 0-4 and 5-9, then 0 wins in 22 "
                         "edges past round 10.")
-    r.add_argument("--mcgs_prior", default="",
+    r.add_argument("--mcts_prior", "--mcgs_prior", default="",
                    help="Path to a mechanism prior fitted by "
                         "scripts/build_mechanism_prior.py (e.g. "
                         "priors/vae_block_002.json). It does more here than in the "
                         "normal path: selection uses it for PUCT AS WELL AS the "
                         "per-rollout mechanism draw that replaces the judge. "
                         "Ignored with a warning when forking a checkpoint that "
-                        "already carries a graph -- that blob's prior is "
+                        "already carries a tree -- that blob's prior is "
                         "authoritative, because a resumed search must select with "
                         "the policy it started with.")
-    r.add_argument("--mcgs_c_prior", type=float, default=1.0,
-                   help="PUCT exploration weight, used only with --mcgs_prior: "
+    r.add_argument("--mcts_c_prior", "--mcgs_c_prior", type=float, default=1.0,
+                   help="PUCT exploration weight, used only with --mcts_prior: "
                         "U = Q + c_prior * P(a) * sqrt(N_parent) / (1 + N_child).")
-    r.add_argument("--mcgs_reward_scale", type=float, default=3.0,
+    r.add_argument("--mcts_reward_scale", "--mcgs_reward_scale", type=float, default=3.0,
                    help="Percent gain mapping to a near-saturated reward via "
                         "tanh(rel/scale). At 3.0: 0%% -> 0.50, +1%% -> 0.66, "
-                        "+3%% -> 0.88. (utils/mcgs.py:191's docstring says 0.58 "
+                        "+3%% -> 0.88. (utils/mcts.py:191's docstring says 0.58 "
                         "for +1%%; that is the value for +0.5%%.)")
 
     r.add_argument(
@@ -1086,7 +1077,7 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
              "site. Turning this ON is the behaviour the existing code plainly "
              "intended but never reaches; it is opt-in because it makes merged N "
              "and W incomparable with a host run's, and it is stamped into the "
-             "graph meta and into every journal record so a later reader can tell.")
+             "tree meta and into every journal record so a later reader can tell.")
 
     r.add_argument("--no_clock_lock", action="store_true",
                    help="Measure without pinning the GPU clock. The result is not "
@@ -1100,7 +1091,7 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
     m = sub.add_parser(
         "merge", help="Fold a quick run's observations into a host checkpoint.")
     m.add_argument("--quick_run", type=Path, required=True,
-                   help="The quick run directory (holds graph.json and "
+                   help="The quick run directory (holds tree.json and "
                         "journal.jsonl).")
     m.add_argument("--host", type=Path, required=True,
                    help="The host TASK ROOT holding checkpoint.json.")
@@ -1112,11 +1103,11 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
              "every round and would clobber a merge landing mid-round.")
     m.add_argument(
         "--adopt", action="store_true",
-        help="Permit merging into a host whose checkpoint has no `mcgs` blob, by "
-             "installing the quick graph wholesale. Needed for every run currently "
+        help="Permit merging into a host whose checkpoint has no search blob, by "
+             "installing the quick tree wholesale. Needed for every run currently "
              "on disk (measured 2026-08-14: 0 of 8 checkpoint.json files carry "
              "one). The host's base_kernel and best_kernel are NOT touched, and the "
-             "installed graph's rep_path entries point into the quick run "
+             "installed tree's rep_path entries point into the quick run "
              "directory -- which must not be moved or deleted, because _resolve "
              "reads them from disk at selection time.")
     m.add_argument(
@@ -1127,7 +1118,7 @@ def _build_parser(suppress: bool = False) -> argparse.ArgumentParser:
              "the mtime test (the /proc liveness scan still runs).")
     m.add_argument(
         "--force_reward_scale", action="store_true",
-        help="Proceed when the two graphs disagree on reward_scale, recomputing "
+        help="Proceed when the two trees disagree on reward_scale, recomputing "
              "every reward at the HOST's scale. Legitimate only because the merge "
              "recomputes reward from the journal's rel_pct and never copies a "
              "stored reward -- but it does change what the host's existing W and M "
@@ -1202,7 +1193,7 @@ def _load_prior(path_str: str) -> Optional[MechanismPrior]:
         return None
     pp = Path(path_str)
     if not pp.exists():
-        print(f"[quick] WARNING: --mcgs_prior {pp} does not exist; continuing with "
+        print(f"[quick] WARNING: --mcts_prior {pp} does not exist; continuing with "
               f"plain UCT and an unranked mechanism draw. Fit one with "
               f"scripts/build_mechanism_prior.py.", flush=True)
         return None
@@ -1224,53 +1215,51 @@ def _load_prior(path_str: str) -> Optional[MechanismPrior]:
     return prior
 
 
-def _graph_from_flags(a: argparse.Namespace) -> MonteCarloGraphSearch:
-    g = MonteCarloGraphSearch(
-        c_puct=a.mcgs_c_puct, lam=a.mcgs_lam, widen_k=a.mcgs_widen_k,
-        widen_alpha=a.mcgs_widen_alpha, max_depth=a.mcgs_max_depth,
-        reward_scale=a.mcgs_reward_scale, state_key_mode=a.mcgs_state_key,
-        merge_tolerance=a.mcgs_merge_tol, c_prior=a.mcgs_c_prior)
-    g.prior = _load_prior(a.mcgs_prior)
+def _graph_from_flags(a: argparse.Namespace) -> MonteCarloTreeSearch:
+    g = MonteCarloTreeSearch(
+        c_puct=a.mcts_c_puct, lam=a.mcts_lam, widen_k=a.mcts_widen_k,
+        widen_alpha=a.mcts_widen_alpha, max_depth=a.mcts_max_depth,
+        reward_scale=a.mcts_reward_scale, c_prior=a.mcts_c_prior)
+    g.prior = _load_prior(a.mcts_prior)
     return g
 
 
-_MCGS_FLAG_TO_ATTR = {
-    "mcgs_c_puct": "c_puct", "mcgs_lam": "lam", "mcgs_widen_k": "widen_k",
-    "mcgs_widen_alpha": "widen_alpha", "mcgs_max_depth": "max_depth",
-    "mcgs_reward_scale": "reward_scale", "mcgs_state_key": "state_key_mode",
-    "mcgs_merge_tol": "merge_tolerance", "mcgs_c_prior": "c_prior",
+_SEARCH_FLAG_TO_ATTR = {
+    "mcts_c_puct": "c_puct", "mcts_lam": "lam", "mcts_widen_k": "widen_k",
+    "mcts_widen_alpha": "widen_alpha", "mcts_max_depth": "max_depth",
+    "mcts_reward_scale": "reward_scale", "mcts_c_prior": "c_prior",
 }
 
 
-def _check_forked_params(graph: MonteCarloGraphSearch, a: argparse.Namespace,
+def _check_forked_params(tree: MonteCarloTreeSearch, a: argparse.Namespace,
                          explicit: set) -> None:
     """A search parameter passed on the CLI must agree with a forked blob.
 
     Hard error, naming both values, rather than silently picking one. Honouring
     the blob would ignore the operator; honouring the flag would change the search
-    policy of a graph mid-life, which is exactly what to_dict()'s prior-persistence
-    comment (utils/mcgs.py:697-700) exists to prevent -- a policy change halfway
+    policy of a tree mid-life, which is exactly what to_dict()'s prior-persistence
+    comment (utils/mcts.py:697-700) exists to prevent -- a policy change halfway
     through makes every earlier visit statistic mean something different from every
     later one, and nothing on disk records where the switch happened.
     """
     bad = []
-    for flag, attr in _MCGS_FLAG_TO_ATTR.items():
+    for flag, attr in _SEARCH_FLAG_TO_ATTR.items():
         if flag not in explicit:
             continue
         want = getattr(a, flag)
-        have = getattr(graph, attr)
+        have = getattr(tree, attr)
         if isinstance(have, float) and isinstance(want, (int, float)):
             same = abs(float(have) - float(want)) < 1e-12
         else:
             same = have == want
         if not same:
-            bad.append(f"--{flag} {want!r} but the forked graph has {attr}={have!r}")
+            bad.append(f"--{flag} {want!r} but the forked tree has {attr}={have!r}")
     if bad:
         raise SystemExit(
             "[quick] REFUSING to fork: the search parameters you passed disagree "
-            "with the graph you are forking.\n  " + "\n  ".join(bad) +
-            "\nDrop the flag to continue with the graph's policy, or fork with "
-            "--from_kernel to start a fresh graph under the new policy.")
+            "with the tree you are forking.\n  " + "\n  ".join(bad) +
+            "\nDrop the flag to continue with the tree's policy, or fork with "
+            "--from_kernel to start a fresh tree under the new policy.")
 
 
 # ===========================================================================
@@ -1279,6 +1268,22 @@ def _check_forked_params(graph: MonteCarloGraphSearch, a: argparse.Namespace,
 def cmd_run(a: argparse.Namespace, explicit: set) -> int:
     from utils import clock_lock, gpu_lock, run_timing
     from utils.torch_ext_cache import sweep_stale_batons, sweep_unheld_batons
+
+    # ---- gate 0: the retired flags ----------------------------------------
+    # Named on stderr rather than dropped in silence, matching
+    # main_memory_latest._normalise_retired_search_flags. Ignoring a flag quietly
+    # is how a run ends up not being the run someone thought they launched, and
+    # these two were load-bearing under the graph: one chose the state
+    # abstraction, the other bounded how wrong it was allowed to be.
+    for _flag, _why in (("mcgs_state_key",
+                         "node identity is minted per kernel; there is no state "
+                         "abstraction left to key on"),
+                        ("mcgs_merge_tol",
+                         "nothing merges, so there is no merge for a tolerance to "
+                         "refuse")):
+        if getattr(a, _flag, None) is not None:
+            print(f"[quick] NOTE: --{_flag} is retired and IGNORED -- {_why}.",
+                  flush=True)
 
     # ---- gate 1: the clock -------------------------------------------------
     # Copied from main_memory_latest.main():3481-3489 with what="quick". Every run
@@ -1300,7 +1305,7 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
 
     # ---- gate 2: GPU serialization ----------------------------------------
     # Refused, not warned, by analogy with the clock lock: an unserialized number
-    # entering the graph is worse than a run that did not start, because the graph
+    # entering the tree is worse than a run that did not start, because the tree
     # keeps it forever and multiplies it into every descendant.
     if not gpu_lock.enabled() and not a.allow_unserialized:
         print("[gpu] KERNELMEM_GPU_LOCK is unset, so gpu_section() is a no-op "
@@ -1313,8 +1318,9 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
     # ---- run directory -----------------------------------------------------
     if a.resume:
         quick_dir = Path(a.resume).resolve()
-        if not (quick_dir / _GRAPH_NAME).exists():
-            print(f"[quick] --resume {quick_dir} has no {_GRAPH_NAME}.", flush=True)
+        if find_tree_path(quick_dir) is None:
+            print(f"[quick] --resume {quick_dir} has no {_TREE_NAME} "
+                  f"(or {_TREE_NAME_LEGACY}).", flush=True)
             return 3
     else:
         # The directory name is chosen before the checkpoint is parsed, so with
@@ -1344,13 +1350,18 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
     io_dir = eval_dir / "llm_io"
     for d in (code_dir, eval_dir, io_dir):
         d.mkdir(parents=True, exist_ok=True)
-    graph_path, journal_path = quick_dir / _GRAPH_NAME, quick_dir / _JOURNAL_NAME
+    # Read from wherever it is, write back under the current name -- so a
+    # resumed graph-era run migrates its filename on its first rollout instead of
+    # keeping a name that no longer describes it.
+    _found = find_tree_path(quick_dir)
+    tree_path = _found if (_found is not None and a.resume) else quick_dir / _TREE_NAME
+    journal_path = quick_dir / _JOURNAL_NAME
     usage_csv = quick_dir / "usage.csv"
 
     # timing.csv lands inside the quick run, so it cannot collide with a
     # concurrent normal run's file even when both are writing every few minutes.
     run_timing.set_timing_log(quick_dir / "timing.csv")
-    run_timing.event("process_start", detail=f"mcgs_quick {run_id}")
+    run_timing.event("process_start", detail=f"mcts_quick {run_id}")
     _install_stop_handler()
     os.environ.setdefault("KERNELMEM_LINEAGE_LABEL", f"quick:{run_id}")
 
@@ -1369,27 +1380,27 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
     applied_obs: set = set()
 
     if a.resume:
-        graph, meta, applied_obs = _read_graph(graph_path)
+        tree, meta, applied_obs = _read_tree(tree_path)
         rep_sha = dict(meta.get("rep_sha") or {})
         task_path = Path(meta["task"])
         records = _read_journal(journal_path)
         replayed = 0
         for rec in records:
-            landed, why = _apply_record(graph, rec, applied_obs, rep_sha)
+            landed, why = _apply_record(tree, rec, applied_obs, rep_sha)
             if why not in ("duplicate",):
                 replayed += 1
                 meta.setdefault("outcomes", {})[rec.get("obs_id", "?")] = {
                     "landed_key_local": landed, "apply_reason": why}
         if replayed:
-            print(f"[quick] --resume replayed {replayed} journal record(s) the graph "
+            print(f"[quick] --resume replayed {replayed} journal record(s) the tree "
                   f"was missing -- this is the crash window between the journal "
-                  f"fsync and the graph write.", flush=True)
+                  f"fsync and the tree write.", flush=True)
         meta["rollouts_done"] = max(int(meta.get("rollouts_done") or 0), len(records))
         meta["applied_obs"] = sorted(applied_obs)
         meta["rep_sha"] = rep_sha
-        _write_graph(graph_path, graph, meta)
+        _write_tree(tree_path, tree, meta)
         # The stored run configuration wins on resume: re-deriving it from CLI
-        # defaults would silently change the bench parameters, and a graph whose
+        # defaults would silently change the bench parameters, and a tree whose
         # edges were measured at two different --repeat values is one chain over
         # two bases.
         bench_cfg, verdict_cfg = meta["bench"], meta["verdict"]
@@ -1407,28 +1418,28 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
               f"/{a.rounds}.", flush=True)
     else:
         try:
-            graph, meta, task_path = _seed(a, explicit, quick_dir, code_dir,
+            tree, meta, task_path = _seed(a, explicit, quick_dir, code_dir,
                                            eval_dir, mml, save_kernel_code,
                                            registry, rep_sha, applied_obs, run_id)
         except SystemExit:
             # Seeding refuses for several reasons that are the operator's fault
-            # (a conflicting --mcgs_* against a forked graph, a missing task, an
+            # (a conflicting --mcts_* against a forked tree, a missing task, an
             # unrunnable seed kernel), and every one of them leaves an empty
             # quick_<stamp>_<task> directory behind. Ten of those in run/ are ten
             # directories a later reader has to open to discover they are empty,
             # so remove ours if nothing MEANINGFUL was written into it. timing.csv
             # is deliberately not meaningful here: set_timing_log creates it at
             # startup, before seeding runs, so testing for "any file" never fires.
-            keep = ([graph_path, journal_path] + list(code_dir.glob("*"))
+            keep = ([tree_path, journal_path] + list(code_dir.glob("*"))
                     + list(eval_dir.glob("eval_*.json")))
             if not any(p.exists() for p in keep):
                 import shutil
                 shutil.rmtree(quick_dir, ignore_errors=True)
             raise
-        _write_graph(graph_path, graph, meta)
+        _write_tree(tree_path, tree, meta)
 
-    if graph.root is None or graph.root not in graph.nodes:
-        print("[quick] The graph has no root; nothing can be selected. Seed it with "
+    if tree.root is None or tree.root not in tree.nodes:
+        print("[quick] The tree has no root; nothing can be selected. Seed it with "
               "--from_kernel.", flush=True)
         return 3
 
@@ -1497,7 +1508,7 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
     for i in range(start, a.rounds):
         if _STOP["requested"]:
             print(f"[stop] Stopping before rollout {i}. Completed {i} of {a.rounds}. "
-                  f"Resume with: python -m utils.mcgs_quick run --resume {quick_dir}",
+                  f"Resume with: python -m utils.mcts_quick run --resume {quick_dir}",
                   flush=True)
             break
         run_timing.set_round(i)
@@ -1513,13 +1524,13 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
                                                                      what="quick"):
             print("[quick] Stopping: the clock has drifted off its lock, so further "
                   "rollouts would not be comparable with the ones already in the "
-                  "graph (and merge would refuse them). graph.json is current.",
+                  "tree (and merge would refuse them). tree.json is current.",
                   flush=True)
             break
 
         t0 = time.perf_counter()
         rec = _one_rollout(
-            graph, rollout_idx=i, rng=random.Random(seed_base ^ i),
+            tree, rollout_idx=i, rng=random.Random(seed_base ^ i),
             policy=a.mechanism_policy, gpu_name=a.gpu, registry=registry,
             dirs=dirs, count_failures=a.count_failures, stamp=stamp,
             resolve_fn=_resolve_fn, prompt_fn=_prompt_fn, rollout_fn=_rollout_fn,
@@ -1536,28 +1547,26 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
             llm_errors_in_a_row = 0
 
         _append_journal(journal_path, rec)
-        landed, why = _apply_record(graph, rec, applied_obs, rep_sha)
+        landed, why = _apply_record(tree, rec, applied_obs, rep_sha)
         meta.setdefault("outcomes", {})[rec["obs_id"]] = {
             "landed_key_local": landed, "apply_reason": why}
         meta["rollouts_done"] = i + 1
         meta["applied_obs"] = sorted(applied_obs)
         meta["rep_sha"] = rep_sha
-        _write_graph(graph_path, graph, meta)
+        _write_tree(tree_path, tree, meta)
 
         if landed is not None:
-            node = graph.nodes[landed]
-            merged = len(node.members) > 1
-            print(f"[quick] Child state {landed}: {rec['rel_pct']:+.2f}% "
-                  f"({rec['basis']}) -> value {node.rep_value:.4f}, N={node.N}"
-                  f"{'  [TRANSPOSITION: merged into an existing state]' if merged else ''}",
-                  flush=True)
-            best = graph.best()
+            node = tree.nodes[landed]
+            print(f"[quick] Child node {landed} (depth {node.depth}): "
+                  f"{rec['rel_pct']:+.2f}% ({rec['basis']}) -> value "
+                  f"{node.value:.4f}, N={node.N}", flush=True)
+            best = tree.best()
             if best is not None:
-                print(f"[quick] Best state so far: {best.key} at "
-                      f"{best.rep_value:.4f} via {best.rep} "
-                      f"(N={best.N}, Q={best.q(graph.lam):.3f})", flush=True)
+                print(f"[quick] Best node so far: {best.key} at "
+                      f"{best.value:.4f} via {best.kernel} "
+                      f"(N={best.N}, Q={best.q(tree.lam):.3f})", flush=True)
         else:
-            print(f"[quick] Rollout {i} did not enter the graph: {why}", flush=True)
+            print(f"[quick] Rollout {i} did not enter the tree: {why}", flush=True)
 
         if llm_errors_in_a_row >= 3:
             # Three in a row is not a bad prompt, it is a dead credential or a
@@ -1568,16 +1577,16 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
             run_timing.event("process_exit", detail="llm_errors")
             return 4
 
-    st = graph.stats()
-    print(f"\n[quick] Done. {meta['rollouts_done']} rollout(s). graph: "
+    st = tree.stats()
+    print(f"\n[quick] Done. {meta['rollouts_done']} rollout(s). tree: "
           f"{json.dumps(st)}", flush=True)
-    best = graph.best()
+    best = tree.best()
     if best is not None:
-        print(f"[quick] Best: {best.key} at {best.rep_value:.4f} via {best.rep} "
-              f"({best.rep_path})", flush=True)
-    print(f"[quick] Graph:   {graph_path}")
+        print(f"[quick] Best: {best.key} at {best.value:.4f} via {best.kernel} "
+              f"({best.kernel_path})", flush=True)
+    print(f"[quick] Graph:   {tree_path}")
     print(f"[quick] Journal: {journal_path}")
-    print(f"[quick] Merge with: python -m utils.mcgs_quick merge "
+    print(f"[quick] Merge with: python -m utils.mcts_quick merge "
           f"--quick_run {quick_dir} --host <task_root>")
     run_timing.event("process_exit", detail=f"rollouts={meta['rollouts_done']}")
     return 0
@@ -1585,8 +1594,8 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
 
 def _seed(a, explicit, quick_dir: Path, code_dir: Path, eval_dir: Path, mml,
           save_kernel_code, registry, rep_sha, applied_obs,
-          run_id: str) -> Tuple[MonteCarloGraphSearch, Dict[str, Any], Path]:
-    """Build the initial graph and meta for a fresh quick run."""
+          run_id: str) -> Tuple[MonteCarloTreeSearch, Dict[str, Any], Path]:
+    """Build the initial tree and meta for a fresh quick run."""
     from utils import clock_lock, gpu_lock
 
     fork_meta: Optional[Dict[str, Any]] = None
@@ -1608,39 +1617,36 @@ def _seed(a, explicit, quick_dir: Path, code_dir: Path, eval_dir: Path, mml,
             raise SystemExit(f"[quick] The task file {task_path} does not exist. "
                              f"Pass --task if it has moved.")
 
-        blob = ckpt.get("mcgs")
+        blob = ckpt.get("mcts") or ckpt.get("mcgs")
         if isinstance(blob, dict) and blob.get("nodes"):
-            graph = MonteCarloGraphSearch.from_dict(blob)
-            if not graph.root or graph.root not in graph.nodes:
+            tree = MonteCarloTreeSearch.from_dict(blob)
+            if not tree.root or tree.root not in tree.nodes:
                 raise SystemExit(
-                    f"[quick] {ckpt_path}'s graph has no usable root "
-                    f"({graph.root!r}); select() would return None forever.")
-            if graph.state_key_mode != "mechanisms":
-                raise SystemExit(
-                    f"[quick] {ckpt_path}'s graph keys states by "
-                    f"{graph.state_key_mode!r}; the quick path only supports "
-                    f"'mechanisms' (see --mcgs_state_key).")
-            _check_forked_params(graph, a, explicit)
-            if a.mcgs_prior:
-                print("[quick] NOTE: ignoring --mcgs_prior. The forked graph carries "
+                    f"[quick] {ckpt_path}'s tree has no usable root "
+                    f"({tree.root!r}); select() would return None forever.")
+            if tree.migration_note:
+                print(f"[quick] {tree.migration_note}", flush=True)
+            _check_forked_params(tree, a, explicit)
+            if a.mcts_prior:
+                print("[quick] NOTE: ignoring --mcts_prior. The forked tree carries "
                       "its own prior, and a resumed search must select with the "
-                      "policy it started with (utils/mcgs.py:697-700).", flush=True)
+                      "policy it started with (utils/mcts.py:697-700).", flush=True)
             fork_meta = {
                 "host_task_root": str(host_root),
                 "host_checkpoint_sha": host_ckpt_sha,
-                "fork_mcgs_sha": hashlib.sha1(
+                "fork_mcts_sha": hashlib.sha1(
                     json.dumps(blob, sort_keys=True).encode()).hexdigest(),
-                "forked_from_mcgs": True,
-                "fork_root": graph.root,
-                "fork_node_keys": sorted(graph.nodes),
+                "forked_from_mcts": True,
+                "fork_root": tree.root,
+                "fork_node_keys": sorted(tree.nodes),
             }
-            print(f"[quick] Forked {len(graph.nodes)} states / "
-                  f"{graph.total_visits} visits from {ckpt_path}.", flush=True)
+            print(f"[quick] Forked {len(tree.nodes)} states / "
+                  f"{tree.total_visits} visits from {ckpt_path}.", flush=True)
         else:
             # The measured common case: 0 of the 8 checkpoint.json files under
-            # run/ carry an mcgs blob, because every existing run predates
-            # --search mcgs or ran --search ratchet.
-            graph = _graph_from_flags(a)
+            # run/ carry a search blob, because every existing run predates
+            # --search mcts or ran --search ratchet.
+            tree = _graph_from_flags(a)
             which, entry = None, None
             for name in ("best", "base", "current"):
                 e = ckpt.get(name)
@@ -1658,27 +1664,28 @@ def _seed(a, explicit, quick_dir: Path, code_dir: Path, eval_dir: Path, mml,
             src = Path(entry["code_path"])
             dst = save_kernel_code(src.read_text(encoding="utf-8"), code_dir)
             seed_source = src
-            root_key = state_key(mode="mechanisms", mechanisms=[], fallback=dst.stem)
-            graph.observe(key=root_key, kernel_name=dst.stem, kernel_path=str(dst),
-                          value=float(entry["score"]), parent_key=None,
-                          runnable=True, note=f"seed from {host_root.name} {which}")
+            root = tree.observe(kernel_name=dst.stem, kernel_path=str(dst),
+                                value=float(entry["score"]), parent_key=None,
+                                runnable=True,
+                                note=f"seed from {host_root.name} {which}")
+            root_key = root.key
             rep_sha[root_key] = hashlib.sha1(
                 _norm_code(dst.read_text(encoding="utf-8")).encode()).hexdigest()
             fork_meta = {
                 "host_task_root": str(host_root),
                 "host_checkpoint_sha": host_ckpt_sha,
-                "fork_mcgs_sha": None,
-                "forked_from_mcgs": False,
+                "fork_mcts_sha": None,
+                "forked_from_mcts": False,
                 "fork_root": root_key,
                 "fork_node_keys": [root_key],
             }
             print(f"\n[quick] ============================================\n"
-                  f"[quick] {ckpt_path} carries NO mcgs graph, so this is a "
+                  f"[quick] {ckpt_path} carries NO search tree, so this is a "
                   f"BOOTSTRAP, not a fork: the root was seeded from its "
                   f"'{which}' kernel at {float(entry['score']):.4f}.\n"
                   f"[quick] The resulting keys are not in that host's key space by "
                   f"construction, so `merge` will refuse it unless you pass "
-                  f"--adopt and the host still has no graph of its own.\n"
+                  f"--adopt and the host still has no tree of its own.\n"
                   f"[quick] ============================================\n",
                   flush=True)
 
@@ -1704,21 +1711,21 @@ def _seed(a, explicit, quick_dir: Path, code_dir: Path, eval_dir: Path, mml,
             raise SystemExit(
                 f"[quick] The seed kernel is not runnable "
                 f"({m.get('error_type')}: {str(m.get('message'))[:400]}). A root "
-                f"the graph cannot branch from is not a graph.")
-        graph = _graph_from_flags(a)
+                f"the tree cannot branch from is not a tree.")
+        tree = _graph_from_flags(a)
         _register(registry, ind)
-        root_key = state_key(mode="mechanisms", mechanisms=[], fallback=dst.stem)
-        graph.observe(key=root_key, kernel_name=dst.stem, kernel_path=str(dst),
-                      value=float(ind.score), parent_key=None, runnable=True,
-                      note="seed (--from_kernel)")
+        root = tree.observe(kernel_name=dst.stem, kernel_path=str(dst),
+                            value=float(ind.score), parent_key=None, runnable=True,
+                            note="seed (--from_kernel)")
+        root_key = root.key
         rep_sha[root_key] = hashlib.sha1(
             _norm_code(ind.code or "").encode()).hexdigest()
-        print(f"[quick] Root state {root_key} <- {dst.stem} at {ind.score:.4f}",
+        print(f"[quick] Root node {root_key} <- {dst.stem} at {ind.score:.4f}",
               flush=True)
 
     meta = {
         "quick_version": _QUICK_VERSION,
-        "kind": "mcgs_quick_graph",
+        "kind": "mcts_quick_tree",
         "run_id": run_id,
         "created": datetime.now().isoformat(timespec="seconds"),
         "task": str(task_path),
@@ -1743,7 +1750,7 @@ def _seed(a, explicit, quick_dir: Path, code_dir: Path, eval_dir: Path, mml,
         "rep_sha": dict(rep_sha),
         "outcomes": {},
     }
-    return graph, meta, task_path
+    return tree, meta, task_path
 
 
 # ===========================================================================
@@ -1791,28 +1798,28 @@ def _code_sha_of(path: Optional[str]) -> Optional[str]:
     return hashlib.sha1(_norm_code(p.read_text(encoding="utf-8")).encode()).hexdigest()
 
 
-def _orphans(graph: MonteCarloGraphSearch) -> List[str]:
-    if not graph.root or graph.root not in graph.nodes:
-        return sorted(graph.nodes)
-    seen = {graph.root}
-    q = deque([graph.root])
+def _orphans(tree: MonteCarloTreeSearch) -> List[str]:
+    if not tree.root or tree.root not in tree.nodes:
+        return sorted(tree.nodes)
+    seen = {tree.root}
+    q = deque([tree.root])
     while q:
-        for k in graph.nodes[q.popleft()].children:
-            if k in graph.nodes and k not in seen:
+        for k in tree.nodes[q.popleft()].children:
+            if k in tree.nodes and k not in seen:
                 seen.add(k)
                 q.append(k)
-    return sorted(set(graph.nodes) - seen)
+    return sorted(set(tree.nodes) - seen)
 
 
 def merge(quick_run: Path, host: Path, *, in_place: bool = False,
           adopt: bool = False, host_idle_s: int = 900,
           force_reward_scale: bool = False, host_device: int = 0,
           dry_run: bool = False) -> Dict[str, Any]:
-    """Fold a quick run's observations into a host checkpoint's mcgs blob.
+    """Fold a quick run's observations into a host checkpoint's search blob.
 
     Fork-and-replay, never a dict-level union. Every invariant in
-    MonteCarloGraphSearch lives INSIDE observe()/backup() -- the merge-tolerance
-    split guard (utils/mcgs.py:504-511), root promotion (:518-519), the depth min
+    MonteCarloTreeSearch lives INSIDE observe()/backup() -- the merge-tolerance
+    split guard (utils/mcts.py:504-511), root promotion (:518-519), the depth min
     (:535), edge dedup (:527-531), `tried` accounting (:536-540) -- and a union
     bypasses all of them. Concretely: H.nodes.update(Q.nodes) replaces the host's
     better representative with the quick run's worse one, points rep_path into
@@ -1822,7 +1829,7 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
 
     So the merge replays gains, not values: for each record it recomputes the
     child key from the HOST's route to the parent, recomputes the value as
-    host_parent.rep_value * (1 + rel_pct/100), and recomputes the reward at the
+    host_parent.value * (1 + rel_pct/100), and recomputes the reward at the
     HOST's reward_scale.
 
     Returns {"ok", "reason", "report"}. Writes nothing when ok is False.
@@ -1836,13 +1843,25 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
         report["detail"] = detail
         return {"ok": False, "reason": reason, "report": report}
 
-    quick_blob = json.loads((quick_run / _GRAPH_NAME).read_text(encoding="utf-8"))
-    if quick_blob.get("kind") != "mcgs_quick_graph" or \
+    _qf = find_tree_path(quick_run)
+    if _qf is None:
+        return _no("R0-no-quick-tree",
+                   f"{quick_run} holds no {_TREE_NAME} (or {_TREE_NAME_LEGACY}); "
+                   f"there is nothing to merge")
+    quick_blob = json.loads(_qf.read_text(encoding="utf-8"))
+    # The same two kinds `_read_tree` accepts, so a quick run cannot be resumable
+    # and unmergeable at once. It could: --resume goes through _read_tree, which
+    # takes the graph-era kind, and _write_tree copies `kind` forward from meta
+    # unchanged -- so a graph-era run could be extended indefinitely while merge
+    # refused it forever, which is the only thing the quick path exists to do.
+    if quick_blob.get("kind") not in ("mcts_quick_tree", "mcgs_quick_graph") or \
             int(quick_blob.get("quick_version") or 0) != _QUICK_VERSION:
-        return _no("bad-quick-graph",
-                   f"{quick_run/_GRAPH_NAME} is not a v{_QUICK_VERSION} quick graph")
+        return _no("bad-quick-tree",
+                   f"{_qf} is not a v{_QUICK_VERSION} quick tree "
+                   f"(kind={quick_blob.get('kind')!r}, "
+                   f"quick_version={quick_blob.get('quick_version')!r})")
     records = _read_journal(quick_run / _JOURNAL_NAME)
-    Q = MonteCarloGraphSearch.from_dict(quick_blob.get("mcgs"))
+    Q = MonteCarloTreeSearch.from_dict(quick_blob.get("mcts") or quick_blob.get("mcgs"))
 
     ckpt_path = host / _CHECKPOINT_NAME
     host_ckpt = json.loads(ckpt_path.read_text(encoding="utf-8"))
@@ -1898,61 +1917,56 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
         if live:
             return _no("R9-host-live", live)
 
-    host_blob = host_ckpt.get("mcgs")
+    host_blob = host_ckpt.get("mcts") or host_ckpt.get("mcgs")
     adopting = not (isinstance(host_blob, dict) and host_blob.get("nodes"))
 
     # ---- R1 / R10: is this a legitimate fork of THIS host? -----------------
     fork = quick_blob.get("fork") or {}
     if adopting and not adopt:
-        return _no("R1-host-has-no-mcgs",
-                   f"{ckpt_path} carries no mcgs graph. Installing a foreign graph "
+        return _no("R1-host-has-no-tree",
+                   f"{ckpt_path} carries no search tree. Installing a foreign tree "
                    f"would make the host's next round select from states it never "
                    f"measured; pass --adopt if that is what you want.")
-    if not fork.get("forked_from_mcgs") and not adopt:
+    if not (fork.get("forked_from_mcts") or fork.get("forked_from_mcgs")) and not adopt:
         return _no("R10-not-a-fork",
-                   "the quick graph was bootstrapped from a kernel, not forked from "
-                   "this host's graph, so its keys are not in the host's key space "
+                   "the quick tree was bootstrapped from a kernel, not forked from "
+                   "this host's tree, so its keys are not in the host's key space "
                    "by construction")
 
     # ---- R5: the two roots must agree on the seed's measured value ---------
     qroot = Q.nodes.get(Q.root) if Q.root else None
     if qroot is None:
-        return _no("bad-quick-graph", "the quick graph has no root node")
+        return _no("bad-quick-tree", "the quick tree has no root node")
 
     if not adopting:
-        H = MonteCarloGraphSearch.from_dict(host_blob)
+        H = MonteCarloTreeSearch.from_dict(host_blob)
         hroot = H.nodes.get(H.root) if H.root else None
         if hroot is None:
-            return _no("R3-root-key", "the host graph has no root node")
-        if H.state_key_mode != Q.state_key_mode:
-            return _no("R2-state-key-mode",
-                       f"host keys states by {H.state_key_mode!r}, quick by "
-                       f"{Q.state_key_mode!r}; keys under different abstractions "
-                       f"are not comparable")
+            return _no("R3-root-key", "the host tree has no root node")
         if H.root != Q.root:
             return _no("R3-root-key",
                        f"host root {H.root!r} != quick root {Q.root!r}; a subtree "
                        f"hanging off a different root is unreachable by select() "
                        f"forever, yet best() and stats() still report it")
-        hsha, qsha = _code_sha_of(hroot.rep_path), _code_sha_of(qroot.rep_path)
+        hsha, qsha = _code_sha_of(hroot.kernel_path), _code_sha_of(qroot.kernel_path)
         if hsha is None:
             return _no("R4-root-source",
-                       f"the host root's kernel {hroot.rep_path} is gone, so the "
+                       f"the host root's kernel {hroot.kernel_path} is gone, so the "
                        f"two roots cannot be shown to be the same code -- and under "
                        f"`mechanisms` keying the root is an x: key hashing a FILE "
                        f"STEM, so equal keys prove nothing")
         if qsha is None:
             return _no("R4-root-source",
-                       f"the quick root's kernel {qroot.rep_path} is gone")
+                       f"the quick root's kernel {qroot.kernel_path} is gone")
         if hsha != qsha:
             return _no("R4-root-source",
                        f"the two roots share a key but not a source "
                        f"({hsha[:12]} vs {qsha[:12]})")
-        if hroot.rep_value > 0 and abs(qroot.rep_value / hroot.rep_value - 1.0) > 0.02:
+        if hroot.value > 0 and abs(qroot.value / hroot.value - 1.0) > 0.02:
             return _no("R5-root-value",
                        f"the roots' measured values disagree by "
-                       f"{abs(qroot.rep_value/hroot.rep_value - 1)*100:.2f}% "
-                       f"({hroot.rep_value:.4f} vs {qroot.rep_value:.4f}); "
+                       f"{abs(qroot.value/hroot.value - 1)*100:.2f}% "
+                       f"({hroot.value:.4f} vs {qroot.value:.4f}); "
                        f"between-process CV is 0.3-1.4%, so >2% means the two runs "
                        f"were not on one clock-lock basis")
         if abs(H.reward_scale - Q.reward_scale) > 1e-12 and not force_reward_scale:
@@ -1970,7 +1984,7 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
     else:
         # --adopt: preconditions R5/R7/R8/R9 already passed above; additionally the
         # quick root must be the same code as the host's best/base kernel, or the
-        # graph being installed describes a lineage the host never ran.
+        # tree being installed describes a lineage the host never ran.
         H = None
         host_seed = None
         for name in ("best", "base", "current"):
@@ -1982,7 +1996,7 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
             return _no("R4-root-source",
                        "the host checkpoint names no kernel to compare the quick "
                        "root against")
-        hsha, qsha = _code_sha_of(host_seed.get("code_path")), _code_sha_of(qroot.rep_path)
+        hsha, qsha = _code_sha_of(host_seed.get("code_path")), _code_sha_of(qroot.kernel_path)
         if hsha is None or qsha is None or hsha != qsha:
             return _no("R4-root-source",
                        f"the quick root's source does not match the host's "
@@ -2003,50 +2017,74 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
     orphan_before: List[str] = []
 
     if adopting:
-        merged_mcgs = quick_blob["mcgs"]
+        merged_mcts = quick_blob.get("mcts") or quick_blob["mcgs"]
         report.update(
             mode="adopt", records=len(records), applied=0, refusals={},
-            nodes_before=0, nodes_after=len(merged_mcgs.get("nodes") or {}),
-            visits_before=0, visits_after=int(merged_mcgs.get("total_visits") or 0),
+            nodes_before=0, nodes_after=len(merged_mcts.get("nodes") or {}),
+            visits_before=0, visits_after=int(merged_mcts.get("total_visits") or 0),
             depth_fixes=[], orphans=[])
-        print("[merge] --adopt: installing the quick graph wholesale. The host's "
+        print("[merge] --adopt: installing the quick tree wholesale. The host's "
               "base_kernel and best_kernel are NOT touched. Note the installed "
-              "graph's rep_path entries point into "
+              "tree's rep_path entries point into "
               f"{quick_run}/code -- that directory must not be moved or deleted, "
               "because _resolve reads them from disk at every selection.",
               flush=True)
     else:
         pre = json.loads(json.dumps(H.to_dict()))
         prior_before = json.dumps(H.prior.to_dict() if H.prior else None, sort_keys=True)
-        splits_before = H.splits
         orphan_before = _orphans(H)
         report["nodes_before"] = len(H.nodes)
         report["visits_before"] = H.total_visits
 
+        # LOCAL id -> HOST id. Identity for every node that existed at the fork
+        # (the quick tree was cloned from the host blob, so those ids denote the
+        # same node in both), and nothing else: after the fork both trees mint
+        # from the same counter independently, so a quick-minted `n0007` and a
+        # host-minted `n0007` are different kernels. Every id beyond the fork set
+        # has to be earned by its own record landing, below.
+        fork_keys = fork.get("fork_node_keys")
+        if not fork_keys:
+            return _no("R11-no-fork-keys",
+                       "the quick run's fork metadata carries no fork_node_keys, so "
+                       "its local node ids cannot be translated into host ids. "
+                       "Merging by raw id would graft records onto whatever node "
+                       "happens to hold the same minted id in the host.")
+        id_map: Dict[str, str] = {k: k for k in fork_keys if k in H.nodes}
+        report["fork_keys_mapped"] = len(id_map)
+
         for rec in records:
-            local_child = rec.get("child_key_local")
+            # The LOCAL id this record produced in the quick run's own tree. It is
+            # read from `outcomes` and never predicted: a node id is minted inside
+            # observe(), so the graph-era `child_key_local` -- a content key the
+            # rollout could compute in advance -- has no successor and is gone.
+            out = outcomes.get(rec.get("obs_id") or "", {})
+            local_child = out.get("landed_key_local")
             if rec.get("parent_key") in refused_local:
                 reasons["refused-subtree"] = reasons.get("refused-subtree", 0) + 1
                 if local_child:
                     refused_local.add(local_child)
                 continue
-            landed, why = _apply_record(H, rec, applied_ids, rep_sha)
+            landed, why = _apply_record(H, rec, applied_ids, rep_sha, id_map=id_map)
             reasons[why] = reasons.get(why, 0) + 1
             if why == "applied":
                 n_applied += 1
+                # The child is now addressable from a later record's parent_key.
+                # Without `landed_key_local` this link cannot be made, so the
+                # quick run's descendants of this node will be refused rather
+                # than grafted somewhere plausible -- which is the right way to
+                # be wrong.
+                if local_child:
+                    id_map[local_child] = landed
             elif why in ("parent-not-in-target", "parent-unreachable-from-root",
-                         "x-fallback-collision", "would-close-a-cycle",
-                         "unsupported-state-key-mode"):
+                         "parent-identity-mismatch"):
                 # This record produced nothing in the host, so anything the quick
-                # run hung off it has no parent here either. Track the LANDED local
-                # key when the quick run recorded one (observe may have split), and
-                # fall back to the pre-computed child key.
-                out = outcomes.get(rec.get("obs_id") or "", {})
-                refused_local.add(out.get("landed_key_local") or local_child)
+                # run hung off it has no parent here either.
+                if local_child:
+                    refused_local.add(local_child)
 
         # ---- post-pass -----------------------------------------------------
         # Depth is "shortest route known when this node was last observed", not an
-        # invariant: adding a shorter route lowers a node's depth (utils/mcgs.py
+        # invariant: adding a shorter route lowers a node's depth (utils/mcts.py
         # :535) but never re-deepens its descendants. A stale-large depth silently
         # costs usable search depth at select()'s `node.depth >= max_depth` bail.
         if H.root and H.root in H.nodes:
@@ -2072,15 +2110,12 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
             print(f"[merge] WARNING: the HOST already had {len(orphan_before)} node(s) "
                   f"unreachable from its root before this merge; they are left "
                   f"alone: {orphan_before[:5]}", flush=True)
-        if H.splits < splits_before:
-            return _no("post-splits",
-                       f"splits went backwards ({splits_before} -> {H.splits})")
         if json.dumps(H.prior.to_dict() if H.prior else None,
                       sort_keys=True) != prior_before:
             return _no("post-prior",
                        "the merge changed the host's prior; a resumed search must "
                        "select with the policy it started with")
-        # `tried` has no dedup in observe() (utils/mcgs.py:536-540) and
+        # `tried` has no dedup in observe() (utils/mcts.py:536-540) and
         # siblings_context shows only the last 8 entries -- the ONLY
         # anti-repetition signal reaching the prompt. A duplicated line fills that
         # window with the same warning eight times.
@@ -2096,9 +2131,9 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
                 seen_t.add(sig)
                 keep.append(t)
             node.tried = keep
-        merged_mcgs = H.to_dict()
-        json.dumps(merged_mcgs)  # round-trip guard: refuse to write what cannot load
-        MonteCarloGraphSearch.from_dict(json.loads(json.dumps(merged_mcgs)))
+        merged_mcts = H.to_dict()
+        json.dumps(merged_mcts)  # round-trip guard: refuse to write what cannot load
+        MonteCarloTreeSearch.from_dict(json.loads(json.dumps(merged_mcts)))
         report.update(mode="replay", records=len(records), applied=n_applied,
                       refusals=reasons, nodes_after=len(H.nodes),
                       visits_after=H.total_visits, depth_fixes=depth_fixes,
@@ -2123,7 +2158,8 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
         "ts": datetime.now().isoformat(timespec="seconds"),
         "quick_run": str(quick_run),
         "quick_run_id": quick_blob.get("run_id"),
-        "fork_mcgs_sha": (quick_blob.get("fork") or {}).get("fork_mcgs_sha"),
+        "fork_mcts_sha": ((quick_blob.get("fork") or {}).get("fork_mcts_sha")
+                          or (quick_blob.get("fork") or {}).get("fork_mcgs_sha")),
         "host_checkpoint_sha_before": hashlib.sha1(ckpt_path.read_bytes()).hexdigest(),
         "n_applied": report.get("applied", 0),
         "n_records": len(records),
@@ -2136,7 +2172,7 @@ def merge(quick_run: Path, host: Path, *, in_place: bool = False,
     tmp.replace(ledger_path)
 
     out = dict(host_ckpt)
-    out["mcgs"] = merged_mcgs      # nothing else in the checkpoint is touched
+    out["mcts"] = merged_mcts      # nothing else in the checkpoint is touched
     target = ckpt_path if in_place else ckpt_path.parent / (_CHECKPOINT_NAME + ".merged")
     tmp = target.parent / (target.name + ".tmp")
     tmp.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2168,7 +2204,7 @@ def cmd_merge(a: argparse.Namespace) -> int:
                   f"{rep['depth_fixes'][:8]}")
         if rep.get("tried_dedup"):
             print(f"[merge] deduped {rep['tried_dedup']} repeated `tried` entries")
-        print(f"[merge] graph: {json.dumps(rep.get('stats'))}")
+        print(f"[merge] tree: {json.dumps(rep.get('stats'))}")
     if res.get("dry_run"):
         print("[merge] --dry_run: nothing written.")
         return 0

@@ -10,8 +10,8 @@ Three runs on 002 died that way.
 The damage was never only the round. The exception also skipped `graph.backup`,
 so the selected node kept its visit count and an untouched Q. The search held no
 record that it had been expanded and produced nothing, and a --resume would
-reselect it and draw the same dead plan. mcgs.reward_from_gain already specifies
-the handling -- "a state that keeps emitting uncompilable code should fall out of
+reselect it and draw the same dead plan. mcts.reward_from_gain already specifies
+the handling -- "a node that keeps emitting uncompilable code should fall out of
 contention on its own rather than needing a separate rule" -- and returns 0.0 for
 exactly this case. The mechanism existed; nothing reached it.
 
@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.mcgs import MonteCarloGraphSearch, reward_from_gain  # noqa: E402
+from utils.mcts import MonteCarloTreeSearch, reward_from_gain  # noqa: E402
 
 LAM = 0.7
 
@@ -38,9 +38,9 @@ def _check(cond: bool, msg: str) -> None:
     assert cond, msg
 
 
-def _graph():
+def _tree():
     """Root plus two children: `good` slightly ahead, `bad` just behind."""
-    g = MonteCarloGraphSearch()
+    g = MonteCarloTreeSearch()
     g.observe(key="root", kernel_name="k0", kernel_path="k0.py", value=1.00)
     g.observe(key="good", kernel_name="k1", kernel_path="k1.py", value=1.20,
               parent_key="root", mechanism="A")
@@ -58,7 +58,7 @@ _check(reward_from_gain(None, failed=True) < reward_from_gain(0.0),
        "so producing nothing is worse than producing something that did not help")
 
 print("[guard] backing up a failure moves N, W and failures -- but NOT M")
-g = _graph()
+g = _tree()
 n = g.nodes["bad"]
 before = (n.N, n.W, n.M, n.q(LAM), n.failures)
 g.backup(["root", "bad"], reward_from_gain(None, failed=True), failed=True)
@@ -78,7 +78,7 @@ print(f"         (one failure costs {drop:.1f}% of Q at lam={LAM}; "
 _check(drop < 25.0, "a single failure is deliberately not decisive")
 
 print("[guard] repeated failures do decide it -- selection moves off the node")
-g = _graph()
+g = _tree()
 picked = []
 for _ in range(6):
     sel = g.select()
@@ -93,7 +93,7 @@ _check(picked[-1] != "bad" or picked.count("bad") < len(picked),
 print(f"         selection order: {picked}")
 
 print("[guard] a node that ONLY ever fails ends up behind one that works")
-g = _graph()
+g = _tree()
 for _ in range(4):
     g.backup(["root", "bad"], reward_from_gain(None, failed=True), failed=True)
     g.backup(["root", "good"], reward_from_gain(3.0))
@@ -102,7 +102,7 @@ _check(qb < qg, f"Q(bad)={qb:.4f} < Q(good)={qg:.4f}")
 _check(g.nodes["bad"].failures == 4, "and the failure count is on the record")
 
 print("[guard] the unguarded case: no backup at all leaves the node pristine")
-g = _graph()
+g = _tree()
 q_before = g.nodes["bad"].q(LAM)
 n_before = g.nodes["bad"].N
 # This is what happened when the exception propagated: nothing ran.

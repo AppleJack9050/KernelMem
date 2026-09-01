@@ -1,12 +1,12 @@
-"""Interactive browser view of the MCGS graph, live while a run builds it.
+"""Interactive browser view of the MCTS tree, live while a run builds it.
 
-    python -m utils.mcgs_serve run/<stamp>_<task>_<tag>
+    python -m utils.mcts_serve run/<stamp>_<task>_<tag>
     -> http://127.0.0.1:8747
 
-Same data source as ``utils.mcgs_view`` -- the graph a run has already written to
-disk -- but rendered as a pannable, zoomable, clickable DAG instead of an ASCII
-tree. Read-only: it never imports the loop and never writes to the run folder, so
-starting or killing it cannot affect a run in progress.
+Same data source as ``utils.mcts_view`` -- the tree a run has already written to
+disk -- but rendered as a pannable, zoomable, clickable tree instead of an ASCII
+outline. Read-only: it never imports the loop and never writes to the run folder,
+so starting or killing it cannot affect a run in progress.
 
 Binds 127.0.0.1 by default. The page serves the contents of a run directory, so
 it is not something to expose on a network without meaning to; ``--host`` exists
@@ -20,10 +20,12 @@ Design notes for the picture itself:
   dark step 600) so the palest node is still a visible mark rather than a hole in
   the surface. Q is printed on every node too: fill is the fast read, the number
   is the true one.
-* ``best``, ``dead`` and ``back-edge`` are **status**, not series, so each ships
-  an icon and a label and never leans on hue alone.
-* Layers are BFS depth from the root, matching where ``utils.mcgs_view`` expands
-  a node, so the two views agree about a transposition's home.
+* ``best`` and ``dead`` are **status**, not series, so each ships an icon and a
+  label and never leans on hue alone.
+* Layers are depth from the root. On a tree that is simply the node's depth, so
+  the two views cannot disagree about where a node belongs -- the graph-era
+  version needed a BFS to pick a home for a node with several parents, and drew
+  a dashed back-edge for the edges that closed a cycle. Neither can occur now.
 """
 from __future__ import annotations
 
@@ -37,40 +39,40 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from utils.mcgs_view import find_graph_file, load_graph
+from utils.mcts_view import find_tree_file, load_tree
 
 DEFAULT_PORT = 8747
 
 
-def graph_payload(root_path: Path, lam: float = 0.7) -> Dict[str, Any]:
-    """The graph as JSON for the page. Re-resolves the file every call.
+def tree_payload(root_path: Path, lam: float = 0.7) -> Dict[str, Any]:
+    """The tree as JSON for the page. Re-resolves the file every call.
 
     Re-resolving matters: a watcher is normally started before the run's first
     round boundary, so the file it must render does not exist yet when the page
     first loads.
     """
-    f = find_graph_file(root_path)
+    f = find_tree_file(root_path)
     if f is None:
-        return {"ok": False, "note": f"no checkpoint.json or graph.json under {root_path} yet",
+        return {"ok": False, "note": f"no checkpoint.json or tree.json under {root_path} yet",
                 "source": str(root_path)}
-    graph, note = load_graph(f)
-    if graph is None:
+    tree, note = load_tree(f)
+    if tree is None:
         return {"ok": False, "note": note, "source": str(f)}
-    best = graph.best()
+    best = tree.best()
     nodes = {}
-    for k, n in graph.nodes.items():
+    for k, n in tree.nodes.items():
         nodes[k] = {
             "key": k, "depth": n.depth, "N": n.N, "W": n.W, "M": n.M,
-            "q": n.q(lam), "value": n.rep_value, "rep": n.rep,
-            # The representative's source, so a state can be read as code and not
-            # only as statistics. Served through /api/code, which re-checks the
-            # path -- this field is a hint, never an authorisation.
-            "rep_path": n.rep_path,
-            "members": n.members, "parents": n.parents, "children": n.children,
+            "q": n.q(lam), "value": n.value, "kernel": n.kernel,
+            # The kernel's source, so a node can be read as code and not only as
+            # statistics. Served through /api/code, which re-checks the path --
+            # this field is a hint, never an authorisation.
+            "kernel_path": n.kernel_path,
+            "parent": n.parent, "children": n.children,
             "via": n.via, "failures": n.failures,
-            # `rep is None` is what makes a state unexpandable; `runnable` is
-            # ORed to True by observe() and cannot express it.
-            "dead": n.rep is None,
+            # No kernel is what makes a node unexpandable, and it is the test
+            # _selectable_children uses.
+            "dead": n.kernel is None or not n.runnable,
             "tried": n.tried[-12:],
         }
     try:
@@ -78,8 +80,8 @@ def graph_payload(root_path: Path, lam: float = 0.7) -> Dict[str, Any]:
     except OSError:
         mtime = 0.0
     return {
-        "ok": True, "note": "", "source": str(f), "mtime": mtime,
-        "root": graph.root, "stats": graph.stats(), "lam": lam,
+        "ok": True, "note": tree.migration_note, "source": str(f), "mtime": mtime,
+        "root": tree.root, "stats": tree.stats(), "lam": lam,
         "best": best.key if best is not None else None,
         "nodes": nodes,
     }
@@ -93,7 +95,7 @@ def read_code(root_path: Path, requested: str) -> Dict[str, Any]:
     """Source of a kernel file, if and only if it lives under the served root.
 
     The path arrives from the page, so it is attacker-controlled in exactly the
-    way a `../../etc/passwd` is: the node's `rep_path` is a hint about where to
+    way a `../../etc/passwd` is: the node's `kernel_path` is a hint about where to
     look, never permission to read it. Both sides are resolved before the
     containment test so symlinks and `..` cannot escape, and the suffix list
     keeps this to source files rather than a general file server.
@@ -125,7 +127,7 @@ def read_code(root_path: Path, requested: str) -> Dict[str, Any]:
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MCGS graph</title>
+<title>MCTS tree</title>
 <style>
 :root{
   color-scheme: light;
@@ -202,10 +204,10 @@ pre.code{margin:0 0 12px;padding:10px;background:var(--plane);border:1px solid v
 text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
 </style></head><body>
 <header>
-  <h1>MCGS graph</h1>
-  <div class="stat"><b id="s-states">–</b><span>states</span></div>
-  <div class="stat"><b id="s-kernels">–</b><span>kernels</span></div>
-  <div class="stat"><b id="s-merged">–</b><span>merged</span></div>
+  <h1>MCTS tree</h1>
+  <div class="stat"><b id="s-nodes">–</b><span>nodes</span></div>
+  <div class="stat"><b id="s-leaves">–</b><span>leaves</span></div>
+  <div class="stat"><b id="s-n1">–</b><span>at N≤1</span></div>
   <div class="stat"><b id="s-visits">–</b><span>visits</span></div>
   <div class="stat"><b id="s-depth">–</b><span>max depth</span></div>
   <div class="stat"><b id="s-best">–</b><span>best value</span></div>
@@ -216,16 +218,15 @@ text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
 </header>
 <main>
   <div id="wrap"><svg id="svg"><g id="scene"></g></svg><div id="empty" class="note"></div></div>
-  <aside id="side"><h2>No state selected</h2>
-    <p class="hint">Click a node to see its members, its statistics, and what has
+  <aside id="side"><h2>No node selected</h2>
+    <p class="hint">Click a node to see its kernel, its statistics, and what has
     already been tried from it. Drag to pan, scroll to zoom.</p></aside>
 </main>
 <div class="legend">
   <span>Q&nbsp;<span class="ramp"><s style="background:var(--seq-0)"></s><s style="background:var(--seq-1)"></s><s style="background:var(--seq-2)"></s><s style="background:var(--seq-3)"></s><s style="background:var(--seq-4)"></s></span>&nbsp;low → high</span>
-  <span><i style="color:var(--status-good)">★</i> best state</span>
+  <span><i style="color:var(--status-good)">★</i> best node</span>
   <span><i style="color:var(--status-critical)">✕</i> dead (no runnable kernel)</span>
-  <span><i style="color:var(--status-serious)">⇠ dashed</i> back-edge (cycle)</span>
-  <span><i>◎</i> transposition (&gt;1 parent)</span>
+  <span id="migration" class="hint" hidden></span>
   <span id="src" class="hint"></span>
 </div>
 <script>
@@ -241,19 +242,13 @@ function ramp(q){ // sequential: 5 steps, clamped
 function inkOn(q){ return q>=0.6 ? "var(--on-fill-dark)" : "var(--on-fill-light)"; }
 function shortKey(k){ return k.length>16 ? k.slice(0,15)+"…" : k; }
 
-// An edge is a back-edge iff it points to its own layer or a shallower one.
-//
-// The tempting test -- "c can reach p, so this edge is in a cycle" -- marks
-// EVERY edge of the cycle, including the ordinary forward ones that merely
-// participate. What is worth seeing is the single edge that CLOSES the loop,
-// and in a BFS layering that is exactly the edge that fails to descend.
-function isBack(depth,p,c){ return depth[c]!==undefined && depth[p]!==undefined
-  && depth[c] <= depth[p]; }
-
 function layout(d){
   const nodes=d.nodes, root=d.root;
-  // BFS from the root fixes each node's layer, so a node sits at its shallowest
-  // route -- the same rule the CLI view uses to decide where to expand it.
+  // Depth from the root. On a tree there is exactly one route to each node, so
+  // this is the node's depth and nothing has to choose a home for it -- the
+  // graph-era version needed a BFS for that, and a back-edge test for the edges
+  // that closed a cycle. Neither can occur now; the walk is kept only because it
+  // is also what detects a node that is not under the root at all.
   const depth={}, order=[];
   if(root&&nodes[root]){ depth[root]=0; const q=[root];
     while(q.length){ const k=q.shift(); order.push(k);
@@ -270,8 +265,7 @@ function layout(d){
   for(const d0 of keys){
     const lv=levels[d0];
     if(d0>0) lv.sort((a,b)=>{
-      const m=k=>{const ps=(nodes[k].parents||[]).filter(p=>row[p]!==undefined);
-        return ps.length?ps.reduce((s,p)=>s+row[p],0)/ps.length:1e9;};
+      const m=k=>{const p=nodes[k].parent; return (p!==undefined&&p!==null&&row[p]!==undefined)?row[p]:1e9;};
       return m(a)-m(b) || a.localeCompare(b);
     });
     lv.forEach((k,i)=>row[k]=i);
@@ -295,35 +289,22 @@ function render(){
   defs.innerHTML=`
     <marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7"
             orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--edge)"/></marker>
-    <marker id="ah-back" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7"
-            orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--status-serious)"/></marker>`;
+`;
   const edges=document.createElementNS(SVGNS,"g");
   const nodeg=document.createElementNS(SVGNS,"g");
   scene.append(defs,edges,nodeg);
 
   for(const k in nodes) for(const c of nodes[k].children){
     if(!pos[c]||!pos[k]) continue;
-    const back=isBack(depth,k,c);
+    // Forward only. A tree has no back-edge to route around, so the dashed
+    // under-arc the graph version drew for a cycle-closing edge is gone.
     const p=document.createElementNS(SVGNS,"path");
-    if(back){
-      // A return edge routed like a forward one swings right before coming
-      // back, which reads as a tangle. Arc it UNDER both nodes instead, so the
-      // shape itself says "this goes backwards".
-      const x1=pos[k].x+NW/2, y1=pos[k].y+NH, x2=pos[c].x+NW/2, y2=pos[c].y+NH;
-      const dip=Math.max(38,Math.abs(x1-x2)*0.16);
-      p.setAttribute("d",`M${x1},${y1} C${x1},${y1+dip} ${x2},${y2+dip} ${x2},${y2}`);
-      p.setAttribute("stroke","var(--status-serious)");
-      p.setAttribute("stroke-width",2);
-      p.setAttribute("stroke-dasharray","5 4");
-      p.setAttribute("marker-end","url(#ah-back)");
-    } else {
-      const x1=pos[k].x+NW, y1=pos[k].y+NH/2, x2=pos[c].x, y2=pos[c].y+NH/2;
-      const mx=(x1+x2)/2;
-      p.setAttribute("d",`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`);
-      p.setAttribute("stroke","var(--edge)");
-      p.setAttribute("stroke-width",1.5);
-      p.setAttribute("marker-end","url(#ah)");
-    }
+    const x1=pos[k].x+NW, y1=pos[k].y+NH/2, x2=pos[c].x, y2=pos[c].y+NH/2;
+    const mx=(x1+x2)/2;
+    p.setAttribute("d",`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`);
+    p.setAttribute("stroke","var(--edge)");
+    p.setAttribute("stroke-width",1.5);
+    p.setAttribute("marker-end","url(#ah)");
     p.setAttribute("fill","none");
     edges.appendChild(p);
   }
@@ -342,7 +323,7 @@ function render(){
     const t1=document.createElementNS(SVGNS,"text");
     t1.setAttribute("x",9); t1.setAttribute("y",18); t1.setAttribute("fill",inkOn(n.q));
     t1.setAttribute("font-size",12); t1.setAttribute("font-weight",600);
-    t1.textContent=(d.best===k?"★ ":"")+(n.dead?"✕ ":"")+((n.parents||[]).length>1?"◎ ":"")+shortKey(k);
+    t1.textContent=(d.best===k?"★ ":"")+(n.dead?"✕ ":"")+shortKey(k);
     const t2=document.createElementNS(SVGNS,"text");
     t2.setAttribute("x",9); t2.setAttribute("y",34); t2.setAttribute("fill",inkOn(n.q));
     t2.setAttribute("font-size",11); t2.setAttribute("opacity",.92);
@@ -358,7 +339,7 @@ function render(){
     }
     g.addEventListener("click",e=>{
       e.stopPropagation();
-      if(sel!==k) codeOpenFor=null;   // a new state starts with its source closed
+      if(sel!==k) codeOpenFor=null;   // a new node starts with its source closed
       sel=k; render(); detail(k);
     });
     nodeg.appendChild(g);
@@ -371,7 +352,7 @@ function detail(k){
   const chips=[];
   if(DATA.best===k) chips.push(`<span class="chip" style="color:var(--status-good)">★ best</span>`);
   if(n.dead) chips.push(`<span class="chip" style="color:var(--status-critical)">✕ dead</span>`);
-  if((n.parents||[]).length>1) chips.push(`<span class="chip">◎ transposition</span>`);
+
   const tried=(n.tried||[]).map(t=>`<div class="tried"><b>${t.mechanism||"(unnamed)"}</b> — ${
     t.runnable?("scored "+Number(t.value||0).toFixed(4)):"FAILED to compile/run"}${
     t.note?" · "+t.note:""}</div>`).join("")||`<div class="tried">nothing tried yet</div>`;
@@ -379,19 +360,18 @@ function detail(k){
    <dl><dt>Q</dt><dd>${n.q.toFixed(4)}</dd>
    <dt>N</dt><dd>${n.N}</dd><dt>W / M</dt><dd>${n.W.toFixed(3)} / ${n.M.toFixed(3)}</dd>
    <dt>value</dt><dd>${n.value.toFixed(4)}</dd><dt>depth</dt><dd>${n.depth}</dd>
-   <dt>via</dt><dd>${n.via||"—"}</dd><dt>rep</dt><dd>${n.rep||"—"}</dd>
+   <dt>via</dt><dd>${n.via||"—"}</dd><dt>kernel</dt><dd>${n.kernel||"—"}</dd>
    <dt>failures</dt><dd>${n.failures}</dd>
-   <dt>parents</dt><dd>${(n.parents||[]).length}</dd>
-   <dt>children</dt><dd>${(n.children||[]).length}</dd>
-   <dt>members</dt><dd>${(n.members||[]).join("<br>")||"—"}</dd></dl>
-   ${n.rep_path?`<button id="showcode">View kernel source</button>
-     <div id="codebox"></div>`:`<p class="hint">No source on record for this state.</p>`}
+   <dt>parent</dt><dd>${n.parent||"— (root)"}</dd>
+   <dt>children</dt><dd>${(n.children||[]).length}</dd></dl>
+   ${n.kernel_path?`<button id="showcode">View kernel source</button>
+     <div id="codebox"></div>`:`<p class="hint">No source on record for this node.</p>`}
    <h2>Tried from here</h2>${tried}`;
   const btn=document.getElementById("showcode");
-  if(btn) btn.onclick=()=>loadCode(n.rep_path,n.rep);
+  if(btn) btn.onclick=()=>loadCode(n.kernel_path,n.kernel);
   // A live poll re-renders this panel every time the checkpoint changes. Without
   // this the open source would silently vanish mid-read, once per round.
-  if(codeOpenFor===k&&n.rep_path) loadCode(n.rep_path,n.rep);
+  if(codeOpenFor===k&&n.kernel_path) loadCode(n.kernel_path,n.kernel);
 }
 
 let codeOpenFor=null;
@@ -449,12 +429,19 @@ if(qTheme==="light"||qTheme==="dark") document.documentElement.setAttribute("dat
 let lastM=-1, firstDraw=true;
 async function poll(){
   try{
-    const r=await fetch("/api/graph",{cache:"no-store"}); const d=await r.json();
+    const r=await fetch("/api/tree",{cache:"no-store"}); const d=await r.json();
     $("#src").textContent=d.source||"";
+    // A graph-era checkpoint that lost edges, merged kernels or unreachable nodes
+    // on the way to a tree says so here. `note` is "" on the ok path for a v2
+    // blob, so this stays hidden for every normal run; without it the operator
+    // sees a smaller tree than the file holds and no reason why.
+    const mg=$("#migration");
+    if(d.ok&&d.note){ mg.textContent="⚠ "+d.note; mg.hidden=false; }
+    else { mg.textContent=""; mg.hidden=true; }
     if(d.ok){
-      $("#s-states").textContent=d.stats.states;
-      $("#s-kernels").textContent=d.stats.kernels;
-      $("#s-merged").textContent=d.stats.merged_states;
+      $("#s-nodes").textContent=d.stats.nodes;
+      $("#s-leaves").textContent=d.stats.leaves;
+      $("#s-n1").textContent=d.stats["nodes_at_N<=1"];
       $("#s-visits").textContent=d.stats.total_visits;
       $("#s-depth").textContent=d.stats.max_depth_seen;
       const b=d.best&&d.nodes[d.best];
@@ -462,7 +449,7 @@ async function poll(){
       if(d.mtime!==lastM){ lastM=d.mtime; DATA=d; render();
         if(firstDraw){
           firstDraw=false; fit();
-          // ?select=<key> deep-links a state (and &code=1 opens its source), so a
+          // ?select=<key> deep-links a node (and &code=1 opens its source), so a
           // particular kernel can be linked to rather than described.
           const qs=new URLSearchParams(location.search);
           const want=qs.get("select");
@@ -470,7 +457,7 @@ async function poll(){
             sel=want; render();
             // Mark it open and let the single detail() call below do the load,
             // rather than calling detail() twice and wiping the first result.
-            if(qs.get("code")==="1"&&d.nodes[want].rep_path) codeOpenFor=want;
+            if(qs.get("code")==="1"&&d.nodes[want].kernel_path) codeOpenFor=want;
           }
         }
         if(sel&&d.nodes[sel]) detail(sel);
@@ -505,9 +492,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = read_code(self.root_path, (q.get("path") or [""])[0])
             self._send(200, json.dumps(payload).encode("utf-8"),
                        "application/json; charset=utf-8")
-        elif path == "/api/graph":
+        elif path in ("/api/tree", "/api/graph"):
             try:
-                payload = graph_payload(self.root_path, self.lam)
+                payload = tree_payload(self.root_path, self.lam)
             except Exception as exc:                     # never take the page down
                 payload = {"ok": False, "note": f"{exc.__class__.__name__}: {exc}"}
             self._send(200, json.dumps(payload).encode("utf-8"),
@@ -534,7 +521,7 @@ def serve_background(path: Path, *, lam: float = 0.7, port: int = DEFAULT_PORT,
     delay the graceful-stop path that writes the checkpoint.
 
     Safe to run against a live run because the viewer is strictly read-only: it
-    polls the graph file the loop has already written and never imports the loop.
+    polls the tree file the loop has already written and never imports the loop.
     It does no GPU work, so it cannot perturb a measurement -- the thing that
     matters most here, since ``noise_verify`` discards any sample that shared the
     card.
@@ -569,10 +556,10 @@ def serve_background(path: Path, *, lam: float = 0.7, port: int = DEFAULT_PORT,
         # would publish a run directory to the network as a side effect of
         # starting a training run.
         url = f"http://127.0.0.1:{chosen}"
-        t = threading.Thread(target=httpd.serve_forever, name="mcgs-viewer", daemon=True)
+        t = threading.Thread(target=httpd.serve_forever, name="mcts-viewer", daemon=True)
         t.start()
         if verbose:
-            print(f"[viewer] {url}   (live MCGS graph for this run)", flush=True)
+            print(f"[viewer] {url}   (live MCTS tree for this run)", flush=True)
         if open_browser:
             threading.Timer(0.6, lambda: webbrowser.open(url)).start()
         return httpd, url
@@ -584,22 +571,22 @@ def serve_background(path: Path, *, lam: float = 0.7, port: int = DEFAULT_PORT,
 
 
 def main(argv: Optional[list] = None) -> int:
-    ap = argparse.ArgumentParser(description="Interactive browser view of the MCGS graph.")
-    ap.add_argument("path", type=Path, help="batch folder, task folder, or graph file")
+    ap = argparse.ArgumentParser(description="Interactive browser view of the MCTS tree.")
+    ap.add_argument("path", type=Path, help="batch folder, task folder, or tree file")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind address (default loopback; anything else exposes the run "
                          "directory's contents to that interface)")
     ap.add_argument("--lam", type=float, default=0.7,
-                    help="lambda for Q = (1-lam)*mean + lam*max; match the run's --mcgs_lam")
+                    help="lambda for Q = (1-lam)*mean + lam*max; match the run's --mcts_lam")
     ap.add_argument("--no_open", action="store_true", help="do not open a browser")
     a = ap.parse_args(argv)
 
     if not a.path.exists():
-        print(f"[mcgs-serve] no such path: {a.path}", file=sys.stderr)
+        print(f"[mcts-serve] no such path: {a.path}", file=sys.stderr)
         return 2
     if a.host not in ("127.0.0.1", "localhost", "::1"):
-        print(f"[mcgs-serve] WARNING: binding {a.host}, not loopback. This serves the "
+        print(f"[mcts-serve] WARNING: binding {a.host}, not loopback. This serves the "
               f"contents of {a.path} to anything that can reach that address.")
 
     Handler.root_path = a.path
@@ -607,16 +594,16 @@ def main(argv: Optional[list] = None) -> int:
     try:
         httpd = ThreadingHTTPServer((a.host, a.port), Handler)
     except OSError as exc:
-        print(f"[mcgs-serve] cannot bind {a.host}:{a.port} -- {exc}", file=sys.stderr)
+        print(f"[mcts-serve] cannot bind {a.host}:{a.port} -- {exc}", file=sys.stderr)
         return 2
     url = f"http://{a.host}:{a.port}"
-    print(f"[mcgs-serve] {a.path}\n[mcgs-serve] {url}   (Ctrl-C to stop)", flush=True)
+    print(f"[mcts-serve] {a.path}\n[mcts-serve] {url}   (Ctrl-C to stop)", flush=True)
     if not a.no_open:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[mcgs-serve] stopped.")
+        print("\n[mcts-serve] stopped.")
     finally:
         httpd.server_close()
     return 0

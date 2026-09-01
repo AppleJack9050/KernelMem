@@ -57,7 +57,7 @@ _AGENT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
 #      an RTX 5090 = sm_120, where tcgen05 does not exist and the B200 metric
 #      names are not all valid. Loading them changes what the model proposes, so
 #      it is a search-policy change and wants its own A/B, exactly as
-#      --mcgs_prior does.
+#      --mcts_prior does.
 #   2. Loading a skill costs turns from the 30-turn tool budget.
 # ---------------------------------------------------------------------------
 _SKILLS_ENV = "KERNELMEM_SKILLS"
@@ -491,7 +491,7 @@ def _write_usage_row(
     """Append one call to usage.csv.
 
     `model`/`effort` are recorded because calls no longer all use the same ones:
-    the MCGS rollout runs on --rollout_model and the judge stays on --model_name,
+    the MCTS rollout runs on --rollout_model and the judge stays on --model_name,
     and a token log that does not say which model spent them cannot answer "did
     the split actually take effect". Appended at the END of the row so a usage.csv
     written before this change stays readable -- _append_usage_totals reads by
@@ -571,7 +571,7 @@ def query_server(
     # the precedence rule stays the same everywhere in this function -- an
     # explicit reasoning_effort still wins.
     model = _resolve_model(model_name)
-    # Per-call effort, because the calls are not alike. The MCGS rollout (the
+    # Per-call effort, because the calls are not alike. The MCTS rollout (the
     # `optimization` call that writes the next kernel) runs on a cheaper model at
     # high effort, while the judge and analysis calls stay where they were; before
     # this, `reasoning_effort` was accepted and then silently discarded, so every

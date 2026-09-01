@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run several kernel lineages in parallel, each with its own base and ratchet.
+"""Run several kernel lineages in parallel, each with its own base and search tree.
 
     python run_lineages.py tasks/vae_block_002.py --gpu "RTX 5090" \
         --plan keep_vendor,own_gemm,own_winograd \
@@ -14,9 +14,11 @@ draws was 10-41%. So the budget was going almost entirely into the small term,
 and the large term was a single unrepeated sample.
 
 Each lineage here is a separate `main_memory_latest.py` process with its own
-`--subproc_id`, its own batch folder, and therefore its own base kernel and
-ratchet -- which is exactly the "per-lineage ratchet" the single-process loop
-cannot express. A structurally new kernel is compared only against its own
+`--subproc_id`, its own batch folder, and therefore its own base kernel and its
+own MCTS tree -- which is exactly the "per-lineage search" the single-process
+loop cannot express. No `--search` is passed, so each child takes the parser
+default (`mcts`); pass `--search ratchet` through if a lineage should hill-climb
+instead. A structurally new kernel is compared only against its own
 history, so it is not killed on evaluation one for being worse than an incumbent
 it has not been tuned to beat yet. Process-level isolation also means the
 existing, working round loop is reused unchanged rather than refactored.

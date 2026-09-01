@@ -254,7 +254,7 @@ def build_optimization_prompt(
         arch_src=arch_src,
         history_block="",  # Not used anymore, kept for backward compatibility
         # Just-in-time memory: where this run's search actually is on the map.
-        # Built by the caller (it needs the live MCGS graph, which this module has
+        # Built by the caller (it needs the live MCTS tree, which this module has
         # no business importing) and "" when path memory is off or the graph has
         # no pathway yet -- so this is a no-op on round 1 and under the ratchet.
         pathway_block=pathway_block or "",

@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""Fit the MCGS mechanism prior from saved optimization trees.
+"""Fit the MCTS mechanism prior from saved optimization trees.
 
     python scripts/build_mechanism_prior.py --task vae_block_002 \
         --out priors/vae_block_002.json --max_round 9
 
-    python main_memory_latest.py tasks/vae_block_002.py --search mcgs \
-        --mcgs_prior priors/vae_block_002.json
+    python main_memory_latest.py tasks/vae_block_002.py --search mcts \
+        --mcts_prior priors/vae_block_002.json
 
 What it fits
 ------------
@@ -24,8 +24,8 @@ Why --max_round matters
 -----------------------
 Win rate over the saved runs is 42% in rounds 0-9 and 0% from round 10 on. Fit
 over all rounds and the prior partly re-learns that cliff: rho = +0.485 with the
-late rounds in, +0.324 with only rounds 0-9. MCGS already handles the cliff with
---mcgs_max_depth, so fitting over everything credits it twice and inflates what
+late rounds in, +0.324 with only rounds 0-9. MCTS already handles the cliff with
+--mcts_max_depth, so fitting over everything credits it twice and inflates what
 the prior looks like it is contributing. Default is 9 for that reason.
 
 Honest scope
@@ -51,7 +51,7 @@ from typing import Dict, List, Tuple
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from utils.mcgs import MechanismPrior  # noqa: E402
+from utils.mcts import MechanismPrior  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -159,12 +159,12 @@ def report(edges: List[dict], kappa: float, min_support: int) -> None:
           f"median gain {st.median([truth[i] for i in top]):+.2f}% vs "
           f"{st.median(truth):+.2f}%")
     if _spearman(preds, truth) < 0.1:
-        print("[prior]   WARNING: little or no signal. Do not enable --mcgs_prior "
+        print("[prior]   WARNING: little or no signal. Do not enable --mcts_prior "
               "on this fit; it would add machinery that predicts nothing.")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("Fit the MCGS mechanism prior from run history")
+    ap = argparse.ArgumentParser("Fit the MCTS mechanism prior from run history")
     ap.add_argument("--task", default="vae_block_002",
                     help="Task stem to fit on. The mechanism vocabulary is "
                          "task-specific; never reuse a prior across tasks.")
@@ -174,7 +174,7 @@ def main() -> None:
     ap.add_argument("--max_round", type=int, default=9,
                     help="Ignore edges past this round. Rounds 10+ have a 0%% win "
                          "rate, so including them makes the prior re-learn the "
-                         "exhaustion cliff that --mcgs_max_depth already handles. "
+                         "exhaustion cliff that --mcts_max_depth already handles. "
                          "Set -1 to keep every round.")
     ap.add_argument("--kappa", type=float, default=0.0,
                     help="Shrinkage: an estimate keeps n/(n+kappa) of its raw "
@@ -237,7 +237,7 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(prior.to_dict(), indent=2), encoding="utf-8")
     print(f"[prior] wrote {out}")
-    print(f"[prior] use it with:  --search mcgs --mcgs_prior {out}")
+    print(f"[prior] use it with:  --search mcts --mcts_prior {out}")
 
 
 if __name__ == "__main__":

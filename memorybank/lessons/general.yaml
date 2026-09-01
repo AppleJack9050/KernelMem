@@ -70,7 +70,7 @@ lessons:
     from measuring the same kernel twice.
 
     '
-  source: utils/mcgs.py docstring; utils/paired_bench; utils/noise_verify
+  source: utils/mcts.py docstring; utils/paired_bench; utils/noise_verify
 - id: only-pinned-clock-numbers-are-comparable
   confidence: measured
   claim: 'An unpinned GPU clock makes two timings of the same kernel two different experiments,
@@ -101,7 +101,7 @@ lessons:
     ones. A timid edit is likelier to land in the noise than to bank a small gain.
 
     '
-  source: utils/mcgs.py backup rationale
+  source: utils/mcts.py backup rationale
 - id: a-hung-build-is-usually-a-stale-lock-not-your-kernel
   confidence: measured
   claim: 'A killed compile orphans torch''s extension baton permanently, and any later kernel

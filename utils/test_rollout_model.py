@@ -4,7 +4,7 @@ The split is invisible at runtime -- both models go through the same Agent SDK
 path and print the same kind of reply -- so a silent regression would spend Opus
 credit on every expansion and nothing would look wrong. These checks pin it down:
 
-  * the `optimization` call (the MCGS rollout) uses --rollout_model at
+  * the `optimization` call (the MCTS rollout) uses --rollout_model at
     --rollout_effort
   * every other call type still uses --model_name
   * an explicit effort beats KERNELMEM_CLAUDE_EFFORT, or per-call routing would be
