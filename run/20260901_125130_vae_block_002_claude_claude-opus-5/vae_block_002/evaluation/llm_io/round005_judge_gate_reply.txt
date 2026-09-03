@@ -1,0 +1,22 @@
+```json
+{
+  "has_reuse": true,
+  "streaming_no_reuse": false,
+  "has_vector_load_store": true,
+  "kernel_structure_id": 4,
+  "is_aligned_vector_access": true,
+  "has_tail_handling_overhead": true,
+  "has_multiple_kernels_in_forward": true,
+  "tc_eligible": true,
+  "is_pointwise": false,
+  "uses_transcendentals": true,
+  "is_naive_gemm": false,
+  "has_k_loop": true,
+  "is_gemm_kloop": false,
+  "is_stencil_conv": true,
+  "has_shared_memory_tile": true,
+  "uses_vector_types": true,
+  "has_bounds_check": true,
+  "cudagraph_eligible": true
+}
+```

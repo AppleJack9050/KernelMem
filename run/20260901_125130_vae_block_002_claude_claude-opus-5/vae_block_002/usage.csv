@@ -1,0 +1,22 @@
+timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens,model,effort
+2026-09-01 12:56:25,0,seed,225098,22427,247525,claude-opus-5,high
+2026-09-01 13:02:26,1,judge_optimization,57869,17613,75482,claude-opus-5,high
+2026-09-01 13:08:22,1,optimization,473617,17745,491362,claude-sonnet-5,high
+2026-09-01 13:14:11,2,judge_optimization,59505,12364,71869,claude-opus-5,high
+2026-09-01 13:17:24,2,optimization,463036,19863,482899,claude-sonnet-5,high
+2026-09-01 13:23:48,3,judge_optimization,104227,16180,120407,claude-opus-5,high
+2026-09-01 13:30:29,3,optimization,610456,35202,645658,claude-sonnet-5,high
+2026-09-01 13:38:13,4,judge_optimization,72180,21923,94103,claude-opus-5,high
+2026-09-01 13:42:23,4,optimization,325495,27836,353331,claude-sonnet-5,high
+2026-09-01 13:47:42,5,judge_optimization,103793,17241,121034,claude-opus-5,high
+2026-09-01 13:51:59,5,optimization,263624,22837,286461,claude-sonnet-5,high
+2026-09-01 13:56:13,6,judge_optimization,87641,11263,98904,claude-opus-5,high
+2026-09-01 13:59:33,6,optimization,462230,17971,480201,claude-sonnet-5,high
+,,,3308771,260465,3569236,,
+2026-09-03 12:29:23,7,judge_optimization,53051,13805,66856,claude-opus-5,high
+2026-09-03 12:41:18,7,optimization,457059,20955,478014,claude-sonnet-5,high
+2026-09-03 12:47:05,8,judge_optimization,92559,12963,105522,claude-opus-5,high
+2026-09-03 12:51:02,8,optimization,381122,22222,403344,claude-sonnet-5,high
+2026-09-03 12:59:06,9,judge_optimization,106466,20998,127464,claude-opus-5,high
+2026-09-03 13:03:46,9,optimization,758586,32577,791163,claude-sonnet-5,high
+,,,8466385,644450,9110835,,

@@ -1,0 +1,24 @@
+{
+  "avg_speedup": 1.586552132906086,
+  "accuracy": 1.0,
+  "total_tokens_sum": 9110835,
+  "num_tasks": 1,
+  "tasks": [
+    {
+      "task": "tasks/vae_block_002.py",
+      "best_score": 1.586552132906086,
+      "best_runnable": true,
+      "task_dir": "/home/elek/KernelMem/run/20260901_125130_vae_block_002_claude_claude-opus-5/vae_block_002",
+      "figure": "/home/elek/KernelMem/run/20260901_125130_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png",
+      "input_tokens_sum": 8466385,
+      "output_tokens_sum": 644450,
+      "total_tokens_sum": 9110835,
+      "method_matched_stats": {
+        "total_opt_rounds": 9,
+        "matched_count": 9,
+        "unmatched_count": 0
+      }
+    }
+  ],
+  "timestamp": "2026-09-03 13:04:59"
+}
