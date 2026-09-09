@@ -3,7 +3,7 @@
 Why this exists
 ---------------
 Every ``config.json`` this repo has ever written records ``"lock_clocks": false``,
-and ``REPORT_002_vae_resblock.md:547`` calls that out as the reason a trace cannot
+and ``docs/REPORT_002_vae_resblock.md:547`` calls that out as the reason a trace cannot
 be audited on its own: two numbers produced by the same kernel on the same card
 are only comparable if the card was running at the same frequency both times, and
 nothing in the artifacts said what that frequency was. A boost clock is set by

@@ -1,0 +1,11 @@
+# Tooling configuration only -- this repository is run in place from its root
+# (`python main_memory_latest.py ...`, `python -m utils.<tool>`), not installed.
+
+[tool.pytest.ini_options]
+# Only tests/ is a test tree. Without this, `pytest` from the root also walks
+# run/ (thousands of artifacts), KernelBench/ and third_party/.
+testpaths = ["tests"]
+# Tests import `utils`, `prompts`, `agents`, `profiling` and
+# `main_memory_latest` as top-level modules, exactly as `python -m` from the
+# repo root does.
+pythonpath = ["."]

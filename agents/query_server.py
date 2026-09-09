@@ -212,7 +212,7 @@ _SUBSCRIPTION_ENV = {
 # nvcc compile -- the 482 object builds in this repo's .ninja_log files run a
 # median of 9.9s and a p90 of 26.9s. Paying that once per accepted kernel to stop
 # an agent from poisoning the directory the harness measures in is the right
-# trade, but it is a trade. This does not contradict run_ncu_memory.py's note
+# trade, but it is a trade. This does not contradict profiling/ncu.py's note
 # about leaving TORCH_EXTENSIONS_DIR unset -- that is about the HARNESS reusing
 # built .so files under ncu, a different process.
 # ---------------------------------------------------------------------------

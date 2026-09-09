@@ -1,6 +1,6 @@
 """Append-only duration log for a run (``timing.csv``, beside ``usage.csv``).
 
-Nothing in this harness used to record how long anything took. ``run_ncu_memory``
+Nothing in this harness used to record how long anything took. ``profiling.ncu``
 printed "Completed for kernel i/N" with no elapsed time, ``lineage.log`` carried no
 timestamps, and manual ``--resume`` invocations wrote their stdout to a terminal that
 was never captured. So the only way to recover a duration was to subtract two artifact
@@ -9,7 +9,8 @@ running.
 
 That bit us concretely. On 2026-08-06 the own_gemm lineage was stopped gracefully after
 round 7 (08:20:59, the post-loop writer's summary/figures prove a clean exit) and
-resumed by hand 51 minutes later (09:12:11, the mtime of the ``ref_0.py`` written at
+resumed by hand 51 minutes later (09:12:11, the mtime of the ``ref_0.py`` -- then written
+to the repo root, now ``scratch/ref.py`` under the run -- written at
 process startup). The next ncu CSV landed at 09:13:10. Subtracting mtimes charged the
 whole 52.5 minutes to the ncu pass, and it read as a profiler stall that had to be
 explained. Re-running that exact profile later took 1.05 minutes. There was never a
@@ -78,7 +79,7 @@ def set_round(round_idx: int) -> None:
     """Set the round every subsequent row is attributed to.
 
     Called once at the top of each round so that callers deep in the stack --
-    ``run_ncu_memory.profile_bench`` in particular, which has no idea what a round is
+    ``profiling.ncu.profile_bench`` in particular, which has no idea what a round is
     -- do not have to thread a round index through their signatures.
     """
     global _ROUND_IDX

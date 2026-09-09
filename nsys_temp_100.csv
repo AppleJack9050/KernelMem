@@ -1,7 +1,0 @@
-Kernel Name,kernel_launch_count
-gn_silu_add_nhwc2nchw_kernel,12
-nchw2nhwc_kernel,12
-gn_silu_nhwc_kernel,12
-gn_partial_kernel,24
-kcrs2krsc_kernel,24
-gn_finalize_kernel,24

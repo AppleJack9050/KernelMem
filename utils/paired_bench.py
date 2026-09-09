@@ -35,7 +35,7 @@ still recorded, for reading only, never for ranking.
 
 Usage
 -----
-    python -m utils.paired_bench ref_0.py seed.py candidate.py --reps 3
+    python -m utils.paired_bench tasks/vae_block_002.py seed.py candidate.py --reps 3
 
 The first kernel is the baseline; every other kernel is compared against it.
 """
@@ -102,7 +102,7 @@ def _t_sf(t: float, dof: int) -> float:
     Stdlib-only on purpose: this decides whether the ratchet advances, and it runs
     inside the benchmark subprocess, so it must not depend on scipy being present.
     Checked against scipy.stats.t.sf to 1e-12 over dof 1-30 -- see
-    ``utils/test_paired_stats.py``.
+    ``tests/test_paired_stats.py``.
     """
     if dof <= 0:
         return float("nan")

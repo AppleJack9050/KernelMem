@@ -25,6 +25,10 @@ from pathlib import Path
 
 from utils.paired_bench import adaptive_paired_verdict
 
+# Default home for the two kernel copies and for results, so running this from
+# the repo root (as the README shows) leaves nothing behind there.
+_NOISE_DIR = Path(__file__).resolve().parents[1] / "run" / "noise"
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -36,7 +40,8 @@ def main() -> int:
     ap.add_argument("--sigma", type=float, default=3.0)
     ap.add_argument("--warmup", type=int, default=25)
     ap.add_argument("--repeat", type=int, default=100)
-    ap.add_argument("--tmpdir", default=".")
+    ap.add_argument("--tmpdir", default=None,
+                    help="Where the two kernel copies go (default: run/noise/); removed on exit")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -56,46 +61,53 @@ def main() -> int:
     # files, and giving it the same path twice would let any per-path caching
     # make the comparison artificially clean.
     src = Path(args.kernel)
-    a = Path(args.tmpdir) / "null_base.py"
-    b = Path(args.tmpdir) / "null_cand.py"
+    tmpdir = Path(args.tmpdir) if args.tmpdir else _NOISE_DIR
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    a = tmpdir / "null_base.py"
+    b = tmpdir / "null_cand.py"
     shutil.copyfile(src, a)
     shutil.copyfile(src, b)
     assert a.read_bytes() == b.read_bytes() == src.read_bytes()
 
-    out = Path(args.out)
-    rel, ts, flagged, resolved = [], [], 0, 0
-    for i in range(args.trials):
-        v = adaptive_paired_verdict(
-            Path(args.ref), a, b, device=args.device,
-            warmup=args.warmup, repeat=args.repeat, tol=1e-2,
-            margin=args.margin, sigma=args.sigma, log=lambda m: print(m, flush=True),
-        )
-        if v is None:
-            print(f"  trial {i + 1}: measurement failed", flush=True)
-            continue
-        rel.append(v["rel_pct"])
-        ts.append(v["t"])
-        flagged += int(bool(v["beats_margin"]) and bool(v["sigma_ok"]))
-        resolved += int(bool(v["resolved"]))
-        with out.open("a") as fh:
-            fh.write(json.dumps({"trial": i, "ts": datetime.now().isoformat(timespec="seconds"),
-                                 **{k: v[k] for k in
-                                    ("rel_pct", "se_pct", "t", "dof", "reps",
-                                     "beats_margin", "sigma_ok", "resolved",
-                                     "base_ms", "cand_ms", "base_ms_all",
-                                     "cand_ms_all")}}) + "\n")
-        print(f"  trial {i + 1}/{args.trials}: rel={v['rel_pct']:+.3f}% "
-              f"se={v['se_pct']:.3f}% t={v['t']:+.2f} reps={v['reps']} "
-              f"beats_margin={v['beats_margin']} sigma_ok={v['sigma_ok']}", flush=True)
+    try:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        rel, ts, flagged, resolved = [], [], 0, 0
+        for i in range(args.trials):
+            v = adaptive_paired_verdict(
+                Path(args.ref), a, b, device=args.device,
+                warmup=args.warmup, repeat=args.repeat, tol=1e-2,
+                margin=args.margin, sigma=args.sigma, log=lambda m: print(m, flush=True),
+            )
+            if v is None:
+                print(f"  trial {i + 1}: measurement failed", flush=True)
+                continue
+            rel.append(v["rel_pct"])
+            ts.append(v["t"])
+            flagged += int(bool(v["beats_margin"]) and bool(v["sigma_ok"]))
+            resolved += int(bool(v["resolved"]))
+            with out.open("a") as fh:
+                fh.write(json.dumps({"trial": i, "ts": datetime.now().isoformat(timespec="seconds"),
+                                     **{k: v[k] for k in
+                                        ("rel_pct", "se_pct", "t", "dof", "reps",
+                                         "beats_margin", "sigma_ok", "resolved",
+                                         "base_ms", "cand_ms", "base_ms_all",
+                                         "cand_ms_all")}}) + "\n")
+            print(f"  trial {i + 1}/{args.trials}: rel={v['rel_pct']:+.3f}% "
+                  f"se={v['se_pct']:.3f}% t={v['t']:+.2f} reps={v['reps']} "
+                  f"beats_margin={v['beats_margin']} sigma_ok={v['sigma_ok']}", flush=True)
 
-    if rel:
-        print(f"\n[null] n={len(rel)}  true effect = 0 by construction")
-        print(f"  rel_pct: mean={st.mean(rel):+.3f}%  sd={st.stdev(rel) if len(rel) > 1 else 0:.3f}%  "
-              f"min={min(rel):+.3f}%  max={max(rel):+.3f}%")
-        print(f"  |rel| >= margin({100 * args.margin:.1f}%) in {sum(1 for r in rel if abs(r) >= 100 * args.margin)}/{len(rel)} trials")
-        print(f"  ACCEPTED (beats margin AND passes {args.sigma} sigma): {flagged}/{len(rel)}")
-        print(f"  resolved: {resolved}/{len(rel)}")
-    return 0
+        if rel:
+            print(f"\n[null] n={len(rel)}  true effect = 0 by construction")
+            print(f"  rel_pct: mean={st.mean(rel):+.3f}%  sd={st.stdev(rel) if len(rel) > 1 else 0:.3f}%  "
+                  f"min={min(rel):+.3f}%  max={max(rel):+.3f}%")
+            print(f"  |rel| >= margin({100 * args.margin:.1f}%) in {sum(1 for r in rel if abs(r) >= 100 * args.margin)}/{len(rel)} trials")
+            print(f"  ACCEPTED (beats margin AND passes {args.sigma} sigma): {flagged}/{len(rel)}")
+            print(f"  resolved: {resolved}/{len(rel)}")
+        return 0
+    finally:
+        for p in (a, b):
+            p.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

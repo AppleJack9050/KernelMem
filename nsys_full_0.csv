@@ -1,8 +1,0 @@
-Kernel Name,kernel_launch_count,time_pct,total_time_ns
-sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_tilesize64x128x32_warpgroupsize1x1x1…,24,63.4,7159015.0
-"gn_silu_res_nchw_kernel(const float *, const float *, const float *, const float *, const float *, …",12,11.4,1290348.0
-"gn_stats_kernel(const float *, float *, int, int, int)",24,10.4,1172460.0
-"nchw_to_nhwc_kernel(const float *, float *, int)",12,7.3,819337.0
-"gn_silu_nhwc_kernel(const float *, const float *, const float *, const float *, const float *, floa…",12,6.4,727367.0
-"weight_to_nhwc_kernel(const float *, const float *, float *, float *)",12,0.7,79264.0
-"gn_finalize_kernel(const float *, float *, float *, int, int, float, float)",24,0.4,48801.0

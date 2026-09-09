@@ -29,9 +29,9 @@ The main entry point of the project is the `main()` function in `main_memory_lat
     - Asks the LLM to generate more reliable kernel versions based on historical error logs and repair records.
 
 - **NCU & NSYS profiling–driven optimization**
-  - Invokes NVIDIA Nsight Compute (`ncu`) via `run_ncu_memory.py` to obtain fine-grained performance metrics:
+  - Invokes NVIDIA Nsight Compute (`ncu`) via `profiling/ncu.py` to obtain fine-grained performance metrics:
     - Memory efficiency, SM utilization, launch/occupancy, bottleneck stages, etc.
-  - Invokes Nsight Systems (`nsys`) via `run_nsys.py` to measure kernel launch counts and runtime behavior.
+  - Invokes Nsight Systems (`nsys`) via `profiling/nsys.py` to measure kernel launch counts and runtime behavior.
   - These profiling results are converted into optimization suggestions by `prompts/judger_optimization_memory_latest.py` / `prompts/optimization_memory_latest.py`, then used to drive new kernel generations.
 
 - **Interruptible, resumable runs**
@@ -43,16 +43,51 @@ The main entry point of the project is the `main()` function in `main_memory_lat
 
 ---
 
-## Code Structure
+## Repository layout
+
+```
+main_memory_latest.py   entry point: the generate / repair / optimize / profile loop
+run_lineages.py         coordinator that runs several seed lineages as parallel main_memory_latest.py processes
+agents/                 LLM backends; query_server.py is the one interface the loop talks to
+prompts/                prompt builders and judges; few_shot/ examples, hardware/ GPU specs
+profiling/              Nsight wrappers: ncu.py, nsys.py, the two .ncu-cfg metric sets, and
+                        bench_ref_inputs.py, the driver script that ncu/nsys execute
+utils/                  library code (compile_and_run, kernel_io, clock_lock, mcts*, ...) and the
+                        `python -m utils.<tool>` command-line tools built on it (noise_*, ...)
+scripts/                standalone scripts run by path: mechanism prior, timing report, solution
+                        packager, clock-lock installer
+tests/                  test suite (see "Running the tests")
+docs/                   reports on problem 002
+tasks/                  task files the search runs on (tasks/vae_block_002.py)
+KernelBench/            the KernelBench reference tasks, level1-4
+memorybank/             long-term memory: bottleneck rules and per-task lessons
+priors/                 fitted mechanism priors and the per-card clock presets
+solbench_problems/      SOL-ExecBench problem definitions; solbench_bridge/ turns them into tasks
+                        (that package exists in this checkout only as Python 3.13 bytecode)
+third_party/            vendored SOL-ExecBench (+ PATCHES.md); cutlass/ and kernel-design-agents/
+                        are gitignored -- .gitignore says how to fetch them
+run/                    run outputs, one folder per batch (see "Outputs and Visualization")
+```
 
 - **`main_memory_latest.py`**: main entry of the project
   - Parses CLI arguments (task selection, GPU, LLM settings, number of rounds, etc.).
   - Calls the LLM to generate / repair / optimize kernels.
   - Orchestrates benchmarking, NCU/NSYS profiling, visualization, and summary.
+  - Everything it needs per run is written under the run's own folder, including its
+    temp files (`scratch/`); the repository root stays clean while a run is in progress.
+
+- **`profiling/`**: Nsight integration
+  - `ncu.py`: runs Nsight Compute over the bench driver (`profile_bench`), parses the CSV
+    (`load_ncu_metrics`) and renders it for the prompt (`metrics_to_prompt`). Reads the two
+    `.ncu-cfg` files beside it.
+  - `nsys.py`: the same for Nsight Systems, giving per-kernel launch counts.
+  - `bench_ref_inputs.py`: the script both profilers execute. It is copied into each run's
+    `scratch/` next to `ref.py` and `test_kernel.py` and loads them from its own directory.
 
 - **`KernelBench/`**: PyTorch reference tasks
   - `level1`, `level2`: various basic operators and small subnetworks.
   - `level3`: representative deep learning models (ResNet, VGG, LSTM, Transformer, etc.).
+  - `level4`: 20 further tasks.
 
 - **`prompts/`**: prompt design and “memory mechanism”
   - `generate_custom_cuda_memory.py`: seed prompt for the first-round kernel generation.
@@ -67,6 +102,10 @@ The main entry point of the project is the `main()` function in `main_memory_lat
 - **`utils/`**:
   - `compile_and_run.py`: compile, run, compare accuracy, and measure performance.
   - `kernel_io.py`: extract code blocks from LLM replies, save them as Python/CUDA files, and read/write metrics.
+  - `individual.py`: `KernelIndividual`, the record the loop keeps per generated kernel.
+  - `clock_lock.py`, `gpu_lock.py`, `device_state.py`: measurement hygiene (see 1b below).
+  - `mcts*.py`, `pathmemory.py`, `rank_backtest.py`: the Monte Carlo search and its tooling.
+  - `noise_*.py`, `paired_bench.py`: noise-floor measurement (see 1c below).
 
 - **`agents/query_server.py`**:
   - Unified interface for talking to actual LLM backends (OpenAI, local vLLM/sglang, etc.).
@@ -167,8 +206,11 @@ python -m utils.noise_verify --kernel run/vae_block_002/kernels/nhwc_eager.py \
 # 2. False positives: run the real decision rule on two identical kernels.
 python -m utils.noise_null_verdict --ref tasks/vae_block_002.py \
   --kernel run/vae_block_002/kernels/nhwc_eager.py \
-  --trials 15 --margin 0.01 --out null.jsonl
+  --trials 15 --margin 0.01 --out run/noise/null.jsonl
 ```
+
+Both tools write under `run/noise/` by default (`noise_verify` picks a stamped name unless
+`--out` is given), so nothing is left in the repository root.
 
 `noise_verify` reports the **±2σ band** — the interval a re-measurement of an
 unchanged kernel lands in ~95% of the time, so any "improvement" smaller than it
@@ -275,6 +317,22 @@ Notes:
   it is therefore tied to its run folder. Moving or renaming the folder invalidates it, and any
   kernel file that has been deleted is reported and dropped rather than failing the resume.
 
+### 5. Running the tests
+
+Everything under `tests/` is collected by plain `pytest` from the repository root
+(`pyproject.toml` restricts collection to that directory and puts the root on the import
+path). About half the files are pytest-style; the rest are self-checking scripts that print
+`ok` / `FAIL` per assertion (most run their checks at import time, so `pytest` executes them
+while collecting but cannot report them as tests). Run those directly:
+
+```bash
+pytest                              # the pytest-style files
+python -m tests.test_mcts_quick     # a script-style one (each file's docstring names its command)
+```
+
+One needs a GPU (`test_uninit_memory_gate` compiles two CUDA extensions); `test_torch_ext_cache`
+needs torch importable but no GPU; the rest run anywhere.
+
 ---
 
 ## Outputs and Visualization
@@ -293,6 +351,12 @@ Example structure for a single task:
   - `*_nsys*.nsys-rep` / `*_nsys*.csv`: Nsight Systems traces and stats.
 - `optimization_tree.json`:
   - A “genealogy” of all kernels for the task, with parent–child relationships, speedups, NCU status, and whether an optimization method was matched.
+- `scratch/`:
+  - Per-run temp files: `ref.py` (a copy of the task), `test_kernel.py` (the kernel being
+    profiled), `rejected_kernel.py` (the previous round's not-adopted kernel, profiled for the
+    judge), `bench_ref_inputs.py` (the profiling driver) and the raw `ncu_temp.csv` /
+    `ncu_rejected.csv` / `nsys_temp.*` / `nsys_full.csv` output. Gitignored; anything worth
+    keeping is copied into `profile/` under the kernel's name.
 - `usage.csv`:
   - Token usage for all LLM calls, with a total row appended at the end.
 - `checkpoint.json`:

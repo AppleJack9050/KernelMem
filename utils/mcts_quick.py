@@ -168,7 +168,7 @@ def _load_host_helpers():
     (a) spawn re-executes THIS file in every bench and verdict child, and
     main_memory_latest drags in torch, matplotlib and the whole prompt package --
     twice per rollout, for a child that only needs `_bench_worker_entry`; and
-    (b) utils/test_mcts_quick.py has to run with no GPU and no torch, and it
+    (b) tests/test_mcts_quick.py has to run with no GPU and no torch, and it
     asserts `"main_memory_latest" not in sys.modules` right after importing this
     module. That assertion is the tripwire for anyone who later hoists this to
     the top of the file.
@@ -661,7 +661,7 @@ def _one_rollout(tree: MonteCarloTreeSearch, *, rollout_idx: int,
     also mutate the tree there would be a window in which the two disagreed with
     nothing on disk to reconcile them from.
 
-    Every side-effecting dependency is injected so utils/test_mcts_quick.py can
+    Every side-effecting dependency is injected so tests/test_mcts_quick.py can
     drive the whole cycle with no GPU, no LLM and no subprocess.
     """
     now = now or datetime.now
@@ -1350,6 +1350,10 @@ def cmd_run(a: argparse.Namespace, explicit: set) -> int:
     io_dir = eval_dir / "llm_io"
     for d in (code_dir, eval_dir, io_dir):
         d.mkdir(parents=True, exist_ok=True)
+    # A reply with no code block is dumped beside the run's other LLM I/O, as
+    # main_memory_latest._run_single_task does; unset, it lands in the cwd.
+    from utils.kernel_io import set_error_dump_dir
+    set_error_dump_dir(io_dir)
     # Read from wherever it is, write back under the current name -- so a
     # resumed graph-era run migrates its filename on its first rollout instead of
     # keeping a name that no longer describes it.

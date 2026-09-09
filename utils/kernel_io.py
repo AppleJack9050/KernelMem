@@ -19,7 +19,19 @@ import re
 from pathlib import Path
 from typing import Final
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+# Where a raw LLM reply is dumped when it contains no code block at all.
+# main_memory_latest.py points this at the run's evaluation/llm_io/ so the dump
+# sits beside the reply it came from; left unset (standalone tools, subprocesses)
+# it falls back to the working directory, which is what it always did.
+ERROR_DUMP_DIR: Optional[Path] = None
+
+
+def set_error_dump_dir(path: "str | Path | None") -> None:
+    """Direct ``llm_output_error_*.txt`` dumps into *path* (None = cwd)."""
+    global ERROR_DUMP_DIR
+    ERROR_DUMP_DIR = Path(path) if path is not None else None
 __all__: Final = [
     "extract_code_block",
     "save_kernel_code",
@@ -150,7 +162,12 @@ def extract_code_block(text: str) -> str:
     m_open = _CODE_FENCE_OPEN_RE.search(text)
     if not m_open:
         # No ``` found → raise and persist raw output to disk
-        dump_path = f"llm_output_error_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        dump_dir = ERROR_DUMP_DIR or Path.cwd()
+        try:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            dump_dir = Path.cwd()
+        dump_path = dump_dir / f"llm_output_error_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(dump_path, "w") as f:
             f.write(text)
         raise RuntimeError(f"No ``` code block found in LLM output – raw output saved to {dump_path}")

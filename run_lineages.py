@@ -14,11 +14,12 @@ draws was 10-41%. So the budget was going almost entirely into the small term,
 and the large term was a single unrepeated sample.
 
 Each lineage here is a separate `main_memory_latest.py` process with its own
-`--subproc_id`, its own batch folder, and therefore its own base kernel and its
-own MCTS tree -- which is exactly the "per-lineage search" the single-process
+`--work_dir` batch folder (hence its own `scratch/`), and therefore its own base
+kernel and its own MCTS tree -- which is exactly the "per-lineage search" the single-process
 loop cannot express. No `--search` is passed, so each child takes the parser
 default (`mcts`); pass `--search ratchet` through if a lineage should hill-climb
-instead. A structurally new kernel is compared only against its own
+instead. `--subproc_id` is passed only as the label written to `timing.csv`.
+A structurally new kernel is compared only against its own
 history, so it is not killed on evaluation one for being worse than an incumbent
 it has not been tuned to beat yet. Process-level isolation also means the
 existing, working round loop is reused unchanged rather than refactored.

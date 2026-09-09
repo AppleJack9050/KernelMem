@@ -124,7 +124,7 @@ def main() -> None:
         raise SystemExit(2)
 
     sys.path.insert(0, str(REPO))
-    ref_mod = _load(REPO / "ref_0.py", "_ref0")
+    ref_mod = _load(REPO / "tasks" / "vae_block_002.py", "_ref0")
     from sol_execbench.core import Workload
     from sol_execbench.core.bench.io import gen_inputs
 

@@ -14,8 +14,8 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from run_ncu_memory import profile_bench, load_ncu_metrics, metrics_to_prompt
-from run_nsys import profile_bench as nsys_profile_bench, load_nsys_stats
+from profiling.ncu import profile_bench, load_ncu_metrics, metrics_to_prompt
+from profiling.nsys import profile_bench as nsys_profile_bench, load_nsys_stats
 import matplotlib
 matplotlib.use("Agg")  # headless save
 import matplotlib.pyplot as plt
@@ -25,8 +25,9 @@ from prompts.generate_custom_cuda_memory import build_seed_prompt, default_syste
 from utils.reference_profile import build_reference_profile_block
 from prompts.judger_compilation_timeout import build_compilation_timeout_prompts
 from utils.compile_and_run import compare_and_bench
-from utils.kernel_io import extract_code_block, save_kernel_code, extract_json, extract_cuda_kernel_names
-from scripts.individual import KernelIndividual  # adjust path if needed
+from utils.kernel_io import (extract_code_block, save_kernel_code, extract_json,
+                             extract_cuda_kernel_names, set_error_dump_dir)
+from utils.individual import KernelIndividual
 from prompts.error_memory import build_error_prompt
 from prompts.optimization_memory_latest import build_optimization_prompt
 from prompts.judger_repair_memory import build_correctness_prompts
@@ -62,6 +63,9 @@ compare_and_bench = _serialize_on_gpu(compare_and_bench, "bench")
 profile_bench = _serialize_on_gpu(profile_bench, "ncu")
 nsys_profile_bench = _serialize_on_gpu(nsys_profile_bench, "nsys")
 build_reference_profile_block = _serialize_on_gpu(build_reference_profile_block, "ref_profile")
+
+# The ncu/nsys bench driver. Copied per run into run/<batch>/<task>/scratch/.
+_BENCH_TEMPLATE = Path(__file__).resolve().parent / "profiling" / "bench_ref_inputs.py"
 
 _INVOCATION_SPLITTER = "Invoked with:"
 
@@ -361,7 +365,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Open a browser at the viewer URL. Off by default: runs are "
                         "usually launched headless or with output redirected, and popping "
                         "a browser out of a background job is worse than printing a URL.")
-    p.add_argument("--subproc_id", type=int, default=0, help="Identifier for sub-process (e.g., when running multiple in parallel)")
+    p.add_argument("--subproc_id", type=int, default=0,
+                   help="Identifier for this process when several run in parallel; recorded in "
+                        "timing.csv. Temp files live under the run folder, so it no longer names them.")
     p.add_argument("--no_clock_lock", action="store_true",
                    help="Run WITHOUT pinning the GPU clock. Off by default: an "
                         "unpinned clock is set by temperature and power, neither "
@@ -1551,12 +1557,18 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     fig_dir = task_root / "figures"
     io_dir = eval_dir / "llm_io"
     profile_dir = task_root / "profile"
+    # Per-run temp files (reference copy, kernel under profile, bench driver,
+    # raw ncu/nsys output). Gitignored; named copies go to profile_dir.
+    scratch_dir = task_root / "scratch"
 
     code_dir.mkdir(parents=True, exist_ok=True)
     eval_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
     io_dir.mkdir(parents=True, exist_ok=True)
     profile_dir.mkdir(parents=True, exist_ok=True)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    # A reply with no code block is dumped beside the run's other LLM I/O.
+    set_error_dump_dir(io_dir)
     log_path = task_root / "usage.csv"
     # Durations, beside the token log. Opened before anything else can spend time, and
     # bounded by process_start/process_exit rows so a reader can tell a gap between
@@ -1566,27 +1578,20 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                      detail=f"pid={os.getpid()} subproc_id={args.subproc_id} "
                             f"task={task_path.stem}")
 
-    # === Write the contents of task_path into root/ref.py ===
-    root_dir = Path(__file__).resolve().parent
-    ref_py = root_dir / f"ref_{args.subproc_id}.py"
-    test_kernel = root_dir / f"test_kernel_{args.subproc_id}.py"
-    bench_py = root_dir / f"bench_ref_inputs_{args.subproc_id}.py"
-    content = task_path.read_text(encoding="utf-8")  # read source from task_path
-    with open(ref_py, "w", encoding="utf-8") as f:
-        f.write(content)
-    
-    # === Create bench_ref_inputs_{subproc_id}.py from template ===
-    if not bench_py.exists():
-        template_path = root_dir / "bench_ref_inputs_0.py"
-        if template_path.exists():
-            template_content = template_path.read_text(encoding="utf-8")
-            # Replace hardcoded ref_0.py and test_kernel_0.py with subproc_id versions
-            bench_content = template_content.replace("ref_0.py", f"ref_{args.subproc_id}.py")
-            bench_content = bench_content.replace("test_kernel_0.py", f"test_kernel_{args.subproc_id}.py")
-            with open(bench_py, "w", encoding="utf-8") as f:
-                f.write(bench_content)
-        else:
-            raise FileNotFoundError(f"Template file {template_path} not found. Cannot create {bench_py}")
+    # === Per-run scratch: the reference copy, the kernel under profile and the
+    # bench driver live beside the run's outputs, not in the repo root. Nothing
+    # here depends on --subproc_id any more: every run has its own task_root,
+    # so parallel processes cannot collide.
+    ref_py = scratch_dir / "ref.py"
+    test_kernel = scratch_dir / "test_kernel.py"
+    bench_py = scratch_dir / "bench_ref_inputs.py"
+    ref_py.write_text(task_path.read_text(encoding="utf-8"), encoding="utf-8")
+    if not _BENCH_TEMPLATE.exists():
+        raise FileNotFoundError(f"Bench template {_BENCH_TEMPLATE} not found. Cannot create {bench_py}")
+    # Refreshed from the template every start (a resume included) so the run
+    # profiles with the current driver. The ncu cache keys on the driver bytes,
+    # so a changed template invalidates it, as it should.
+    shutil.copy2(_BENCH_TEMPLATE, bench_py)
 
     call_llm = _make_llm_caller(args)
 
@@ -1868,7 +1873,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         # repair rounds, which burn wall clock without advancing the search.
         best_score_at_round_start = best_score
         # Attribute every row written from here on -- including the ones emitted deep
-        # inside run_ncu_memory, which has no notion of a round -- to this round.
+        # inside profiling.ncu, which has no notion of a round -- to this round.
         run_timing.set_round(round_idx)
         _round_t0 = time.perf_counter()
 
@@ -2472,9 +2477,9 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         kernel_file_to_profile = test_kernel  # test_kernel already contains parent_kernel.code
                         print(f"[ncu] Profiling kernel from file: {kernel_file_to_profile} (parent_kernel: {parent_kernel.code_path if parent_kernel and hasattr(parent_kernel, 'code_path') else 'N/A'})", flush=True)
                         
-                        csv_path_str = f"ncu_temp_{args.subproc_id}.csv"
+                        csv_path_str = str(scratch_dir / "ncu_temp.csv")
                         csv_path_result = _ncu_profile_cached(
-                            bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
+                            bench_py=str(bench_py),
                             kernel_names=kernel_names,  # pass the kernel names so only the specified kernel is monitored
                             kernel_file=kernel_file_to_profile,  # explicitly specify the kernel file to profile
                             out_csv=csv_path_str,
@@ -2568,13 +2573,13 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 print(f"[ncu] Profiling last round's NOT-ADOPTED kernel "
                                       f"{rejected_kernel_name} ({rejected_kernel_score:.4f} vs base "
                                       f"{base_score:.4f}) {_why}", flush=True)
-                                _rf = Path(f"rejected_kernel_{args.subproc_id}.py")
+                                _rf = scratch_dir / "rejected_kernel.py"
                                 _rf.write_text(_rej.code, encoding="utf-8")
                                 _rn = extract_cuda_kernel_names(_rf)
                                 _rcsv = _ncu_profile_cached(
-                                    bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
+                                    bench_py=str(bench_py),
                                     kernel_names=_rn, kernel_file=_rf,
-                                    out_csv=f"ncu_rejected_{args.subproc_id}.csv",
+                                    out_csv=str(scratch_dir / "ncu_rejected.csv"),
                                     device_idx=args.device, repeat=ncu_repeat,
                                     timeout_override=ncu_timeout_seconds,
                                     cache_dir=profile_dir / ".ncu_cache",
@@ -2604,16 +2609,16 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             print(f"[nsys] Starting nsys profiling after ncu...", flush=True)
                             _nsys_t0 = time.perf_counter()
                             nsys_rep_path = nsys_profile_bench(
-                                bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
+                                bench_py=str(bench_py),
                                 kernel_names=kernel_names,
                                 kernel_file=kernel_file_to_profile,
-                                out_rep=f"nsys_temp_{args.subproc_id}.nsys-rep",
+                                out_rep=str(scratch_dir / "nsys_temp.nsys-rep"),
                                 device_idx=args.device,
                                 timeout=300,  # 5 minutes timeout
                             )
                             run_timing.record("nsys", time.perf_counter() - _nsys_t0)
                             # Extract and save launch counts
-                            nsys_csv_path = Path(f"nsys_temp_{args.subproc_id}.csv")
+                            nsys_csv_path = scratch_dir / "nsys_temp.csv"
                             nsys_df = load_nsys_stats(
                                 rep_path=nsys_rep_path,
                                 kernel_names=kernel_names,
@@ -2630,7 +2635,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 full_df = load_nsys_stats(
                                     rep_path=nsys_rep_path,
                                     kernel_names=None,
-                                    out_csv=Path(f"nsys_full_{args.subproc_id}.csv"),
+                                    out_csv=scratch_dir / "nsys_full.csv",
                                 )
                                 if full_df is not None and not full_df.empty:
                                     metrics_block += _nsys_launch_table_block(full_df)
@@ -2677,7 +2682,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                 import shutil
                                 kernel_name = parent_kernel.code_path.stem
                                 # Use the csv_path from profile_bench if available, otherwise try to find it
-                                csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else Path(f"ncu_temp_{args.subproc_id}.csv").resolve()
+                                csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else (scratch_dir / "ncu_temp.csv").resolve()
                                 if csv_path_temp.exists() and csv_path_temp.stat().st_size > 0:
                                     ncu_profile_path = profile_dir / f"{kernel_name}_ncu_error.csv"
                                     try:
@@ -2700,7 +2705,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             import shutil
                             kernel_name = parent_kernel.code_path.stem
                             # Use the csv_path from profile_bench if available, otherwise try to find it
-                            csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else Path(f"ncu_temp_{args.subproc_id}.csv").resolve()
+                            csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else (scratch_dir / "ncu_temp.csv").resolve()
                             if csv_path_temp.exists() and csv_path_temp.stat().st_size > 0:
                                 ncu_profile_path = profile_dir / f"{kernel_name}_ncu_error.csv"
                                 try:
@@ -2720,7 +2725,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         import shutil
                         kernel_name = parent_kernel.code_path.stem
                         # Use the csv_path from profile_bench if available, otherwise try to find it
-                        csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else Path(f"ncu_temp_{args.subproc_id}.csv").resolve()
+                        csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else (scratch_dir / "ncu_temp.csv").resolve()
                         if csv_path_temp.exists() and csv_path_temp.stat().st_size > 0:
                             ncu_profile_path = profile_dir / f"{kernel_name}_ncu_timeout.csv"
                             try:

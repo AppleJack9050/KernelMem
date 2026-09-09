@@ -15,3 +15,17 @@ third_party/cutlass/
 # must not be committed into this repository. Referencing a local checkout keeps
 # provenance with upstream; copying the text in here would not.
 third_party/kernel-design-agents/
+
+# Python bytecode. The one exception is solbench_bridge/, which exists in this
+# checkout ONLY as Python 3.13 bytecode (no .py sources), so those files are
+# the package and must stay tracked.
+__pycache__/
+*.py[cod]
+!solbench_bridge/*.pyc
+.pytest_cache/
+
+# Per-run scratch written by main_memory_latest.py next to the run's outputs:
+# the reference copy, the kernel under profile, the previous round's rejected
+# kernel, the bench driver and the raw ncu/nsys temp files. Named copies of anything worth keeping land in
+# run/<batch>/<task>/profile/.
+run/**/scratch/

@@ -8,7 +8,7 @@ copied verbatim from a solution.json the bridge itself produced
 (run/vae_block_002/out8_maxautotune/solution.json), so packaging stays
 byte-compatible with previously scored solutions.
 
-    python package_solution.py <kernel.py> <out_dir> [--name-suffix TAG]
+    python scripts/package_solution.py <kernel.py> <out_dir> [--name-suffix TAG]
 """
 import argparse
 import json

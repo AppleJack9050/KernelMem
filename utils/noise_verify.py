@@ -70,6 +70,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+# Default home for results, so running this from the repo root (as the README
+# shows) leaves nothing behind there.
+_NOISE_DIR = Path(__file__).resolve().parents[1] / "run" / "noise"
+
 def _geo(xs: List[float]) -> float:
     return math.exp(sum(math.log(x) for x in xs) / len(xs))
 
@@ -238,7 +242,9 @@ def main() -> int:
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--warmup", type=int, default=25)
     ap.add_argument("--repeat", type=int, default=100)
-    ap.add_argument("--out", default=None, help="JSONL path (default: alongside a summary)")
+    ap.add_argument("--out", default=None,
+                    help="JSONL path (default: run/noise/noise_verify_<label>_<stamp>.jsonl); "
+                         "a .summary.json lands beside it")
     ap.add_argument("--label", default="", help="Tag for the summary, e.g. 'locked'")
     args = ap.parse_args()
 
@@ -250,7 +256,8 @@ def main() -> int:
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     label = args.label or "run"
-    out = Path(args.out) if args.out else Path(f"noise_verify_{label}_{stamp}.jsonl")
+    out = Path(args.out) if args.out else _NOISE_DIR / f"noise_verify_{label}_{stamp}.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     # tasks/*.py hardcodes an absolute SOLBENCH_SRC default from the machine it
