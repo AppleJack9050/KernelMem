@@ -846,6 +846,25 @@ def _bench_and_score(
             else:
                 print(f"[{phase}] score={speedup:.4f}", flush=True)
 
+            # Compiler-level trouble is REPORTED here, not handed to the next LLM
+            # round: register allocation and spills are the CompileIQ finishing
+            # pass's job now (utils/acf.py says why; README "CompileIQ finishing
+            # pass" says how). The LLM prompts no longer ask for unroll/regcap sweeps.
+            _px = metrics.get("ptxas") or {}
+            if _px.get("spill_bytes"):
+                from utils.acf import short_kernel_name as _short_kname
+                _spilling = _px.get("spilling") or []
+                _names = ", ".join(_short_kname(n) for n in _spilling[:3])
+                print(f"[{phase}] ptxas: {_px['spill_bytes']} B spilled in {len(_spilling)} kernel(s) "
+                      f"({_names}); max {_px.get('max_registers')} regs/thread. Compiler-level: "
+                      f"leave it to `python -m utils.compileiq_finish` on the frozen winner, "
+                      f"not to the next round.", flush=True)
+            _acf = metrics.get("acf") or {}
+            if _acf.get("acf"):
+                print(f"[{phase}] acf: {_acf['acf']} "
+                      + ("applied" if _acf.get("applied") else "FAILED to build; built plain (fallback)"),
+                      flush=True)
+
             # # === Optional: on successful compile+run, copy code to root/test_kernel.py ===
             # try:
             #     from pathlib import Path as _Path

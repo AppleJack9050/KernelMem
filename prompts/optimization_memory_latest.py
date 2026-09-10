@@ -75,6 +75,7 @@ Your answer MUST consist of **two sections in order**, separated by explicit del
 (2) MINIMAL-DIFF PRINCIPLE (RELATIVE TO BASE KERNEL)
 - Keep the overall structure and public interface of the base kernel stable. Do not redesign unrelated parts.
 - Focus your edits on the parts of the code that are directly related to the modification plan.
+- Do not add or change nvcc/ptxas flags (-maxrregcount, -Xptxas, --use_fast_math, -Ofast-compile) and do not spend the round on unroll-factor or launch-bounds sweeps: compiler-internal knobs are tuned by the NVIDIA CompileIQ finishing pass after the search, and fast-math changes the numerics.
 
 (3) SEMANTIC ALIGNMENT
 - Your optimized kernel must produce the same outputs as the base kernel for the same inputs (within tolerance).

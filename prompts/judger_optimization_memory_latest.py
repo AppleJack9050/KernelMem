@@ -396,9 +396,15 @@ Definitions:
 Rules:
 1) If your proposed modification plan matches a prior attempt's core mechanism(s), you MUST:
    - keep the SAME method_name as that prior attempt (treat it as "refinement"), AND
-   - explicitly state at least ONE concrete delta vs that attempt (e.g., different vector width, different unroll factor, different block size, different alignment/tail handling, different indexing/coalescing strategy).
+   - explicitly state at least ONE concrete delta vs that attempt (e.g., different vector width, different tile/warp shape, different block size, different alignment/tail handling, different indexing/coalescing strategy).
 2) If you cannot provide a concrete delta, you MUST choose a DIFFERENT method from allowed_methods that has not been tried, or justify why switching is necessary.
 3) You MUST NOT change method_name merely to avoid repetition. Relabeling without mechanism change is invalid.
+4) COMPILER-KNOB HAND-OFF: do NOT propose a round whose delta is an unroll factor, a register cap
+   (-maxrregcount, __launch_bounds__ min-blocks, "keep registers under N"), an nvcc/ptxas flag or
+   fast-math. Those knobs are owned by the NVIDIA CompileIQ finishing pass that runs on the frozen
+   winner after the search; a round spent on them is guesswork the compiler search does better.
+   Your deltas are source-level: tile/warp shape, pipeline stages, split-K, vector width, fusion,
+   layout, indexing. If the metrics report ptxas spills, say so in one line and move on.
 
 You MUST follow this decision procedure:
 
@@ -512,9 +518,9 @@ If your plan includes mechanisms that trigger multiple rules, you MUST choose th
 - Each numbered item must be actionable and directly checkable in code review. You MUST include ALL specific details relevant to implementing that particular optimization method. The details you include depend on what the optimization method requires, and may include (but are not limited to):
   * Launch shape and grid/block dimensions (if changed) or explicit statement to keep them unchanged
   * Indexing math and stride calculations (e.g., `stride = blockDim.x * gridDim.x`)
-  * Vector width (e.g., float2/float4) or unroll factor (e.g., `#pragma unroll(4)`)
+  * Vector width (e.g., float2/float4); loop structure, but NOT unroll-factor sweeps (compiler knob, delegated)
   * Tail/edge handling strategy (e.g., "handle remaining elements with scalar loop")
-  * Resource/occupancy constraints (e.g., "keep registers per thread < 32")
+  * Resource/occupancy constraints that follow from the SOURCE (block size, shared-memory budget) -- not register caps, which are delegated
   * Specific intrinsics/APIs to use (e.g., `__pipeline_memcpy_async`, `__prefetch_global_l2`)
   * Required conditionals or guards (e.g., "if idx_pref < N then prefetch")
   * Any other implementation details necessary for the specific optimization method
@@ -855,6 +861,10 @@ def build_judger_optimization_prompts(
                         if method_id in method_catalog:
                             method_info = method_catalog[method_id]
                             method_catalog_lines.append(f"**{method_id}**:")
+                            if method_info.get("delegated_to"):
+                                method_catalog_lines.append(
+                                    f"  DELEGATED to {method_info['delegated_to']}: do not spend a round on it; "
+                                    "it is applied to the frozen winner after the search.")
                             if "intent" in method_info:
                                 method_catalog_lines.append(f"  Intent: {method_info['intent']}")
                             if "mechanism_requirements" in method_info:

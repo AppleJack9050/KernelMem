@@ -106,6 +106,7 @@ run/                    run outputs, one folder per batch (see "Outputs and Visu
   - `clock_lock.py`, `gpu_lock.py`, `device_state.py`: measurement hygiene (see 1b below).
   - `mcts*.py`, `pathmemory.py`, `rank_backtest.py`: the Monte Carlo search and its tooling.
   - `noise_*.py`, `paired_bench.py`: noise-floor measurement (see 1c below).
+  - `acf.py`, `compileiq_finish.py`: the compiler-knob hand-off to NVIDIA CompileIQ (see 6 below).
 
 - **`agents/query_server.py`**:
   - Unified interface for talking to actual LLM backends (OpenAI, local vLLM/sglang, etc.).
@@ -331,7 +332,55 @@ python -m tests.test_mcts_quick     # a script-style one (each file's docstring 
 ```
 
 One needs a GPU (`test_uninit_memory_gate` compiles two CUDA extensions); `test_torch_ext_cache`
-needs torch importable but no GPU; the rest run anywhere.
+and `test_acf` need torch importable but no GPU; the rest run anywhere.
+
+### 6. CompileIQ finishing pass (compiler knobs are not the LLM's job)
+
+The loop owns a kernel's **source**: tile and warp shape, split-K, pipeline stages, fusion,
+layout, vector width. The knobs **inside the compiler** -- register allocation, instruction
+scheduling, the compiler's own unrolling heuristics -- are not something an LLM can see, so
+rounds spent on `#pragma unroll` sweeps, `-maxrregcount` and launch-bounds hints were guesswork.
+Since 2026-09-09 the prompts tell the LLM not to spend rounds on them, `Reduce_Unrolling` is out
+of the machine-check action space, and those knobs are tuned once, on the frozen winner, by
+[NVIDIA CompileIQ](https://github.com/NVIDIA/CompileIQ): an evolutionary search over the hidden
+nvcc/ptxas controls that ships with CUDA 13.3, whose output is an *Advanced Controls File* (ACF)
+applied with `nvcc --apply-controls`.
+
+Why it is a finishing pass and never part of a round: NVIDIA states an ACF is per-kernel and
+per-compiler-build (stale the moment the source changes) and that failures, compile hangs and
+numeric instability are to be expected. Every candidate is therefore built and benchmarked by
+the harness itself, tolerance check included, in a fresh process.
+
+```bash
+pip install compileiq                                   # once; needs nvcc >= 13.3 and a Blackwell+ GPU
+python -m utils.compileiq_finish tasks/vae_block_002.py run/vae_block_002/kernel_autotune_splitk.py \
+    --out run/vae_block_002/compileiq --baseline-only   # one bench, ptxas report, cost estimate
+python -m utils.compileiq_finish tasks/vae_block_002.py run/vae_block_002/kernel_autotune_splitk.py \
+    --out run/vae_block_002/compileiq                   # the search (~1 min/evaluation, 150 by default)
+```
+
+The search's own "best" is one noisy sample picked from 150, so it is not what decides. The best
+ACF is embedded into `<kernel>_acf.py` -- self-contained, applied only when the local nvcc is the
+exact build it was tuned with, and falling back to the plain build if the controlled build fails
+-- and that file is measured against the plain kernel with the interleaved paired verdict at the
+loop's 1% accept margin (`--margin`). Only a kernel that beats it is worth shipping;
+`scripts/package_solution.py` takes the embedded file unchanged. `report.json`, `evals.csv` and
+`search_results.csv` in `--out` record everything.
+
+Two smaller pieces of the same hand-off run inside every round, at no extra cost:
+
+* candidate builds get `-Xptxas -v`, and the bench result carries `ptxas` (registers and spill
+  bytes per kernel). A spilling kernel is printed as a hand-off, not fed to the next round.
+  `KERNELMEM_PTXAS_VERBOSE=0` turns it off. The report exists only when the build actually ran:
+  a kernel served from torch's extension cache carries `n_kernels: 0`, which the tools print as
+  "no report". (The first bench after upgrading rebuilds any kernel cached under the old flags once.)
+* `KERNELMEM_ACF=<file>` applies an ACF to the candidate build of any bench, with fallback unless
+  `KERNELMEM_ACF_STRICT=1`; `KERNELMEM_ACF_DISABLE=1` makes an embedded kernel build plain. The
+  bench result records `acf.applied` / `acf.fallback`.
+
+Expect little on a kernel that already sits at tensor-core peak (problem 002's CUTLASS conv:
+0-2%); the hand-off earns its keep on hand-written SIMT kernels, where the LLM used to burn rounds
+on exactly these knobs.
 
 ---
 

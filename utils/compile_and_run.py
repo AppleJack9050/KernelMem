@@ -31,7 +31,7 @@ from typing import List, Tuple
 
 import torch
 
-from utils import clock_lock, device_state
+from utils import acf as acf_mod, clock_lock, device_state
 
 # ---------------------------------------------------------------------------
 
@@ -61,7 +61,9 @@ def _timeout_handler(signum, frame):
     raise CompilationTimeoutError("Compilation exceeded timeout limit (10 minutes)")
 
 
-def _capture_import(path: Path, timeout: int = 600):
+def _capture_import(path: Path, timeout: int = 600, *,
+                    acf: "Path | None" = None, acf_strict: bool = False,
+                    ptxas_verbose: bool = False):
     """Import *path* dynamically and capture **all** build logs.
 
     Parameters
@@ -70,6 +72,11 @@ def _capture_import(path: Path, timeout: int = 600):
         Path to the Python file to import.
     timeout : int, optional
         Compilation timeout in seconds (default: 600 = 10 minutes).
+    acf, acf_strict, ptxas_verbose
+        Passed to :func:`utils.acf.patched_extension_builds`: every
+        ``load_inline``/``load`` the module runs while importing gets
+        ``--apply-controls <acf>`` and/or ``-Xptxas -v`` appended. The build
+        record is left on the module as ``__kernelmem_build__``.
 
     Returns
     -------
@@ -114,7 +121,10 @@ def _capture_import(path: Path, timeout: int = 600):
 
             # ------------ REAL IMPORT (build/compile) with timeout --------------------
             signal.alarm(timeout)  # Start the timeout timer
-            spec.loader.exec_module(module)                             # pyright: ignore[attr-defined]
+            with acf_mod.patched_extension_builds(acf=acf, strict=acf_strict,
+                                                  ptxas_verbose=ptxas_verbose) as build_rec:
+                spec.loader.exec_module(module)                         # pyright: ignore[attr-defined]
+            module.__dict__["__kernelmem_build__"] = build_rec
             signal.alarm(0)  # Cancel the alarm if compilation succeeds
 
             fd_buf.flush()
@@ -821,7 +831,15 @@ def compare_and_bench(
 
     # ------------ Dynamic import ------------
     ref_mod, _ = _capture_import(ref_py)
-    test_mod, _ = _capture_import(test_py)
+    # The candidate build is where the compiler-knob hand-off happens (see
+    # utils/acf.py): an ACF named by KERNELMEM_ACF is applied to it, and ptxas
+    # is asked for its register/spill report so the loop can SEE compiler-level
+    # trouble and hand it off instead of asking the LLM to fix it blind.
+    test_mod, test_build_log = _capture_import(
+        test_py, acf=acf_mod.active_acf(), acf_strict=acf_mod.strict_enabled(),
+        ptxas_verbose=acf_mod.ptxas_verbose_enabled())
+    build_info = acf_mod.build_summary(test_mod.__dict__.get("__kernelmem_build__"),
+                                       test_build_log)
 
     RefModel   = getattr(ref_mod,  "Model",       None)
     get_inputs = getattr(ref_mod,  "get_inputs",  None)
@@ -1153,6 +1171,10 @@ def compare_and_bench(
         # single-shape ref/test ratio when the task has no get_inputs_extra().
         "score": score,
         "per_shape": per_shape,
+        # Candidate build facts: ptxas registers/spills per kernel (None when
+        # KERNELMEM_PTXAS_VERBOSE=0) and which ACF, if any, the build applied.
+        "ptxas": build_info["ptxas"],
+        "acf": build_info["acf"],
         "model_init_args": init_args,
         "model_init_kwargs": init_kwargs,
         "seed": seed,
@@ -1174,6 +1196,9 @@ def _cli():
     p.add_argument("--repeat", type=int, default=20, help="Benchmark runs")
     p.add_argument("--tol", type=float, default=1e-4, help="Max abs error tolerance")
     p.add_argument("--dump", type=Path, help="If set, write JSON results here")
+    p.add_argument("--no-time-ref", action="store_true",
+                   help="Skip timing the reference (score/speedup come back None); "
+                        "for callers that only want the candidate's absolute time")
     args = p.parse_args()
 
     res = compare_and_bench(
@@ -1183,6 +1208,7 @@ def _cli():
         warmup=args.warmup,
         repeat=args.repeat,
         tol=args.tol,
+        time_ref=not args.no_time_ref,
     )
     print(json.dumps(res, indent=2))
 

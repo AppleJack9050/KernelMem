@@ -702,7 +702,11 @@ machine_check:
         - id: REG_TierHM
           headroom: [Tier-H, Tier-M]
           kernel_structure: [S0, S1, S2, S3]
-          allowed_methods: [Reduce_Live_Ranges, Reduce_Unrolling, SharedMemory_Tradeoff_if_Beneficial]
+          # Reduce_Unrolling left this list on 2026-09-09: unroll factors and
+          # register caps are compiler knobs, delegated to the CompileIQ finishing
+          # pass (utils/compileiq_finish.py). The catalog entry stays so older
+          # histories that name it still render.
+          allowed_methods: [Reduce_Live_Ranges, SharedMemory_Tradeoff_if_Beneficial]
 
 
     divergence:
@@ -1440,7 +1444,8 @@ llm_assist:
         - "cause spills via poor scheduling"
 
     Reduce_Unrolling:
-      intent: "Reduce unroll factors to cut register pressure and avoid spills while keeping enough ILP."
+      delegated_to: "the NVIDIA CompileIQ finishing pass (python -m utils.compileiq_finish)"
+      intent: "DELEGATED. Unroll factors and register allocation are compiler-internal knobs; CompileIQ searches them on the frozen winner after the LLM search. Do not spend a round on unroll sweeps."
       mechanism_requirements:
         - unroll_factor_adjusted
         - preserve_semantics

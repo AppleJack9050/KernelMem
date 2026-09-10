@@ -159,6 +159,11 @@ Always include:
 - "--expt-relaxed-constexpr"
 - "-lineinfo"
 - "$gencode_flag" (this is the target architecture of the GPU you are compiling for; do not substitute another one)
+Do NOT add "-maxrregcount", "-Xptxas ...", "--use_fast_math", "-Ofast-compile" or any other
+register / scheduling / fast-math flag. Compiler-internal knobs (register allocation, instruction
+scheduling, the compiler's unrolling heuristics) are tuned AFTER the search by an NVIDIA CompileIQ
+pass on the finished kernel, and fast-math changes the numerics. Spend the effort on the source:
+tiling, fusion, layout, pipelining, vector width.
 $cutlass_block
 Here are examples to show you the syntax of inline embedding custom CUDA operators in torch:
 $few_shot_examples
