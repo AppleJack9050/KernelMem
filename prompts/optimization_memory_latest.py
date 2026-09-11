@@ -99,7 +99,6 @@ Architecture: $gpu_arch
 Details:
 $gpu_items
 $cutlass_block
-$lessons_block
 $pathway_block
 
 [BASE KERNEL FILE]
@@ -236,22 +235,11 @@ def build_optimization_prompt(
     # rounds of the best run so far. Emit it here too; it is "" when CUTLASS is
     # absent or does not compile, so this is a no-op on machines without it.
     from prompts.generate_custom_cuda_memory import _cutlass_block
-    # Long-term memory: findings recorded on THIS task by previous runs. Advisory,
-    # and "" when the task has no lessons file or MEMORYBANK_LESSONS=0 -- an empty
-    # heading is worse than silence, because the model tries to honour it. A
-    # failure to read it must never cost a round, so it degrades to "".
-    try:
-        from utils.memorybank_lessons import render as _render_lessons
-        lessons_block = _render_lessons(Path(arch_path).stem)
-    except Exception as _exc:                                  # pragma: no cover
-        print(f"[lessons] skipped ({_exc})", flush=True)
-        lessons_block = ""
     return _OPTIMIZATION_PROMPT_TEMPLATE.substitute(
         gpu_name=gpu_name,
         gpu_arch=gpu_arch,
         gpu_items=gpu_items,
         cutlass_block=_cutlass_block(),
-        lessons_block=lessons_block,
         arch_src=arch_src,
         history_block="",  # Not used anymore, kept for backward compatibility
         # Just-in-time memory: where this run's search actually is on the map.

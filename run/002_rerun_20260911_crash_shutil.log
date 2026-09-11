@@ -1,0 +1,16 @@
+[clock] locked NVIDIA GeForce RTX 5090 to 2407 MHz, mem 13801 MHz (ceiling 3090 MHz, observed 2400 MHz) -- preset for NVIDIA GeForce RTX 5090
+[capability] gpu-spec:NVIDIA GeForce RTX 5090: available (matched 'RTX 5090')
+[gpu] 'NVIDIA GeForce RTX 5090' -> spec key 'RTX 5090'
+[BATCH] Output folder: /home/otter77/git_project/KernelMem/run/20260911_073713_vae_block_002_claude_claude-opus-5
+[viewer] http://127.0.0.1:8747   (live MCTS tree for this run)
+Traceback (most recent call last):
+  File "/home/otter77/git_project/KernelMem/main_memory_latest.py", line 3866, in <module>
+    main()
+    ~~~~^^
+  File "/home/otter77/git_project/KernelMem/main_memory_latest.py", line 3800, in main
+    res = _run_single_task(all_tasks[0], args, batch_dir=batch_dir)
+  File "/home/otter77/git_project/KernelMem/main_memory_latest.py", line 1613, in _run_single_task
+    shutil.copy2(_BENCH_TEMPLATE, bench_py)
+    ^^^^^^
+UnboundLocalError: cannot access local variable 'shutil' where it is not associated with a value
+EXIT=1

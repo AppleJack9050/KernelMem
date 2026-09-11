@@ -2516,7 +2516,6 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         # Use parent_kernel's filename to name the ncu csv file
                         ncu_profile_path = None
                         if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
-                            import shutil
                             kernel_name = parent_kernel.code_path.stem  # e.g., "kernel_20251229_141824"
                             ncu_profile_path = profile_dir / f"{kernel_name}_ncu.csv"
                             if csv_path.exists() and csv_path.stat().st_size > 0:
@@ -2666,7 +2665,6 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             
                             # Save nsys results to profile folder
                             if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
-                                import shutil
                                 kernel_name = parent_kernel.code_path.stem
                                 nsys_profile_rep_path = profile_dir / f"{kernel_name}_nsys.nsys-rep"
                                 nsys_profile_csv_path = profile_dir / f"{kernel_name}_nsys.csv"
@@ -2698,7 +2696,6 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             print(f"[ncu] ERROR: Profiling failed: {ncu_error}")
                             # Try to save partial CSV results if available
                             if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
-                                import shutil
                                 kernel_name = parent_kernel.code_path.stem
                                 # Use the csv_path from profile_bench if available, otherwise try to find it
                                 csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else (scratch_dir / "ncu_temp.csv").resolve()
@@ -2721,7 +2718,6 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         print(f"[ncu] ERROR: Unexpected profiling error: {ncu_error}")
                         # Try to save partial CSV results if available
                         if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
-                            import shutil
                             kernel_name = parent_kernel.code_path.stem
                             # Use the csv_path from profile_bench if available, otherwise try to find it
                             csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else (scratch_dir / "ncu_temp.csv").resolve()
@@ -2741,7 +2737,6 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     # Handle ncu timeout by calling repair
                     # Mark parent_kernel as not passing ncu and save timeout CSV if available
                     if ncu_timeout and parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
-                        import shutil
                         kernel_name = parent_kernel.code_path.stem
                         # Use the csv_path from profile_bench if available, otherwise try to find it
                         csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else (scratch_dir / "ncu_temp.csv").resolve()

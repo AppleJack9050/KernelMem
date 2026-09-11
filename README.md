@@ -60,7 +60,7 @@ tests/                  test suite (see "Running the tests")
 docs/                   reports on problem 002
 tasks/                  task files the search runs on (tasks/vae_block_002.py)
 KernelBench/            the KernelBench reference tasks, level1-4
-memorybank/             long-term memory: bottleneck rules and per-task lessons
+memorybank/             long-term memory: the bottleneck/headroom rule table
 priors/                 fitted mechanism priors and the per-card clock presets
 solbench_problems/      SOL-ExecBench problem definitions; solbench_bridge/ turns them into tasks
                         (that package exists in this checkout only as Python 3.13 bytecode)

@@ -1,0 +1,53 @@
+[clock] locked NVIDIA GeForce RTX 5090 to 2407 MHz, mem 13801 MHz (ceiling 3090 MHz, observed 2400 MHz) -- preset for NVIDIA GeForce RTX 5090
+  rep 1/5  kernel_20260911_091625         1.4634 ms
+  rep 1/5  kernel_20260911_084339         1.4667 ms
+  rep 1/5  kernel_20260911_083010         1.4551 ms
+  rep 1/5  kernel_20260911_092850         1.4518 ms
+  rep 1/5  kernel_20260911_075408         1.4821 ms
+  rep 2/5  kernel_20260911_091625         1.4678 ms
+  rep 2/5  kernel_20260911_084339         1.4685 ms
+  rep 2/5  kernel_20260911_083010         1.4540 ms
+  rep 2/5  kernel_20260911_092850         1.4494 ms
+  rep 2/5  kernel_20260911_075408         1.4790 ms
+  rep 3/5  kernel_20260911_091625         1.4655 ms
+  rep 3/5  kernel_20260911_084339         1.4697 ms
+  rep 3/5  kernel_20260911_083010         1.4527 ms
+  rep 3/5  kernel_20260911_092850         1.4494 ms
+  rep 3/5  kernel_20260911_075408         1.4806 ms
+  rep 4/5  kernel_20260911_091625         1.4660 ms
+  rep 4/5  kernel_20260911_084339         1.4699 ms
+  rep 4/5  kernel_20260911_083010         1.4526 ms
+  rep 4/5  kernel_20260911_092850         1.4499 ms
+  rep 4/5  kernel_20260911_075408         1.4789 ms
+  rep 5/5  kernel_20260911_091625         1.4653 ms
+  rep 5/5  kernel_20260911_084339         1.4686 ms
+  rep 5/5  kernel_20260911_083010         1.4541 ms
+  rep 5/5  kernel_20260911_092850         1.4502 ms
+  rep 5/5  kernel_20260911_075408         1.4790 ms
+
+==============================================================================
+PAIRED INTERLEAVED BENCHMARK   reps=5   baseline=kernel_20260911_091625
+==============================================================================
+Ranked on ABSOLUTE kernel time (geomean over shapes) -- LOWER is better.
+kernel                          geomean ms   stdev     sem
+kernel_20260911_091625              1.4656   0.11%   0.05%
+kernel_20260911_084339              1.4687   0.09%   0.04%
+kernel_20260911_083010              1.4537   0.07%   0.03%
+kernel_20260911_092850              1.4501   0.07%   0.03%
+kernel_20260911_075408              1.4799   0.09%   0.04%
+
+Per-shape mean time in ms (noise in parentheses, as stdev %):
+shape                  260911_091625   260911_084339   260911_083010   260911_092850   260911_075408
+8x256x64x128            2.2381( 0.2)    2.2448( 0.2)    2.2270( 0.2)    2.2446( 0.1)    2.2495( 0.1)
+2x256x64x64             0.3384( 0.3)    0.3387( 0.1)    0.3412( 0.3)    0.3365( 0.0)    0.3438( 0.2)
+4x256x256x256           9.6852( 0.0)    9.6858( 0.0)    9.3068( 0.0)    9.3085( 0.2)    9.7474( 0.0)
+1x256x131x131           0.6289( 0.0)    0.6318( 0.1)    0.6315( 0.1)    0.6289( 0.1)    0.6363( 0.2)
+
+Comparisons vs kernel_20260911_091625   (positive = FASTER than baseline):
+  kernel_20260911_084339         -0.21%  se= 0.06%  t= -3.44  shapes 0/4  -> REAL
+  kernel_20260911_083010         +0.82%  se= 0.06%  t=+14.15  shapes 2/4  -> REAL
+  kernel_20260911_092850         +1.06%  se= 0.06%  t=+18.61  shapes 2/4  -> REAL
+  kernel_20260911_075408         -0.97%  se= 0.06%  t=-15.25  shapes 0/4  -> REAL
+
+Saved -> run/20260911_073844_vae_block_002_claude_claude-opus-5/head_to_head_final.json
+EXIT=0

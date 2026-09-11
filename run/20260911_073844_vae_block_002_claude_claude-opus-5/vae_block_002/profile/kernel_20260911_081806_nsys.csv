@@ -1,0 +1,5 @@
+Kernel Name,kernel_launch_count
+norm_silu_res_t_kernel,4
+gn_partial_kernel,8
+norm_silu_nhwc_kernel,4
+gn_finalize_kernel,8

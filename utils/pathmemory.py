@@ -45,15 +45,13 @@ The three consumers
    with no lineage.
 2. ``MonteCarloTreeSearch.pv`` + ``--mcts_pv_bonus`` -- a selection bonus for
    staying on that pathway. OFF by default; see the note on convention below.
-3. ``pathway_lesson()`` -- distils the pathway into a ``memorybank/lessons``
-   entry, so the NEXT run starts knowing which chain won this one. This is the
-   part that makes it long-term rather than merely within-run.
+3. ``pathway_lesson()`` -- distils the pathway into a printable summary of the
+   chain that won this run, for a human reading a finished run.
 
 On defaults, and this repo's convention
 ---------------------------------------
-The prompt block is ON by default, matching ``MEMORYBANK_LESSONS``: it is context,
-and context that is measured this run cannot mislead the way an unsourced claim
-can. ``--mcts_pv_bonus`` is OFF by default, matching ``--mcts_prior`` and
+The prompt block is ON by default: it is context, and context that is measured
+this run cannot mislead the way an unsourced claim can. ``--mcts_pv_bonus`` is OFF by default, matching ``--mcts_prior`` and
 ``--mcts_epsilon``: it changes the search policy, and the convention here is that
 such a change is opt-in until it has won its own A/B. Set ``KERNELMEM_PATHWAY=0``
 to drop the block (e.g. for that A/B).
@@ -210,8 +208,7 @@ def render_pathway(tree: MonteCarloTreeSearch, *,
     """The block injected into the optimization prompt.
 
     Returns "" when there is nothing to say or the feature is off. An empty
-    heading is worse than silence, because the model will try to honour it --
-    the same reasoning as ``memorybank_lessons.render``.
+    heading is worse than silence, because the model will try to honour it.
 
     Deliberately reports the pathway as measurement, not instruction. The
     ``allowed_methods`` precedent in this repo is that the catalog's 26 entries
@@ -291,17 +288,14 @@ def render_pathway(tree: MonteCarloTreeSearch, *,
 
 # ---------------------------------------------------------------- long term
 def pathway_lesson(tree: MonteCarloTreeSearch, task: str) -> Optional[Dict[str, Any]]:
-    """Distil the pathway into a ``memorybank/lessons`` entry for the NEXT run.
+    """Distil the pathway into a summary of the chain that won this run.
 
     Returns None when the run has no pathway worth recording -- a single seed with
     no surviving edit teaches nothing, and an entry that says "the seed was the
     best" is prompt budget spent to tell the model something it will discover in
     round one anyway.
 
-    Not written automatically. ``memorybank/lessons/<task>.yaml`` is hand-curated
-    and its stated bar is that every entry carries its evidence; an automated
-    writer appending to it every run is how a curated file becomes a log. The CLI
-    prints the entry and ``--write`` commits it.
+    Printed by the CLI for a human to read; nothing consumes it automatically.
     """
     pv = principal_variation(tree)
     if len(pv) < 2:
@@ -378,8 +372,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="print the block exactly as the optimization prompt sees it")
     ap.add_argument("--lesson", action="store_true",
                     help="print the memorybank lesson distilled from the pathway")
-    ap.add_argument("--write", action="store_true",
-                    help="with --lesson, commit it to memorybank/lessons/<task>.yaml")
     ap.add_argument("--lam", type=float, default=0.7, help="Q mixing weight, for display")
     a = ap.parse_args(argv)
 
@@ -397,15 +389,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if lesson is None:
             print("no pathway worth recording (fewer than two nodes on the PV)")
             return 0
-        if a.write:
-            from utils.memorybank_lessons import load as _load, save as _save
-            data = _load(task)
-            data["lessons"] = [l for l in (data.get("lessons") or [])
-                               if l.get("id") != lesson["id"]] + [lesson]
-            print(f"wrote {lesson['id']} to {_save(task, data)}")
-        else:
-            for k, v in lesson.items():
-                print(f"{k}: {str(v).strip()}")
+        for k, v in lesson.items():
+            print(f"{k}: {str(v).strip()}")
         return 0
 
     if a.prompt:

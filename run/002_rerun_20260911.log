@@ -1,0 +1,1161 @@
+[clock] locked NVIDIA GeForce RTX 5090 to 2407 MHz, mem 13801 MHz (ceiling 3090 MHz, observed 2400 MHz) -- preset for NVIDIA GeForce RTX 5090
+[capability] gpu-spec:NVIDIA GeForce RTX 5090: available (matched 'RTX 5090')
+[gpu] 'NVIDIA GeForce RTX 5090' -> spec key 'RTX 5090'
+[BATCH] Output folder: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5
+[viewer] http://127.0.0.1:8747   (live MCTS tree for this run)
+[vae_block_002.py] Round 0
+[Seed] Generating the initial kernel ...
+[ref_profile] Profiling reference model to inform granularity choice ...
+[ref_profile] REFERENCE PROFILE (measured on this GPU, not estimated)
+[ref_profile] The unmodified reference takes 2451.7 us of GPU time per forward.
+[ref_profile] Where that time actually goes:
+[capability] cutlass: available (/home/otter77/git_project/KernelMem/third_party/cutlass/include; PFN shim required)
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=426727, Out=31330, Total=458057
+[92mFinish reason: end_turn[0m
+[seed] score=1.0524 (geomean over 4 shapes: 8x256x64x128=1.0769x  2x256x64x64=1.0106x  4x256x256x256=1.0353x  1x256x131x131=1.0887x)
+[seed] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0000.json
+[seed] bench took 33.9s
+[mcts] Root node n0000 <- kernel_20260911_074454 at 1.0524
+[base] Setting initial base_kernel: 1.0524
+[best] Updating best_kernel: 1.0524 vs -inf [stored-score (no paired verdict available)]
+[vae_block_002.py] Round 0 took 6.7 min (404s)
+[vae_block_002.py] Round 1
+Optimizing start
+[mcts] Round 1: branching from node n0000 (depth 0, N=0, Q=0.000, value 1.0524) via kernel_20260911_074454
+[mcts]   why: leaf node (no expandable children yet)
+[mcts]   tree: 1 nodes (1 leaves), mean N=0.00, depth seen 0
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_partial_kernel', 'gn_finalize_kernel', 'norm_silu_nhwc_kernel', 'norm_silu_nhwc_scalar_kernel', 'norm_silu_res_t_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_074454.py)
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[ncu] Multiple kernels detected (5), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/5: gn_partial_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel0_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 6.6s
+[ncu] [metrics] Completed for kernel 1/5: gn_partial_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel0_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 5.3s
+[ncu] [section] Completed for kernel 1/5: gn_partial_kernel
+[ncu] Profiling kernel 2/5: gn_finalize_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel1_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 6.3s
+[ncu] [metrics] Completed for kernel 2/5: gn_finalize_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel1_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 5.3s
+[ncu] [section] Completed for kernel 2/5: gn_finalize_kernel
+[ncu] Profiling kernel 3/5: norm_silu_nhwc_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel2_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 6.3s
+[ncu] [metrics] Completed for kernel 3/5: norm_silu_nhwc_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel2_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 5.4s
+[ncu] [section] Completed for kernel 3/5: norm_silu_nhwc_kernel
+[ncu] Profiling kernel 4/5: norm_silu_nhwc_scalar_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel3_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 1.8s
+[ncu] [metrics] Completed for kernel 4/5: norm_silu_nhwc_scalar_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel3_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 1.8s
+[ncu] [section] Completed for kernel 4/5: norm_silu_nhwc_scalar_kernel
+[ncu] Profiling kernel 5/5: norm_silu_res_t_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel4_metrics.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 6.4s
+[ncu] [metrics] Completed for kernel 5/5: norm_silu_res_t_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel4_section.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 5.3s
+[ncu] [section] Completed for kernel 5/5: norm_silu_res_t_kernel
+[ok] Merged 5 kernel profiles into: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp.csv
+[ncu] profile_bench finished in 50.6s (5 kernel name(s), 10 invocation(s), 10.1s per name)
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_074454_ncu.csv
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp /home/otter77/miniconda3/bin/python3 /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 4 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 7 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_full.csv
+[nsys] Added full launch table (7 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_074454_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_074454_nsys.csv
+[machine_check] Using kernel_launch_count from nsys: 72
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_judge_gate_prompt.txt
+Usage: In=23420, Out=267, Total=23687
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round001_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=56881, Out=15175, Total=72056
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_074454/opt_round_001.json
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Usage: In=524382, Out=22909, Total=547291
+[92mFinish reason: end_turn[0m
+[opt] score=1.1052 (geomean over 4 shapes: 8x256x64x128=1.1591x  2x256x64x64=1.0620x  4x256x256x256=1.0648x  1x256x131x131=1.1384x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0001.json
+[opt] bench took 32.8s
+[opt] Optimization history updated: speedup=1.1052
+[base] Re-measuring base and candidate side by side (5-8 interleaved reps)...
+[mcts] Child node n0001 (depth 1): +4.74% (paired) -> reward 0.959, value 1.1023, N=1
+[mcts] Best node so far: n0001 at 1.1023 via kernel_20260911_075408 (N=1, Q=0.959)
+[base] MCTS holds selection (1.1052: paired +4.74% +/-0.26% (5.1 sigma equiv, t=+18.6 on 7 dof, 8 reps, escalated, UNRESOLVED; 1.5677 -> 1.4967 ms)); the candidate is a tree node and may be branched from later
+[best] Updating best_kernel: 1.1052 vs 1.0524 [paired +4.74% +/-0.26% (5.1 sigma equiv, t=+18.6 on 7 dof, 8 reps, escalated, UNRESOLVED; 1.5677 -> 1.4967 ms)]
+[vae_block_002.py] Round 1 took 10.2 min (614s)
+[vae_block_002.py] Round 2
+Optimizing start
+[mcts] Round 2: branching from node n0001 (depth 1, N=1, Q=0.959, value 1.1023) via kernel_20260911_075408 [SWITCHED parent]
+[mcts]   why: leaf node (no expandable children yet)
+[mcts]   tree: 2 nodes (1 leaves), mean N=1.00, depth seen 1
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_partial_kernel', 'gn_finalize_kernel', 'norm_silu_nhwc_kernel', 'norm_silu_nhwc_scalar_kernel', 'norm_silu_res_t_kernel', 'nchw_to_nhwc_kernel', 'weight_nchw_to_nhwc_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_075408.py)
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[ncu] Multiple kernels detected (7), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/7: gn_partial_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel0_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 1/7: gn_partial_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel0_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 1/7: gn_partial_kernel
+[ncu] Profiling kernel 2/7: gn_finalize_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel1_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 5.7s
+[ncu] [metrics] Completed for kernel 2/7: gn_finalize_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel1_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 2/7: gn_finalize_kernel
+[ncu] Profiling kernel 3/7: norm_silu_nhwc_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel2_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 6.1s
+[ncu] [metrics] Completed for kernel 3/7: norm_silu_nhwc_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel2_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 5.2s
+[ncu] [section] Completed for kernel 3/7: norm_silu_nhwc_kernel
+[ncu] Profiling kernel 4/7: norm_silu_nhwc_scalar_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel3_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 1.8s
+[ncu] [metrics] Completed for kernel 4/7: norm_silu_nhwc_scalar_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel3_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 1.8s
+[ncu] [section] Completed for kernel 4/7: norm_silu_nhwc_scalar_kernel
+[ncu] Profiling kernel 5/7: norm_silu_res_t_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel4_metrics.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 6.1s
+[ncu] [metrics] Completed for kernel 5/7: norm_silu_res_t_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel4_section.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 5/7: norm_silu_res_t_kernel
+[ncu] Profiling kernel 6/7: nchw_to_nhwc_kernel
+[ncu] [metrics[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel5_metrics.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel5]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 6/7: nchw_to_nhwc_kernel
+[ncu] [section[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel5_section.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel5]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 6/7: nchw_to_nhwc_kernel
+[ncu] Profiling kernel 7/7: weight_nchw_to_nhwc_kernel
+[ncu] [metrics[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel6_metrics.csv --kernel-name=::regex:\bweight_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel6]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 7/7: weight_nchw_to_nhwc_kernel
+[ncu] [section[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel6_section.csv --kernel-name=::regex:\bweight_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel6]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 7/7: weight_nchw_to_nhwc_kernel
+[ok] Merged 7 kernel profiles into: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp.csv
+[ncu] profile_bench finished in 69.3s (7 kernel name(s), 14 invocation(s), 9.9s per name)
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_075408_ncu.csv
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp /home/otter77/miniconda3/bin/python3 /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 5 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 8 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_full.csv
+[nsys] Added full launch table (8 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_075408_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_075408_nsys.csv
+[opt] Base carries Improve_Coalescing_and_TransactionSize (+5.02%)
+[machine_check] Using kernel_launch_count from nsys: 108
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_judge_gate_prompt.txt
+Usage: In=24559, Out=267, Total=24826
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round002_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=71336, Out=24289, Total=95625
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_075408/opt_round_002.json
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Usage: In=584408, Out=33450, Total=617858
+[92mFinish reason: end_turn[0m
+[opt] score=1.1026 (geomean over 4 shapes: 8x256x64x128=1.1407x  2x256x64x64=1.0690x  4x256x256x256=1.0637x  1x256x131x131=1.1396x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0002.json
+[opt] bench took 30.7s
+[opt] Optimization history updated: speedup=1.1026
+[base] Re-measuring base and candidate side by side (5-8 interleaved reps)...
+[mcts] Child node n0002 (depth 2): +0.29% (paired) -> reward 0.548, value 1.1055, N=1
+[mcts] Best node so far: n0002 at 1.1055 via kernel_20260911_080728 (N=1, Q=0.548)
+[base] MCTS holds selection (1.1026: paired +0.29% +/-0.06% (2.6 sigma equiv, t=+4.6 on 4 dof, 5 reps, resolved; 1.4846 -> 1.4803 ms)); the candidate is a tree node and may be branched from later
+[vae_block_002.py] Round 2 took 13.1 min (784s)
+[vae_block_002.py] Round 3
+Optimizing start
+[mcts] Round 3: branching from node n0000 (depth 0, N=2, Q=0.898, value 1.0524) via kernel_20260911_074454 [SWITCHED parent]
+[mcts]   why: progressive widening: 1 child node(s) < budget 2 at N=2
+[mcts]   tree: 3 nodes (1 leaves), mean N=1.67, depth seen 2
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_partial_kernel', 'gn_finalize_kernel', 'norm_silu_nhwc_kernel', 'norm_silu_nhwc_scalar_kernel', 'norm_silu_res_t_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_074454.py)
+[ncu] cache hit (82e0a985): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_074454_ncu.csv
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260911_080728 (1.1026 vs base 1.0524) -- note it scored ABOVE the base but inside the margin (not resolvable from noise), so this is 'unproven', not 'failed'
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py
+[ncu] Multiple kernels detected (7), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/7: gn_partial_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 30.0s
+[ncu] [metrics] Completed for kernel 1/7: gn_partial_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 4.8s
+[ncu] [section] Completed for kernel 1/7: gn_partial_kernel
+[ncu] Profiling kernel 2/7: gn_finalize_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 5.7s
+[ncu] [metrics] Completed for kernel 2/7: gn_finalize_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 2/7: gn_finalize_kernel
+[ncu] Profiling kernel 3/7: norm_silu_nhwc_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 3/7: norm_silu_nhwc_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 3/7: norm_silu_nhwc_kernel
+[ncu] Profiling kernel 4/7: norm_silu_nhwc_scalar_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 1.7s
+[ncu] [metrics] Completed for kernel 4/7: norm_silu_nhwc_scalar_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 1.7s
+[ncu] [section] Completed for kernel 4/7: norm_silu_nhwc_scalar_kernel
+[ncu] Profiling kernel 5/7: norm_silu_res_t_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_metrics.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 5.7s
+[ncu] [metrics] Completed for kernel 5/7: norm_silu_res_t_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_section.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 5/7: norm_silu_res_t_kernel
+[ncu] Profiling kernel 6/7: nchw_to_nhwc_kernel
+[ncu] [metrics[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_metrics.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel5]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 6/7: nchw_to_nhwc_kernel
+[ncu] [section[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_section.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel5]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 6/7: nchw_to_nhwc_kernel
+[ncu] Profiling kernel 7/7: weight_nchw_to_nhwc_kernel
+[ncu] [metrics[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_metrics.csv --kernel-name=::regex:\bweight_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel6]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 7/7: weight_nchw_to_nhwc_kernel
+[ncu] [section[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_section.csv --kernel-name=::regex:\bweight_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel6]] completed successfully in 4.8s
+[ncu] [section] Completed for kernel 7/7: weight_nchw_to_nhwc_kernel
+[ok] Merged 7 kernel profiles into: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected.csv
+[ncu] profile_bench finished in 92.0s (7 kernel name(s), 14 invocation(s), 13.1s per name)
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp /home/otter77/miniconda3/bin/python3 /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 4 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 7 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_full.csv
+[nsys] Added full launch table (7 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_074454_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_074454_nsys.csv
+[opt] Loaded 1 previous optimization attempts from /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_074454
+[machine_check] Using kernel_launch_count from nsys: 72
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round003_judge_gate_prompt.txt
+Usage: In=23499, Out=267, Total=23766
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round003_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round003_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round003_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=103366, Out=14722, Total=118088
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_074454/opt_round_003.json
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=620260, Out=24700, Total=644960
+[92mFinish reason: end_turn[0m
+[opt] score=1.0581 (geomean over 4 shapes: 8x256x64x128=1.0903x  2x256x64x64=1.0163x  4x256x256x256=1.0341x  1x256x131x131=1.0941x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0003.json
+[opt] bench took 29.3s
+[opt] Optimization history updated: speedup=1.0581
+[base] Re-measuring base and candidate side by side (5-8 interleaved reps)...
+[mcts] Child node n0003 (depth 1): +0.54% (paired) -> reward 0.589, value 1.0581, N=1
+[mcts] Best node so far: n0002 at 1.1055 via kernel_20260911_080728 (N=1, Q=0.548)
+[base] MCTS holds selection (1.0581: paired +0.54% +/-0.02% (4.4 sigma equiv, t=+27.2 on 4 dof, 5 reps, resolved; 1.5463 -> 1.5380 ms)); the candidate is a tree node and may be branched from later
+[vae_block_002.py] Round 3 took 10.2 min (613s)
+[vae_block_002.py] Round 4
+Optimizing start
+[mcts] Round 4: branching from node n0001 (depth 1, N=2, Q=0.898, value 1.1023) via kernel_20260911_075408 [SWITCHED parent]
+[mcts]   why: progressive widening: 1 child node(s) < budget 2 at N=2
+[mcts]   tree: 4 nodes (2 leaves), mean N=1.75, depth seen 2
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_partial_kernel', 'gn_finalize_kernel', 'norm_silu_nhwc_kernel', 'norm_silu_nhwc_scalar_kernel', 'norm_silu_res_t_kernel', 'nchw_to_nhwc_kernel', 'weight_nchw_to_nhwc_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_075408.py)
+[ncu] cache hit (9832973b): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_075408_ncu.csv
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260911_081806 (1.0581 vs base 1.1023) to explain why it lost
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py
+[ncu] Multiple kernels detected (5), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/5: gn_partial_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 29.8s
+[ncu] [metrics] Completed for kernel 1/5: gn_partial_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 1/5: gn_partial_kernel
+[ncu] Profiling kernel 2/5: gn_finalize_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 2/5: gn_finalize_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 2/5: gn_finalize_kernel
+[ncu] Profiling kernel 3/5: norm_silu_nhwc_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 6.0s
+[ncu] [metrics] Completed for kernel 3/5: norm_silu_nhwc_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 3/5: norm_silu_nhwc_kernel
+[ncu] Profiling kernel 4/5: norm_silu_nhwc_scalar_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 1.8s
+[ncu] [metrics] Completed for kernel 4/5: norm_silu_nhwc_scalar_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 1.8s
+[ncu] [section] Completed for kernel 4/5: norm_silu_nhwc_scalar_kernel
+[ncu] Profiling kernel 5/5: norm_silu_res_t_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_metrics.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 6.0s
+[ncu] [metrics] Completed for kernel 5/5: norm_silu_res_t_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_section.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 5/5: norm_silu_res_t_kernel
+[ok] Merged 5 kernel profiles into: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected.csv
+[ncu] profile_bench finished in 71.3s (5 kernel name(s), 10 invocation(s), 14.3s per name)
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp /home/otter77/miniconda3/bin/python3 /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 5 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 8 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_full.csv
+[nsys] Added full launch table (8 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_075408_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_075408_nsys.csv
+[opt] Loaded 1 previous optimization attempts from /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_075408
+[opt] Base carries Improve_Coalescing_and_TransactionSize (+5.02%)
+[machine_check] Using kernel_launch_count from nsys: 108
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round004_judge_gate_prompt.txt
+Usage: In=24559, Out=267, Total=24826
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round004_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round004_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round004_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=104472, Out=22744, Total=127216
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_075408/opt_round_004.json
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Usage: In=425725, Out=28934, Total=454659
+[92mFinish reason: end_turn[0m
+[opt] score=1.1213 (geomean over 4 shapes: 8x256x64x128=1.1376x  2x256x64x64=1.0824x  4x256x256x256=1.1117x  1x256x131x131=1.1550x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0004.json
+[opt] bench took 30.5s
+[opt] Optimization history updated: speedup=1.1213
+[base] Re-measuring base and candidate side by side (5-8 interleaved reps)...
+[mcts] Child node n0004 (depth 2): +1.88% (paired) -> reward 0.777, value 1.1230, N=1
+[mcts] Best node so far: n0004 at 1.1230 via kernel_20260911_083010 (N=1, Q=0.777)
+[base] MCTS holds selection (1.1213: paired +1.88% +/-0.06% (4.5 sigma equiv, t=+30.3 on 4 dof, 5 reps, resolved; 1.4829 -> 1.4556 ms)); the candidate is a tree node and may be branched from later
+[best] Keeping best_kernel 1.1052 (1.1213 scores higher but paired +1.88% +/-0.06% (4.5 sigma equiv, t=+30.3 on 4 dof, 5 reps, resolved; 1.4829 -> 1.4556 ms)); not separable from measurement drift
+[vae_block_002.py] Round 4 took 12.5 min (748s)
+[vae_block_002.py] Round 5
+Optimizing start
+[mcts] Round 5: branching from node n0003 (depth 1, N=1, Q=0.589, value 1.0581) via kernel_20260911_081806 [SWITCHED parent]
+[mcts]   why: leaf node (no expandable children yet)
+[mcts]   tree: 5 nodes (3 leaves), mean N=2.00, depth seen 2
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_partial_kernel', 'gn_finalize_kernel', 'norm_silu_nhwc_kernel', 'norm_silu_nhwc_scalar_kernel', 'norm_silu_res_t_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_081806.py)
+[ncu] cache hit (358446a2): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_081806_ncu.csv
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260911_083010 (1.1213 vs base 1.0581) -- note it scored ABOVE the base but inside the margin (not resolvable from noise), so this is 'unproven', not 'failed'
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py
+[ncu] Multiple kernels detected (8), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/8: gn_partial_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 25.6s
+[ncu] [metrics] Completed for kernel 1/8: gn_partial_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 1.7s
+[ncu] [section] Completed for kernel 1/8: gn_partial_kernel
+[ncu] Profiling kernel 2/8: gn_partial_c256_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_metrics.csv --kernel-name=::regex:\bgn_partial_c256_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 2/8: gn_partial_c256_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_section.csv --kernel-name=::regex:\bgn_partial_c256_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 2/8: gn_partial_c256_kernel
+[ncu] Profiling kernel 3/8: gn_finalize_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 3/8: gn_finalize_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 3/8: gn_finalize_kernel
+[ncu] Profiling kernel 4/8: norm_silu_nhwc_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 6.0s
+[ncu] [metrics] Completed for kernel 4/8: norm_silu_nhwc_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 4/8: norm_silu_nhwc_kernel
+[ncu] Profiling kernel 5/8: norm_silu_nhwc_scalar_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 1.7s
+[ncu] [metrics] Completed for kernel 5/8: norm_silu_nhwc_scalar_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 1.7s
+[ncu] [section] Completed for kernel 5/8: norm_silu_nhwc_scalar_kernel
+[ncu] Profiling kernel 6/8: norm_silu_res_t_kernel
+[ncu] [metrics[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_metrics.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel5]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 6/8: norm_silu_res_t_kernel
+[ncu] [section[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_section.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel5]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 6/8: norm_silu_res_t_kernel
+[ncu] Profiling kernel 7/8: nchw_to_nhwc_kernel
+[ncu] [metrics[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_metrics.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel6]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 7/8: nchw_to_nhwc_kernel
+[ncu] [section[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_section.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel6]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 7/8: nchw_to_nhwc_kernel
+[ncu] Profiling kernel 8/8: weight_nchw_to_nhwc_kernel
+[ncu] [metrics[kernel7]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel7_metrics.csv --kernel-name=::regex:\bweight_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel7]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 8/8: weight_nchw_to_nhwc_kernel
+[ncu] [section[kernel7]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel7_section.csv --kernel-name=::regex:\bweight_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel7]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 8/8: weight_nchw_to_nhwc_kernel
+[ok] Merged 8 kernel profiles into: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected.csv
+[ncu] profile_bench finished in 95.9s (8 kernel name(s), 16 invocation(s), 12.0s per name)
+[ncu] No profile data for 4 kernel name(s), skipping: gn_partial_kernel [metrics], norm_silu_nhwc_scalar_kernel [metrics], gn_partial_kernel [section], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_c256_kernel(const float4 *, float2 *, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp /home/otter77/miniconda3/bin/python3 /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 4 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 8 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_full.csv
+[nsys] Added full launch table (8 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_081806_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_081806_nsys.csv
+[opt] Base carries CUDA_Graph_Capture_Replay_StaticBuffers (+0.55%)
+[machine_check] Using kernel_launch_count from nsys: 24
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round005_judge_gate_prompt.txt
+Usage: In=25012, Out=267, Total=25279
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round005_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round005_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round005_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=103607, Out=29065, Total=132672
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_081806/opt_round_005.json
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Usage: In=348546, Out=29827, Total=378373
+[92mFinish reason: end_turn[0m
+[opt] score=1.1105 (geomean over 4 shapes: 8x256x64x128=1.1316x  2x256x64x64=1.0851x  4x256x256x256=1.0667x  1x256x131x131=1.1611x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0005.json
+[opt] bench took 30.6s
+[opt] Optimization history updated: speedup=1.1105
+[base] Re-measuring base and candidate side by side (5-8 interleaved reps)...
+[mcts] Child node n0005 (depth 2): +5.03% (paired) -> reward 0.966, value 1.1113, N=1
+[mcts] Best node so far: n0004 at 1.1230 via kernel_20260911_083010 (N=1, Q=0.777)
+[base] MCTS holds selection (1.1105: paired +5.03% +/-0.03% (7.5 sigma equiv, t=+175.4 on 7 dof, 8 reps, escalated, UNRESOLVED; 1.5391 -> 1.4654 ms)); the candidate is a tree node and may be branched from later
+[best] Updating best_kernel: 1.1105 vs 1.1052 [paired +5.03% +/-0.03% (7.5 sigma equiv, t=+175.4 on 7 dof, 8 reps, escalated, UNRESOLVED; 1.5391 -> 1.4654 ms)]
+[vae_block_002.py] Round 5 took 13.7 min (822s)
+[vae_block_002.py] Round 6
+Optimizing start
+[mcts] Round 6: branching from node n0000 (depth 0, N=5, Q=0.907, value 1.0524) via kernel_20260911_074454 [SWITCHED parent]
+[mcts]   why: progressive widening: 2 child node(s) < budget 3 at N=5
+[mcts]   tree: 6 nodes (3 leaves), mean N=2.17, depth seen 2
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_partial_kernel', 'gn_finalize_kernel', 'norm_silu_nhwc_kernel', 'norm_silu_nhwc_scalar_kernel', 'norm_silu_res_t_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_074454.py)
+[ncu] cache hit (82e0a985): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_074454_ncu.csv
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260911_084339 (1.1105 vs base 1.0524) -- note it scored ABOVE the base but inside the margin (not resolvable from noise), so this is 'unproven', not 'failed'
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py
+[ncu] Multiple kernels detected (7), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/7: nchw_to_nhwc_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_metrics.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 29.9s
+[ncu] [metrics] Completed for kernel 1/7: nchw_to_nhwc_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_section.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 1/7: nchw_to_nhwc_kernel
+[ncu] Profiling kernel 2/7: weights_nchw_to_nhwc_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_metrics.csv --kernel-name=::regex:\bweights_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 2/7: weights_nchw_to_nhwc_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_section.csv --kernel-name=::regex:\bweights_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 2/7: weights_nchw_to_nhwc_kernel
+[ncu] Profiling kernel 3/7: gn_partial_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 6.0s
+[ncu] [metrics] Completed for kernel 3/7: gn_partial_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 3/7: gn_partial_kernel
+[ncu] Profiling kernel 4/7: gn_finalize_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 4/7: gn_finalize_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 4/7: gn_finalize_kernel
+[ncu] Profiling kernel 5/7: norm_silu_nhwc_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 6.0s
+[ncu] [metrics] Completed for kernel 5/7: norm_silu_nhwc_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 5/7: norm_silu_nhwc_kernel
+[ncu] Profiling kernel 6/7: norm_silu_nhwc_scalar_kernel
+[ncu] [metrics[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel5]] completed successfully in 1.7s
+[ncu] [metrics] Completed for kernel 6/7: norm_silu_nhwc_scalar_kernel
+[ncu] [section[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel5]] completed successfully in 1.7s
+[ncu] [section] Completed for kernel 6/7: norm_silu_nhwc_scalar_kernel
+[ncu] Profiling kernel 7/7: norm_silu_res_t_kernel
+[ncu] [metrics[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_metrics.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel6]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 7/7: norm_silu_res_t_kernel
+[ncu] [section[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_section.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel6]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 7/7: norm_silu_res_t_kernel
+[ok] Merged 7 kernel profiles into: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected.csv
+[ncu] profile_bench finished in 93.4s (7 kernel name(s), 14 invocation(s), 13.3s per name)
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['nchw_to_nhwc_kernel(const float *, float *, int, int, int)', 'nan', 'weights_nchw_to_nhwc_kernel(const float *, const float *, float *, float *, int)']
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp /home/otter77/miniconda3/bin/python3 /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 4 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 7 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_full.csv
+[nsys] Added full launch table (7 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_074454_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_074454_nsys.csv
+[opt] Loaded 2 previous optimization attempts from /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_074454
+[machine_check] Using kernel_launch_count from nsys: 72
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round006_judge_gate_prompt.txt
+Usage: In=23499, Out=267, Total=23766
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round006_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round006_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round006_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=106700, Out=19677, Total=126377
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_074454/opt_round_006.json
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Usage: In=302330, Out=19936, Total=322266
+[92mFinish reason: end_turn[0m
+[opt] score=1.0708 (geomean over 4 shapes: 8x256x64x128=1.1407x  2x256x64x64=1.0082x  4x256x256x256=1.0496x  1x256x131x131=1.0893x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0006.json
+[opt] bench took 30.4s
+[opt] Optimization history updated: speedup=1.0708
+[base] Re-measuring base and candidate side by side (5-8 interleaved reps)...
+[mcts] Child node n0006 (depth 1): +1.64% (paired) -> reward 0.749, value 1.0697, N=1
+[mcts] Best node so far: n0004 at 1.1230 via kernel_20260911_083010 (N=1, Q=0.777)
+[base] MCTS holds selection (1.0708: paired +1.64% +/-0.06% (4.4 sigma equiv, t=+27.6 on 4 dof, 5 reps, resolved; 1.5477 -> 1.5226 ms)); the candidate is a tree node and may be branched from later
+[vae_block_002.py] Round 6 took 10.6 min (635s)
+[plateau] No gain above the 0.5% margin for 5 consecutive rounds (best=1.1105). Stopping after round 6 of 10; the remaining 3 would very likely have cost wall clock without moving the score. Resume with --resume /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5 --patience 0 to override.
+[vae_block_002.py] Figure saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png
+[vae_block_002.py] Optimization tree saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/optimization_tree.json
+[SUMMARY] {'task': 'tasks/vae_block_002.py', 'best_score': 1.1104788361152151, 'best_runnable': True, 'task_dir': '/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002', 'figure': '/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png', 'input_tokens_sum': 3778740, 'output_tokens_sum': 316758, 'total_tokens_sum': 4095498, 'method_matched_stats': {'total_opt_rounds': 6, 'matched_count': 6, 'unmatched_count': 0}}
+[GLOBAL] Avg speedup=1.1105, Accuracy=1.0000
+[GLOBAL] Saved: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/summary.json
+[GLOBAL] Saved: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/summary.csv
+EXIT=0
+===== RESUME --patience 0 (2026-09-11T08:56:03-03:00) =====
+[clock] locked NVIDIA GeForce RTX 5090 to 2407 MHz, mem 13801 MHz (ceiling 3090 MHz, observed 2400 MHz) -- preset for NVIDIA GeForce RTX 5090
+[capability] gpu-spec:NVIDIA GeForce RTX 5090: available (matched 'RTX 5090')
+[gpu] 'NVIDIA GeForce RTX 5090' -> spec key 'RTX 5090'
+[BATCH] Resuming into existing folder: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5
+[viewer] http://127.0.0.1:8747   (live MCTS tree for this run)
+[mcts] Restored the search tree: 7 nodes (4 leaves), depth 2, mean N=2.14, 6 visits.
+[resume] Restored /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/checkpoint.json: continuing at round 7/10, best=1.1105
+[resume] Carrying a 5-round plateau streak forward (--patience 0).
+[vae_block_002.py] Round 7
+Optimizing start
+[mcts] Round 7: branching from node n0006 (depth 1, N=1, Q=0.749, value 1.0697) via kernel_20260911_085427 [SWITCHED parent]
+[mcts]   why: leaf node (no expandable children yet)
+[mcts]   tree: 7 nodes (4 leaves), mean N=2.14, depth seen 2
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_partial_kernel', 'gn_finalize_kernel', 'norm_silu_nhwc_kernel', 'norm_silu_nhwc_scalar_kernel', 'norm_silu_res_t_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_085427.py)
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[ncu] Multiple kernels detected (5), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/5: gn_partial_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel0_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 1/5: gn_partial_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel0_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 1/5: gn_partial_kernel
+[ncu] Profiling kernel 2/5: gn_finalize_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel1_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 2/5: gn_finalize_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel1_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 4.8s
+[ncu] [section] Completed for kernel 2/5: gn_finalize_kernel
+[ncu] Profiling kernel 3/5: norm_silu_nhwc_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel2_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 3/5: norm_silu_nhwc_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel2_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 3/5: norm_silu_nhwc_kernel
+[ncu] Profiling kernel 4/5: norm_silu_nhwc_scalar_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel3_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 1.7s
+[ncu] [metrics] Completed for kernel 4/5: norm_silu_nhwc_scalar_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel3_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 1.7s
+[ncu] [section] Completed for kernel 4/5: norm_silu_nhwc_scalar_kernel
+[ncu] Profiling kernel 5/5: norm_silu_res_t_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel4_metrics.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 5/5: norm_silu_res_t_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp_kernel4_section.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 5/5: norm_silu_res_t_kernel
+[ok] Merged 5 kernel profiles into: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_temp.csv
+[ncu] profile_bench finished in 47.0s (5 kernel name(s), 10 invocation(s), 9.4s per name)
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_085427_ncu.csv
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp /home/otter77/miniconda3/bin/python3 /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 4 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 7 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_full.csv
+[nsys] Added full launch table (7 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_085427_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_085427_nsys.csv
+[opt] Base carries batch_split_multistream_overlap (+1.75%)
+[machine_check] Using kernel_launch_count from nsys: 144
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round007_judge_gate_prompt.txt
+Usage: In=24515, Out=267, Total=24782
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round007_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round007_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round007_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=58754, Out=14903, Total=73657
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_085427/opt_round_007.json
+[capability] cutlass: available (/home/otter77/git_project/KernelMem/third_party/cutlass/include; PFN shim required)
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Usage: In=937048, Out=48185, Total=985233
+[92mFinish reason: end_turn[0m
+[opt] score=1.0690 (geomean over 4 shapes: 8x256x64x128=1.1386x  2x256x64x64=1.0090x  4x256x256x256=1.0489x  1x256x131x131=1.0836x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0007.json
+[opt] bench took 30.6s
+[opt] Optimization history updated: speedup=1.0690
+[base] Re-measuring base and candidate side by side (5-8 interleaved reps)...
+[mcts] Child node n0007 (depth 2): +0.06% (paired) -> reward 0.510, value 1.0703, N=1
+[mcts] Best node so far: n0004 at 1.1230 via kernel_20260911_083010 (N=1, Q=0.777)
+[base] MCTS holds selection (1.0690: paired +0.06% +/-0.08% (0.7 sigma equiv, t=+0.8 on 4 dof, 5 reps, resolved; 1.5236 -> 1.5227 ms)); the candidate is a tree node and may be branched from later
+[vae_block_002.py] Round 7 took 12.2 min (730s)
+[vae_block_002.py] Round 8
+Optimizing start
+[mcts] Round 8: branching from node n0003 (depth 1, N=2, Q=0.910, value 1.0581) via kernel_20260911_081806 [SWITCHED parent]
+[mcts]   why: progressive widening: 1 child node(s) < budget 2 at N=2
+[mcts]   tree: 8 nodes (4 leaves), mean N=2.25, depth seen 2
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['gn_partial_kernel', 'gn_finalize_kernel', 'norm_silu_nhwc_kernel', 'norm_silu_nhwc_scalar_kernel', 'norm_silu_res_t_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_081806.py)
+[ncu] cache hit (358446a2): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_081806_ncu.csv
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260911_090701 (1.0690 vs base 1.0581) -- note it scored ABOVE the base but inside the margin (not resolvable from noise), so this is 'unproven', not 'failed'
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py
+[ncu] Multiple kernels detected (9), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/9: gn_partial_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 30.1s
+[ncu] [metrics] Completed for kernel 1/9: gn_partial_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 1/9: gn_partial_kernel
+[ncu] Profiling kernel 2/9: gn_partial_nchw_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_metrics.csv --kernel-name=::regex:\bgn_partial_nchw_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 1.8s
+[ncu] [metrics] Completed for kernel 2/9: gn_partial_nchw_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_section.csv --kernel-name=::regex:\bgn_partial_nchw_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 1.7s
+[ncu] [section] Completed for kernel 2/9: gn_partial_nchw_kernel
+[ncu] Profiling kernel 3/9: gn_finalize_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 3/9: gn_finalize_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 3/9: gn_finalize_kernel
+[ncu] Profiling kernel 4/9: norm_silu_nhwc_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 6.0s
+[ncu] [metrics] Completed for kernel 4/9: norm_silu_nhwc_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 4/9: norm_silu_nhwc_kernel
+[ncu] Profiling kernel 5/9: norm_silu_nhwc_scalar_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 1.8s
+[ncu] [metrics] Completed for kernel 5/9: norm_silu_nhwc_scalar_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 1.8s
+[ncu] [section] Completed for kernel 5/9: norm_silu_nhwc_scalar_kernel
+[ncu] Profiling kernel 6/9: norm_silu_res_t_kernel
+[ncu] [metrics[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_metrics.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel5]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 6/9: norm_silu_res_t_kernel
+[ncu] [section[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_section.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel5]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 6/9: norm_silu_res_t_kernel
+[ncu] Profiling kernel 7/9: norm_silu_res_nchw_in_kernel
+[ncu] [metrics[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_metrics.csv --kernel-name=::regex:\bnorm_silu_res_nchw_in_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel6]] completed successfully in 1.8s
+[ncu] [metrics] Completed for kernel 7/9: norm_silu_res_nchw_in_kernel
+[ncu] [section[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_section.csv --kernel-name=::regex:\bnorm_silu_res_nchw_in_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel6]] completed successfully in 1.8s
+[ncu] [section] Completed for kernel 7/9: norm_silu_res_nchw_in_kernel
+[ncu] Profiling kernel 8/9: norm_silu_res_nchw_in_vec_kernel
+[ncu] [metrics[kernel7]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel7_metrics.csv --kernel-name=::regex:\bnorm_silu_res_nchw_in_vec_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel7]] completed successfully in 1.7s
+[ncu] [metrics] Completed for kernel 8/9: norm_silu_res_nchw_in_vec_kernel
+[ncu] [section[kernel7]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel7_section.csv --kernel-name=::regex:\bnorm_silu_res_nchw_in_vec_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel7]] completed successfully in 1.7s
+[ncu] [section] Completed for kernel 8/9: norm_silu_res_nchw_in_vec_kernel
+[ncu] Profiling kernel 9/9: norm_silu_nchw2nhwc_kernel
+[ncu] [metrics[kernel8]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel8_metrics.csv --kernel-name=::regex:\bnorm_silu_nchw2nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel8]] completed successfully in 1.7s
+[ncu] [metrics] Completed for kernel 9/9: norm_silu_nchw2nhwc_kernel
+[ncu] [section[kernel8]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel8_section.csv --kernel-name=::regex:\bnorm_silu_nchw2nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel8]] completed successfully in 1.7s
+[ncu] [section] Completed for kernel 9/9: norm_silu_nchw2nhwc_kernel
+[ok] Merged 9 kernel profiles into: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected.csv
+[ncu] profile_bench finished in 85.3s (9 kernel name(s), 18 invocation(s), 9.5s per name)
+[ncu] No profile data for 10 kernel name(s), skipping: gn_partial_nchw_kernel [metrics], norm_silu_nhwc_scalar_kernel [metrics], norm_silu_res_nchw_in_kernel [metrics], norm_silu_res_nchw_in_vec_kernel [metrics], norm_silu_nchw2nhwc_kernel [metrics], gn_partial_nchw_kernel [section], norm_silu_nhwc_scalar_kernel [section], norm_silu_res_nchw_in_kernel [section], norm_silu_res_nchw_in_vec_kernel [section], norm_silu_nchw2nhwc_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'gn_partial_nchw_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_res_nchw_in_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_res_nchw_in_vec_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nchw2nhwc_kernel'. Available kernels: ['gn_partial_kernel(const float *, float2 *, int, int, int, int, int, int)', 'nan', 'gn_finalize_kernel(const float2 *, const float *, const float *, float *, float *, int, int, int, int, float, float)']
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp /home/otter77/miniconda3/bin/python3 /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 4 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 8 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_full.csv
+[nsys] Added full launch table (8 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_081806_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_081806_nsys.csv
+[opt] Loaded 1 previous optimization attempts from /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_081806
+[opt] Base carries CUDA_Graph_Capture_Replay_StaticBuffers (+0.55%)
+[machine_check] Using kernel_launch_count from nsys: 24
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round008_judge_gate_prompt.txt
+Usage: In=25012, Out=267, Total=25279
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round008_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round008_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round008_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=92252, Out=13149, Total=105401
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_081806/opt_round_008.json
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Usage: In=390137, Out=25248, Total=415385
+[92mFinish reason: end_turn[0m
+[opt] score=1.1112 (geomean over 4 shapes: 8x256x64x128=1.1368x  2x256x64x64=1.0858x  4x256x256x256=1.0667x  1x256x131x131=1.1578x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0009.json
+[opt] bench took 29.5s
+[opt] Optimization history updated: speedup=1.1112
+[base] Re-measuring base and candidate side by side (5-8 interleaved reps)...
+[mcts] Child node n0008 (depth 2): +5.02% (paired) -> reward 0.966, value 1.1112, N=1
+[mcts] Best node so far: n0004 at 1.1230 via kernel_20260911_083010 (N=1, Q=0.777)
+[base] MCTS holds selection (1.1112: paired +5.02% +/-0.02% (7.7 sigma equiv, t=+211.4 on 7 dof, 8 reps, escalated, UNRESOLVED; 1.5392 -> 1.4657 ms)); the candidate is a tree node and may be branched from later
+[best] Updating best_kernel: 1.1112 vs 1.1105 [paired +5.02% +/-0.02% (7.7 sigma equiv, t=+211.4 on 7 dof, 8 reps, escalated, UNRESOLVED; 1.5392 -> 1.4657 ms)]
+[vae_block_002.py] Round 8 took 9.6 min (577s)
+[vae_block_002.py] Round 9
+Optimizing start
+[mcts] Round 9: branching from node n0005 (depth 2, N=1, Q=0.966, value 1.1113) via kernel_20260911_084339 [SWITCHED parent]
+[mcts]   why: leaf node (no expandable children yet)
+[mcts]   tree: 9 nodes (5 leaves), mean N=2.33, depth seen 2
+[opt] Updated test_kernel with base_kernel (temp, needs profiling) for ncu profiling
+=============================================================
+Detected kernel names: ['nchw_to_nhwc_kernel', 'weights_nchw_to_nhwc_kernel', 'gn_partial_kernel', 'gn_finalize_kernel', 'norm_silu_nhwc_kernel', 'norm_silu_nhwc_scalar_kernel', 'norm_silu_res_t_kernel'] (from base_kernel (temp))
+[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...
+[Pre-compile] Kernel loaded successfully, .so is now cached
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py (parent_kernel: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_084339.py)
+[ncu] cache hit (e315fff3): source unchanged since a previous profile, skipping ncu run
+[ncu] Saved profiling results to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_084339_ncu.csv
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['nchw_to_nhwc_kernel(const float *, float *, int, int, int)', 'nan', 'weights_nchw_to_nhwc_kernel(const float *, const float *, float *, float *, int)']
+[ncu] Profiling last round's NOT-ADOPTED kernel kernel_20260911_091625 (1.1112 vs base 1.1113) to explain why it lost
+[ncu] Profiling kernel from file: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py
+[ncu] Multiple kernels detected (7), profiling each kernel separately to ensure all are captured
+[ncu] Profiling kernel 1/7: nchw_to_nhwc_kernel
+[ncu] [metrics[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_metrics.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel0]] completed successfully in 30.0s
+[ncu] [metrics] Completed for kernel 1/7: nchw_to_nhwc_kernel
+[ncu] [section[kernel0]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel0_section.csv --kernel-name=::regex:\bnchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel0]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 1/7: nchw_to_nhwc_kernel
+[ncu] Profiling kernel 2/7: weights_nchw_to_nhwc_kernel
+[ncu] [metrics[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_metrics.csv --kernel-name=::regex:\bweights_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel1]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 2/7: weights_nchw_to_nhwc_kernel
+[ncu] [section[kernel1]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel1_section.csv --kernel-name=::regex:\bweights_nchw_to_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel1]] completed successfully in 4.9s
+[ncu] [section] Completed for kernel 2/7: weights_nchw_to_nhwc_kernel
+[ncu] Profiling kernel 3/7: gn_partial_kernel
+[ncu] [metrics[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_metrics.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel2]] completed successfully in 5.9s
+[ncu] [metrics] Completed for kernel 3/7: gn_partial_kernel
+[ncu] [section[kernel2]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel2_section.csv --kernel-name=::regex:\bgn_partial_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel2]] completed successfully in 5.1s
+[ncu] [section] Completed for kernel 3/7: gn_partial_kernel
+[ncu] Profiling kernel 4/7: gn_finalize_kernel
+[ncu] [metrics[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_metrics.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel3]] completed successfully in 5.8s
+[ncu] [metrics] Completed for kernel 4/7: gn_finalize_kernel
+[ncu] [section[kernel3]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel3_section.csv --kernel-name=::regex:\bgn_finalize_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel3]] completed successfully in 4.8s
+[ncu] [section] Completed for kernel 4/7: gn_finalize_kernel
+[ncu] Profiling kernel 5/7: norm_silu_nhwc_kernel
+[ncu] [metrics[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel4]] completed successfully in 6.0s
+[ncu] [metrics] Completed for kernel 5/7: norm_silu_nhwc_kernel
+[ncu] [section[kernel4]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel4_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel4]] completed successfully in 5.0s
+[ncu] [section] Completed for kernel 5/7: norm_silu_nhwc_kernel
+[ncu] Profiling kernel 6/7: norm_silu_nhwc_scalar_kernel
+[ncu] [metrics[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_metrics.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel5]] completed successfully in 1.7s
+[ncu] [metrics] Completed for kernel 6/7: norm_silu_nhwc_scalar_kernel
+[ncu] [section[kernel5]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel5_section.csv --kernel-name=::regex:\bnorm_silu_nhwc_scalar_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel5]] completed successfully in 1.7s
+[ncu] [section] Completed for kernel 6/7: norm_silu_nhwc_scalar_kernel
+[ncu] Profiling kernel 7/7: norm_silu_res_t_kernel
+[ncu] [metrics[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_metrics.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_metrics.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [metrics[kernel6]] completed successfully in 6.1s
+[ncu] [metrics] Completed for kernel 7/7: norm_silu_res_t_kernel
+[ncu] [section[kernel6]] running: /usr/local/cuda/bin/ncu --clock-control=none --config-file-path /home/otter77/git_project/KernelMem/profiling/config_section.ncu-cfg --log-file=/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected_kernel6_section.csv --kernel-name=::regex:\bnorm_silu_res_t_kernel\b /home/otter77/miniconda3/bin/python /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/rejected_kernel.py --repeat 100
+[ncu] [section[kernel6]] completed successfully in 5.2s
+[ncu] [section] Completed for kernel 7/7: norm_silu_res_t_kernel
+[ok] Merged 7 kernel profiles into: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/ncu_rejected.csv
+[ncu] profile_bench finished in 93.2s (7 kernel name(s), 14 invocation(s), 13.3s per name)
+[ncu] No profile data for 2 kernel name(s), skipping: norm_silu_nhwc_scalar_kernel [metrics], norm_silu_nhwc_scalar_kernel [section]
+[load_ncu_metrics] Warning: No match for kernel 'norm_silu_nhwc_scalar_kernel'. Available kernels: ['nchw_to_nhwc_kernel(const float *, float *, int, int)', 'nan', 'weights_nchw_to_nhwc_kernel(const float *, const float *, float *, float *, int)']
+[ncu] Rejected-kernel profile captured
+[nsys] Starting nsys profiling after ncu...
+[nsys] Running: nsys profile -t cuda,nvtx --sample=none --force-overwrite=true -o /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp /home/otter77/miniconda3/bin/python3 /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/bench_ref_inputs.py --device-idx 0 --test /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/test_kernel.py
+[nsys] Profile completed: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 5 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.csv
+[nsys] Extracting stats: nsys stats --report cuda_gpu_kern_sum --force-export=true /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_temp.nsys-rep
+[nsys] Extracted launch counts for 9 kernel(s)
+[nsys] Saved launch counts to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/scratch/nsys_full.csv
+[nsys] Added full launch table (9 kernels) to optimization prompt
+[nsys] Successfully extracted kernel launch counts
+[nsys] Saved .nsys-rep to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_084339_nsys.nsys-rep
+[nsys] Saved .csv to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/profile/kernel_20260911_084339_nsys.csv
+[opt] Base carries CUDA_Graph_Capture_Replay_StaticBuffers (+0.55%), Improve_Coalescing_and_TransactionSize (+4.95%)
+[machine_check] Using kernel_launch_count from nsys: 32
+[judge_gate] Saved prompt to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round009_judge_gate_prompt.txt
+Usage: In=26377, Out=267, Total=26644
+[92mFinish reason: end_turn[0m
+[judge_gate] Saved reply to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round009_judge_gate_reply.txt
+[judge_gate] Saved code_features to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round009_code_features.json
+[machine_check] Saved machine_check_result to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/llm_io/round009_machine_check_result.json
+Skipping non-text content block of type 'ThinkingBlock'
+Usage: In=117099, Out=22103, Total=139202
+[92mFinish reason: end_turn[0m
+[opt] Optimization history saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/code/kernel_20260911_084339/opt_round_009.json
+[rollout] Expanding with claude-sonnet-5 at effort=high (subscription credit); judge/analysis remain on claude-opus-5
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Skipping non-text content block of type 'ThinkingBlock'
+Skipping non-text content block of type 'ToolUseBlock'
+Usage: In=327427, Out=27488, Total=354915
+[92mFinish reason: end_turn[0m
+[opt] score=1.1222 (geomean over 4 shapes: 8x256x64x128=1.1299x  2x256x64x64=1.0915x  4x256x256x256=1.1114x  1x256x131x131=1.1569x)
+[opt] metrics saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/evaluation/eval_0010.json
+[opt] bench took 30.6s
+[opt] Optimization history updated: speedup=1.1222
+[base] Re-measuring base and candidate side by side (5-8 interleaved reps)...
+[mcts] Child node n0009 (depth 3): +1.32% (paired) -> reward 0.707, value 1.1259, N=1
+[mcts] Best node so far: n0009 at 1.1259 via kernel_20260911_092850 (N=1, Q=0.707)
+[base] MCTS holds selection (1.1222: paired +1.32% +/-0.03% (4.8 sigma equiv, t=+44.9 on 4 dof, 5 reps, resolved; 1.4679 -> 1.4487 ms)); the candidate is a tree node and may be branched from later
+[best] Keeping best_kernel 1.1112 (1.1222 scores higher but paired +1.32% +/-0.03% (4.8 sigma equiv, t=+44.9 on 4 dof, 5 reps, resolved; 1.4679 -> 1.4487 ms)); not separable from measurement drift
+[vae_block_002.py] Round 9 took 12.2 min (733s)
+[vae_block_002.py] Figure saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png
+[vae_block_002.py] Optimization tree saved to: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/optimization_tree.json
+[SUMMARY] {'task': 'tasks/vae_block_002.py', 'best_score': 1.1111795550210926, 'best_runnable': True, 'task_dir': '/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002', 'figure': '/home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/vae_block_002/figures/vae_block_002_score.png', 'input_tokens_sum': 9480197, 'output_tokens_sum': 784592, 'total_tokens_sum': 10264789, 'method_matched_stats': {'total_opt_rounds': 9, 'matched_count': 9, 'unmatched_count': 0}}
+[GLOBAL] Avg speedup=1.1112, Accuracy=1.0000
+[GLOBAL] Saved: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/summary.json
+[GLOBAL] Saved: /home/otter77/git_project/KernelMem/run/20260911_073844_vae_block_002_claude_claude-opus-5/summary.csv
+EXIT2=0
