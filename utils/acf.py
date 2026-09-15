@@ -48,8 +48,12 @@ Environment variables (read by ``utils.compile_and_run``):
 ``KERNELMEM_ACF_STRICT``     ``1``: a build that fails with the ACF is an
                              error (the finishing pass's objective wants that);
                              default: rebuild without controls and record it.
-``KERNELMEM_PTXAS_VERBOSE``  ``0`` disables ``-Xptxas -v`` on candidate builds
+``KERNELMEM_PTXAS_VERBOSE``  ``0`` disables ``-Xptxas -v`` on kernel builds
                              (on by default; it changes no code, only the log).
+                             Applied at EVERY kernel import site -- bench,
+                             preload, ncu/nsys driver -- through
+                             ``utils.ext_naming.kernel_build_context``, so they
+                             all build the same command and share one build.
 ``KERNELMEM_ACF_DISABLE``    ``1``: an embedded preamble builds plain. A/B switch.
 """
 from __future__ import annotations
@@ -57,6 +61,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import functools
+import inspect
 import os
 import re
 import subprocess
@@ -71,10 +76,13 @@ ACF_DISABLE_ENV = "KERNELMEM_ACF_DISABLE"
 CONTROLS_FLAG = "--apply-controls"
 PTXAS_VERBOSE_FLAGS = ["-Xptxas", "-v"]
 
-# Positional index of ``extra_cuda_cflags`` in each patched builder. Kernels pass
-# it by keyword in practice, but a positional call must not silently lose the
-# injection.
-_CUDA_CFLAGS_POS = {"load_inline": 5, "load": 3}
+# The builders patched. The position of ``extra_cuda_cflags`` (and ``verbose``)
+# is read from each builder's signature at call time, never hard-coded: this
+# used to say ``{"load_inline": 5, "load": 3}``, but torch inserted
+# ``sycl_sources`` at index 3 of load_inline, so in torch 2.11 index 5 is
+# ``extra_cflags`` and a positional call would have handed nvcc's flags to g++.
+# Latent only because every corpus kernel passes flags by keyword.
+_PATCHED_BUILDERS = ("load_inline", "load")
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -125,12 +133,27 @@ def nvcc_supports_controls(nvcc: str = "nvcc") -> bool:
 
 
 # ---------------------------------------------------------------- injection
-def _inject(args: tuple, kwargs: dict, pos: int, extra: List[str],
+def _positional_index(fn: Any, param: str) -> Optional[int]:
+    """Index at which *fn* takes *param* positionally, from its signature, or None."""
+    try:
+        params = inspect.signature(fn).parameters.values()  # follows __wrapped__
+    except (TypeError, ValueError):
+        return None
+    for i, p in enumerate(params):
+        if p.kind not in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+            return None
+        if p.name == param:
+            return i
+    return None
+
+
+def _inject(fn: Any, args: tuple, kwargs: dict, extra: List[str],
             force_verbose: bool) -> tuple[list, dict]:
     """Copy of (args, kwargs) with *extra* appended to ``extra_cuda_cflags``."""
     a = list(args)
     kw = dict(kwargs)
-    if len(a) > pos:
+    pos = _positional_index(fn, "extra_cuda_cflags")
+    if pos is not None and len(a) > pos:
         a[pos] = list(a[pos] or []) + list(extra)
     else:
         kw["extra_cuda_cflags"] = list(kw.get("extra_cuda_cflags") or []) + list(extra)
@@ -138,13 +161,18 @@ def _inject(args: tuple, kwargs: dict, pos: int, extra: List[str],
         # torch swallows ninja's output (and with it ``ptxas info``) unless the
         # build is verbose; the harness captures fd 1/2 during the import, so
         # verbose costs nothing and is the only way the stats reach the log.
-        kw["verbose"] = True
+        vpos = _positional_index(fn, "verbose")
+        if vpos is not None and len(a) > vpos:
+            a[vpos] = True
+        else:
+            kw["verbose"] = True
     return a, kw
 
 
 @contextlib.contextmanager
 def patched_extension_builds(*, acf: Optional[Path] = None, strict: bool = False,
-                             ptxas_verbose: bool = False) -> Iterator[Dict[str, Any]]:
+                             ptxas_verbose: bool = False,
+                             force_verbose: Optional[bool] = None) -> Iterator[Dict[str, Any]]:
     """Patch ``torch.utils.cpp_extension.load_inline``/``load`` for the block.
 
     Every build started inside the block gets ``-Xptxas -v`` (if
@@ -152,7 +180,17 @@ def patched_extension_builds(*, acf: Optional[Path] = None, strict: bool = False
     ``extra_cuda_cflags``. A build that raises WITH the ACF is retried without
     it unless *strict* -- NVIDIA says to expect ACF failures, and a kernel that
     builds plain must never be scored as a compile error because of a control
-    file. The yielded record says what happened::
+    file.
+
+    *force_verbose* (default: same as *ptxas_verbose*, today's behaviour) makes
+    torch stream ninja's output. It is separate from the flags because the two
+    answer different questions: the flags decide WHICH binary is built (and so
+    must be identical at every import site, or ninja rebuilds cuda.o on each
+    switch -- see utils/ext_naming.py), verbose only decides whether the log is
+    visible, which the bench wants and ncu/nsys do not. ``verbose`` is in
+    neither torch's rebuild key nor the ninja command.
+
+    The yielded record says what happened::
 
         {"acf": str|None, "applied": bool, "fallback": bool, "error": str|None,
          "ptxas_verbose": bool}
@@ -167,7 +205,9 @@ def patched_extension_builds(*, acf: Optional[Path] = None, strict: bool = False
         "error": None,
         "ptxas_verbose": bool(ptxas_verbose),
     }
-    if acf is None and not ptxas_verbose:
+    if force_verbose is None:
+        force_verbose = bool(ptxas_verbose)
+    if acf is None and not ptxas_verbose and not force_verbose:
         yield record
         return
     if acf is not None and not Path(acf).is_file():
@@ -175,17 +215,16 @@ def patched_extension_builds(*, acf: Optional[Path] = None, strict: bool = False
 
     import torch.utils.cpp_extension as ext
 
-    originals = {name: getattr(ext, name) for name in _CUDA_CFLAGS_POS}
+    originals = {name: getattr(ext, name) for name in _PATCHED_BUILDERS}
 
     def make(name: str):
         orig = originals[name]
-        pos = _CUDA_CFLAGS_POS[name]
 
         def call(args, kwargs, with_acf: bool):
             extra: List[str] = list(PTXAS_VERBOSE_FLAGS) if ptxas_verbose else []
             if with_acf:
                 extra += [CONTROLS_FLAG, str(acf)]
-            a, kw = _inject(args, kwargs, pos, extra, force_verbose=ptxas_verbose)
+            a, kw = _inject(orig, args, kwargs, extra, force_verbose=force_verbose)
             return orig(*a, **kw)
 
         @functools.wraps(orig)
@@ -283,8 +322,10 @@ def build_summary(record: Optional[Dict[str, Any]], log: str) -> Dict[str, Any]:
 
     The ptxas report is only as good as the log: a build served from torch's
     extension cache prints nothing, so it comes back with ``n_kernels: 0``.
-    Inside the loop every candidate is a fresh build; tools re-benching a
-    cached kernel should read 0 kernels as "no report", not "no spills".
+    Since builds are content-named (utils/ext_naming.py) that includes a loop
+    candidate whose build inputs match a kernel already built -- same source
+    and flags, e.g. a re-proposed base. The report is only logged, never fed to
+    a prompt or a decision; read 0 kernels as "no report", not "no spills".
     """
     return {
         "acf": dict(record) if record else None,
@@ -303,6 +344,7 @@ _PREAMBLE = '''\
 # Set KERNELMEM_ACF_DISABLE=1 to force the plain build (A/B switch).
 import atexit as _km_atexit
 import base64 as _km_b64
+import inspect as _km_inspect
 import os as _km_os
 import re as _km_re
 import subprocess as _km_sp
@@ -321,6 +363,21 @@ def _km_nvcc_version():
         return None
     m = _km_re.search(r"\\bV(\\d+\\.\\d+\\.\\d+)", out)
     return m.group(1) if m else None
+
+
+def _km_cuda_flags_pos(fn):
+    # From the builder's signature: torch 2.11 put sycl_sources at index 3, so
+    # a hard-coded index silently moved nvcc flags into extra_cflags.
+    try:
+        params = list(_km_inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return None
+    for i, p in enumerate(params):
+        if p.kind not in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+            return None
+        if p.name == "extra_cuda_cflags":
+            return i
+    return None
 
 
 def _km_install():
@@ -346,8 +403,9 @@ def _km_install():
         a = list(args)
         kw = dict(kwargs)
         flags = ["--apply-controls", state["path"]]
-        if len(a) > 5:
-            a[5] = list(a[5] or []) + flags
+        pos = _km_cuda_flags_pos(orig)
+        if pos is not None and len(a) > pos:
+            a[pos] = list(a[pos] or []) + flags
         else:
             kw["extra_cuda_cflags"] = list(kw.get("extra_cuda_cflags") or []) + flags
         try:

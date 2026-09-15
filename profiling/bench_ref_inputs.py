@@ -44,6 +44,33 @@ def _load_module(path: str | Path, name: str):
     return module
 
 
+def _load_kernel_module(path: str | Path, name: str):
+    """Import the candidate kernel under the harness's build policy.
+
+    ncu and nsys must import the very binary the preload worker warmed and the
+    bench measured, or the kernel compiles UNDER THE PROFILER: in
+    20260911_214651 the plain import here rebuilt the bench's ``-Xptxas -v``
+    cuda.o (~31 s first ncu invocation, rounds 3-5) and same-named kernels
+    rebuilt each other (round 6 nsys 29.8 s). ``kernel_build_context`` gives the
+    same flags and the same content-hashed build folder as every other import
+    site. ncu.py/nsys.py put the repo root on PYTHONPATH; standalone use without
+    it still works, but says loudly that it is not sharing the harness's build.
+    """
+    try:
+        from utils.ext_naming import kernel_build_context
+    except ImportError as exc:
+        print("\n" + "!" * 78 + "\n"
+              f"[bench] WARNING: utils.ext_naming is not importable ({exc}).\n"
+              "[bench] Loading the kernel PLAINLY: its own extension name and flags, NOT\n"
+              "[bench] the harness build policy. It will not reuse the bench/preload build\n"
+              "[bench] and may compile under the profiler. Put the KernelMem repo root on\n"
+              "[bench] PYTHONPATH (profiling/ncu.py and nsys.py do).\n" + "!" * 78 + "\n",
+              file=sys.stderr, flush=True)
+        return _load_module(path, name)
+    with kernel_build_context(force_verbose=False):
+        return _load_module(path, name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run ModelNew forward repeatedly for profiling")
     parser.add_argument("--device-idx", type=int, default=0, help="CUDA device index")
@@ -61,7 +88,7 @@ def main() -> None:
     torch.cuda.set_device(device)
     # --- load reference task + candidate kernel ---
     ref_mod = _load_module(args.ref, "bench_ref_module")
-    test_mod = _load_module(args.test, "bench_test_module")
+    test_mod = _load_kernel_module(args.test, "bench_test_module")
 
     ModelNew = getattr(test_mod, "ModelNew", None)
     get_inputs = getattr(ref_mod, "get_inputs", None)

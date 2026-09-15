@@ -247,6 +247,25 @@ Key arguments:
 - **`--device`**: CUDA device ID.
 - **`--warmup` / `--repeat` / `--tol`**: warmup iterations, benchmark repetitions, and error tolerance.
 - **`--resume`**: path to an existing batch folder to continue instead of starting a new run (see “Stopping and resuming”).
+- **`--rollout_model` / `--rollout_effort`**: the model that writes each child kernel (the MCTS
+  rollout). Default `claude-opus-5` at `high` since 2026-09-14 (it was `claude-sonnet-5` from
+  2026-08-12, a cost decision; no matched A/B between the two exists). The judge, problem-identify
+  and repair calls always use `--model_name`.
+- **`--gate` / `--no_gate` / `--gate_refusals`** (default on, 5): the **harness gate**. When a
+  tool-mode writing call (seed, optimization, repair) tries to end its turn, the harness's own
+  correctness check runs on the kernel in its final message — every scored shape, the
+  uninitialised-memory and device-state-leak gates, no timing — and a FAIL is handed back into the
+  *same* agent session as a rejection, with the harness error verbatim, so the agent fixes it with
+  its files and builds intact. After `--gate_refusals` rejections the kernel goes through to the
+  official bench as it is. Implemented as a Claude Agent SDK Stop hook in `agents/query_server.py`;
+  each rejection costs one agent turn and one gate run (~30 s cold, ~3 s once the kernel is built).
+  Gate activity is logged as `[gate]` lines, `bench:gate` rows in `timing.csv` (these run inside
+  the enclosing `llm:<call_type>` row, so they are part of it, not extra time), and a
+  `gate=... checks=N blocks=N` note in `calls.csv`. The cap is kept below the CLI's own
+  consecutive-block cap (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`, default 8), past which the CLI would
+  end the call with the rejected kernel. It reports PASS/FAIL only: a kernel slower than
+  its parent still passes, and a kernel that passes the gate can still fail the official bench
+  (allocation-dependent uninitialised reads, OOM at full `--repeat`, timeouts).
 
 ### 3. Batch tasks and filtering
 

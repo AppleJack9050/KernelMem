@@ -52,6 +52,15 @@ from utils import clock_lock
 from utils.compile_and_run import compare_and_bench
 
 
+def _build_policy() -> Optional[str]:
+    """``utils.ext_naming.policy_id()``, or None if it cannot be read (never fails a verdict)."""
+    try:
+        from utils import ext_naming
+        return ext_naming.policy_id()
+    except Exception:
+        return None
+
+
 def _geo(xs: List[float]) -> float:
     """Geometric mean, so no single shape dominates by being large."""
     return math.exp(sum(math.log(x) for x in xs) / len(xs))
@@ -353,6 +362,15 @@ def adaptive_paired_verdict(
         "sigma_target": sigma,
         "sigma_ok": (sigma <= 0) or (p_one_sided <= p_target),
         "method": "paired_log_ratio_t",
+        # Which build regime the reps ran in. Before content-hashed extension
+        # names (utils/ext_naming.py), a pair of same-named kernels rebuilt and
+        # loaded a fresh _vN copy before EVERY rep (round 5 of 20260911_214651:
+        # _v1.._v15, ~26 s nvcc between reps, one leaked copy of static state
+        # per rep); now each kernel is built once and its module reused, the
+        # regime utils.noise_null_verdict is calibrated in. Verdicts that carry
+        # no build_policy predate the change and are not paired-comparable
+        # with ones that do. Read after the reps: it runs nvcc --version.
+        "build_policy": _build_policy(),
         # "Resolved" is about the DECISION, not the effect: a +0.49% that cannot
         # be told apart from a 0.50% gate is unresolved even though the kernel
         # plainly changed something. Rounds 13-20 reported every such case to the

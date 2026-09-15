@@ -1,0 +1,22 @@
+timestamp,round_idx,phase,seconds,detail
+2026-09-14 22:44:09,-1,process_start,0.000,pid=41318 subproc_id=0 task=vae_block_002
+2026-09-14 22:49:15,0,bench:gate,30.361,ok
+2026-09-14 22:49:16,0,llm:seed,304.292,
+2026-09-14 22:49:22,0,bench:seed,6.367,ok
+2026-09-14 22:49:22,0,round_total,312.598,best=1.0626
+2026-09-14 22:49:30,1,ncu_invocation:metrics[kernel0],6.267,ok
+2026-09-14 22:49:35,1,ncu_invocation:section[kernel0],5.094,ok
+2026-09-14 22:49:41,1,ncu_invocation:metrics[kernel1],6.038,ok
+2026-09-14 22:49:46,1,ncu_invocation:section[kernel1],5.142,ok
+2026-09-14 22:49:52,1,ncu_invocation:metrics[kernel2],6.030,ok
+2026-09-14 22:49:57,1,ncu_invocation:section[kernel2],4.995,ok
+2026-09-14 22:49:57,1,ncu_profile_total,33.593,names=3 csv=ncu_temp.csv
+2026-09-14 22:49:57,1,ncu:base,33.599,names=3
+2026-09-14 22:50:00,1,nsys,2.850,
+2026-09-14 22:50:05,1,llm:judge_gate,4.990,
+2026-09-14 22:53:29,1,llm:judge_optimization,203.930,
+2026-09-14 23:02:38,1,bench:gate,32.100,ok
+2026-09-14 23:02:38,1,llm:optimization,548.544,
+2026-09-14 23:02:44,1,bench:opt,5.882,ok
+2026-09-14 23:03:06,1,round_total,823.937,best=1.0626
+2026-09-14 23:03:06,-1,process_exit,0.000,stopped=no plateau=no rounds_run=2

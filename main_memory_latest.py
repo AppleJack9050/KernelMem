@@ -35,8 +35,19 @@ from prompts.judger_optimization_memory_latest import build_judger_optimization_
 from utils.gpu_lock import gpu_section
 from utils import clock_lock
 from utils.torch_ext_cache import sweep_stale_batons, sweep_unheld_batons
+from utils import ext_naming
 from utils import run_timing
 from utils.mcts import MechanismPrior, MonteCarloTreeSearch, reward_from_gain
+
+# tasks/*.py hardcode an absolute SOLBENCH_SRC default from the machine they were
+# generated on (/home/elek/...); on any other host the reference dies at import
+# and the failure is charged to the KERNEL -- every candidate, every repair, and
+# now every harness-gate check, all "failing" for a path. Module scope, not
+# main(): multiprocessing's spawn re-executes this file in every bench child
+# before that child imports the reference. Same pattern as utils/mcts_quick.py.
+_SOLBENCH_DEFAULT = Path(__file__).resolve().parent / "third_party" / "SOL-ExecBench" / "src"
+if _SOLBENCH_DEFAULT.is_dir():
+    os.environ.setdefault("SOLBENCH_SRC", str(_SOLBENCH_DEFAULT))
 
 # ---------------------------------------------------------------------------
 # Serialize every GPU-touching entry point behind one cross-process mutex.
@@ -95,14 +106,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--server_address", default="localhost", help="Unused (kept for compatibility)")
     p.add_argument("--server_port", type=int, default=8000, help="Unused (kept for compatibility)")
     p.add_argument("--model_name", default="claude-opus-5", help="Claude model (non-Claude names fall back to claude-opus-5)")
-    p.add_argument("--rollout_model", default="claude-sonnet-5",
+    p.add_argument("--rollout_model", default="claude-opus-5",
                    help="Model for the MCTS ROLLOUT -- the `optimization` call that writes the "
-                        "next kernel from the selected node. This is the call the search repeats "
-                        "every round, and generation is ~95%% of the wall clock, so it is the one "
-                        "worth moving off the most expensive model. The judge, problem-identify "
-                        "and repair calls stay on --model_name. Both go through the Claude Agent "
-                        "SDK with the API-key env blanked, so both bill subscription credit, not "
-                        "the API. Set this equal to --model_name to disable the split.")
+                        "next kernel from the selected node. Was claude-sonnet-5 from 2026-08-12 "
+                        "(a cost call: its '~95%% of wall clock' rationale was a seed-era figure; "
+                        "the rollout is ~38%% of a round today). Back on claude-opus-5 since "
+                        "2026-09-14, with the harness gate (--gate) holding it to a kernel that "
+                        "passes the harness before it leaves the agent. Pass claude-sonnet-5 "
+                        "for the cheaper model; no matched A/B between the two exists yet. Every "
+                        "call goes through the Claude Agent SDK with the API-key env blanked, so "
+                        "both bill subscription credit, not the API.")
+    p.add_argument("--gate", dest="gate", action="store_true", default=True,
+                   help="Harness gate on the tool-mode writing calls (seed, optimization, repair): "
+                        "when the agent tries to end its turn, the harness's own correctness "
+                        "check (all scored shapes, uninitialised-memory and device-state-leak "
+                        "gates, no timing) runs on the kernel in its final message, and a FAIL is "
+                        "handed back into the SAME session as a rejection so the agent fixes it "
+                        "with its files and builds intact. Replaces the next-round repair call "
+                        "for everything the gate can see. --no_gate restores the ungated calls.")
+    p.add_argument("--no_gate", dest="gate", action="store_false",
+                   help="Turn the harness gate off (see --gate).")
+    p.add_argument("--gate_refusals", type=int, default=5,
+                   help="How many times the gate may reject one call before letting the kernel "
+                        "through to the official bench as it is. Each rejection costs one of the "
+                        "agent's turns (KERNELMEM_AGENT_MAX_TURNS, default 30) and one gate run "
+                        "(~27 s cold, ~5 s warm). Must stay at or under the CLI's own limit on "
+                        "consecutive Stop-hook blocks (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP, default 8). "
+                        "0 disables the gate for the run.")
     p.add_argument("--rollout_effort", default="high",
                    choices=["low", "medium", "high", "xhigh", "max"],
                    help="Reasoning effort for the rollout call. High on purpose: the point of the "
@@ -490,6 +520,13 @@ def _ncu_profile_cached(
             h.update(Path(bench_py).read_bytes())
         except OSError:
             pass
+        # The profiled binary is built by the driver under the harness's build
+        # policy (utils/ext_naming.kernel_build_context: ptxas flags, ACF,
+        # naming recipe) and toolchain, which live in the environment, not in
+        # the bytes above. A KERNELMEM_PTXAS_VERBOSE, KERNELMEM_ACF,
+        # KERNELMEM_ACF_DISABLE, nvcc or CXX/TORCH_CUDA_ARCH_LIST change builds
+        # a different binary and must not be served an old profile.
+        h.update(f"|build={ext_naming.policy_id()}".encode())
         key = h.hexdigest()[:32]
         cached = cache_dir / f"{key}.csv"
         if cached.exists() and cached.stat().st_size > 0:
@@ -531,7 +568,17 @@ def _ncu_profile_cached(
 
 
 # ------------------- LLM & eval steps ------------------
-def _make_llm_caller(args):
+def _make_llm_caller(args, gate=None):
+    """Build the run's single model-call entry point.
+
+    *gate* is the harness gate from `_make_harness_gate` (or None). It is
+    attached here, at the one choke point, rather than threaded through every
+    call site: any call type that WRITES a kernel with tools (seed, optimization,
+    repair) gets it automatically, with the extractor that call site will use on
+    the reply, so the bytes the gate checks are the bytes that get scored.
+    """
+    _gated_types = {"seed", "optimization", "repair"}
+    _refusals = int(getattr(args, "gate_refusals", 5) or 0)
 
     def call_llm(
         prompt: str,
@@ -546,15 +593,16 @@ def _make_llm_caller(args):
         """One model call. *model_name*/*reasoning_effort* override the run defaults.
 
         The override exists for the MCTS rollout: expansion is the call the search
-        makes over and over, so it runs on a cheaper model at high effort while the
-        judge, problem-identify and repair calls stay on --model_name. Both go
-        through the same Agent SDK path, so both bill subscription credit.
+        makes over and over, so it runs on --rollout_model at --rollout_effort
+        while the judge, problem-identify and repair calls stay on --model_name.
+        All go through the same Agent SDK path, so all bill subscription credit.
         """
         sp = default_system_prompt if sys_prompt is None else sys_prompt
         # Timed here rather than at each call site: this is the single choke point for
         # every model call, including judge_gate, which passes log_path=None and so
         # never reaches usage.csv at all.
         _model = model_name or args.model_name
+        _gate = gate if (gate is not None and call_type in _gated_types and _refusals > 0) else None
         with run_timing.phase_timer(f"llm:{call_type}", round_idx=round_idx):
             res = query_server(
                 prompt=prompt,
@@ -570,6 +618,14 @@ def _make_llm_caller(args):
                 call_type=call_type,
                 round_idx=round_idx,
                 baseline_code=baseline_code,
+                gate=_gate,
+                gate_extract=(_extract_kernel_from_optimization_reply
+                              if call_type == "optimization" else extract_code_block),
+                gate_refusals=_refusals,
+                # Only the rollout's baseline is a kernel that already PASSED the
+                # harness (the selected node). A repair's baseline is the broken
+                # kernel, and a seed has none.
+                baseline_known_good=(call_type == "optimization"),
             )
         if isinstance(res, list):
             return res[0] if res else ""
@@ -623,8 +679,8 @@ def _llm_to_kernel(
     would overwrite the previous one's saved reply.
 
     *model_name*/*reasoning_effort* override the run defaults for this one call.
-    Used to put the MCTS rollout on a cheaper model at high effort while the
-    judge and analysis calls stay put.
+    Used to route the MCTS rollout to --rollout_model / --rollout_effort while
+    the judge and analysis calls stay on --model_name.
     """
     raw = call_llm(
         prompt,
@@ -723,6 +779,7 @@ def _preload_worker(test_kernel_path: str, conn) -> None:
     try:
         import sys as _sys
         import importlib.util
+        from utils.ext_naming import kernel_build_context
         spec = importlib.util.spec_from_file_location(
             "preload_test_kernel_temp", 
             test_kernel_path
@@ -730,7 +787,13 @@ def _preload_worker(test_kernel_path: str, conn) -> None:
         if spec and spec.loader:
             preload_mod = importlib.util.module_from_spec(spec)
             _sys.modules[spec.name] = preload_mod
-            spec.loader.exec_module(preload_mod)
+            # Warms the build ncu/nsys will import, so it must be built exactly
+            # as they build it -- and as the bench did: before this, preload and
+            # the profilers built plain while the bench added -Xptxas -v, and
+            # ninja rebuilt cuda.o on every switch (~24 s each, every round of
+            # 20260911_214651). Quiet: nobody reads this build's log.
+            with kernel_build_context(force_verbose=False):
+                spec.loader.exec_module(preload_mod)
             conn.send(("ok", "loaded"))
     except Exception as e:
         conn.send(("error", str(e)))
@@ -840,7 +903,11 @@ def _bench_and_score(
             ind.metrics = metrics
             ind.score = speedup
             per_shape = metrics.get("per_shape") or []
-            if len(per_shape) > 1:
+            # The harness gate runs warmup=0 / repeat=1: its speedup is noise and
+            # is never read, so do not print a number that looks like a score.
+            if phase == "gate":
+                pass
+            elif len(per_shape) > 1:
                 brk = "  ".join(f"{s['shape']}={s['speedup']:.4f}x" for s in per_shape)
                 print(f"[{phase}] score={speedup:.4f} (geomean over {len(per_shape)} shapes: {brk})", flush=True)
             else:
@@ -931,10 +998,69 @@ def _bench_and_score(
     # Covers compile + correctness + the timed loop, i.e. everything the 1200s join
     # above bounds. A timed-out bench is recorded too -- that is 20 minutes spent.
     _bench_dt = time.perf_counter() - _bench_t0
-    print(f"[{phase}] bench took {_bench_dt:.1f}s", flush=True)
+    if phase != "gate":   # the gate prints its own PASS/FAIL line with the time
+        print(f"[{phase}] bench took {_bench_dt:.1f}s", flush=True)
     run_timing.record(f"bench:{phase}", _bench_dt,
                       detail="timeout" if timeout_occurred else "ok")
 
+
+def _make_harness_gate(*, task_path: Path, args, scratch_dir: Path):
+    """The harness gate: PASS/FAIL on the harness's own correctness check.
+
+    Returned callable takes kernel SOURCE and answers ``{"ok", "error_type",
+    "message", "seconds", "key"}``. It is what agents/query_server's Stop
+    hook runs on the kernel the agent is about to deliver, so it must be the
+    scorer's path and nothing weaker: the same spawned `_bench_and_score`, the
+    same `compare_and_bench` (every scored shape via get_inputs_extra, the
+    uninitialised-memory poisoning pass, the device-state leak rejection, the
+    600 s compile alarm, gpu_section in the child), the same pristine task file
+    and the run's own --tol. Only the timed loop is cut to warmup=0 / repeat=1
+    -- the number it produces is never read, never written to an eval file
+    (metrics_dir=None) and never enters a score; PASS/FAIL is the whole output.
+
+    Deliberately NOT cached by content. A verdict is a fact about the bytes AND
+    the environment at that moment: a cached FAIL from a timeout behind another
+    GPU user would be replayed for the rest of the task, and a cached parent
+    PASS would make the hook's "is the environment still healthy" probe a no-op.
+    Re-running identical bytes is cheap anyway -- utils/ext_naming keys the build
+    on the CUDA source, so a rerun reuses the compiled extension (~3 s warm).
+    The throwaway file lives under scratch/gate/ and is a plain object, not a
+    KernelIndividual, so gate runs do not consume kernel ids or leave
+    eval_NNNN.json gaps.
+    """
+    import types as _types
+    gate_dir = scratch_dir / "gate"
+    gate_dir.mkdir(parents=True, exist_ok=True)
+
+    def gate(code: str) -> Dict[str, Any]:
+        key = hashlib.sha1(code.encode("utf-8", errors="replace")).hexdigest()[:12]
+        t0 = time.perf_counter()
+        path = gate_dir / f"gate_{key}.py"
+        path.write_text(code, encoding="utf-8")
+        tmp = _types.SimpleNamespace(code_path=path, code=code, metrics=None, score=None)
+        _bench_and_score(
+            tmp,                       # type: ignore[arg-type]
+            ref_py=task_path,
+            device_idx=args.device,
+            warmup=0,
+            repeat=1,
+            tol=args.tol,
+            phase="gate",
+            metrics_dir=None,
+        )
+        m = tmp.metrics or {}
+        out = {
+            "ok": bool(m.get("runnable", False)),
+            "error_type": None if m.get("runnable") else (m.get("error_type") or "UnknownError"),
+            "message": None if m.get("runnable") else (m.get("message") or "(no message)"),
+            "seconds": time.perf_counter() - t0,
+            "key": key,
+        }
+        print(f"[gate] {'PASS' if out['ok'] else 'FAIL'} {key} in {out['seconds']:.1f}s"
+              + ("" if out["ok"] else f" ({out['error_type']})"), flush=True)
+        return out
+
+    return gate
 
 
 # ---------------------- task helpers -------------------
@@ -1612,7 +1738,18 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # so a changed template invalidates it, as it should.
     shutil.copy2(_BENCH_TEMPLATE, bench_py)
 
-    call_llm = _make_llm_caller(args)
+    # The harness gate (see _make_harness_gate / agents.query_server). Built once
+    # per task so its content cache spans rounds: a rejected candidate handed in
+    # again unchanged, or the parent re-checked for an environment fault, costs
+    # nothing the second time.
+    gate = None
+    if getattr(args, "gate", True) and int(getattr(args, "gate_refusals", 5) or 0) > 0:
+        gate = _make_harness_gate(task_path=task_path, args=args, scratch_dir=scratch_dir)
+        print(f"[gate] Harness gate ON for seed/optimization/repair calls: up to "
+              f"{args.gate_refusals} rejection(s) per call, tol={args.tol}", flush=True)
+    else:
+        print("[gate] Harness gate OFF (--no_gate or --gate_refusals 0)", flush=True)
+    call_llm = _make_llm_caller(args, gate=gate)
 
     current_kernel: Optional[KernelIndividual] = None
     base_kernel: Optional[KernelIndividual] = None  # Base kernel for optimization (updated with strict conditions)
@@ -2168,8 +2305,15 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     except Exception as e:
                         print(f"[repair] Warning: Failed to save repair history: {e}")
                 
+                # baseline_code: pre-fill ANSWER.py with the BROKEN kernel, so a
+                # repair that hits the turn wall salvages something instead of
+                # raising out of the round loop (this call has no guard), and
+                # so the harness gate can tell "returned it unchanged" apart
+                # from a real repair.
                 ind = _llm_to_kernel(repair_prompt, code_dir, call_llm, io_dir,
-                                     round_idx, log_path=log_path, call_type="repair")
+                                     round_idx, log_path=log_path, call_type="repair",
+                                     baseline_code=(current_kernel.code
+                                                    if current_kernel is not None else None))
                 _bench_and_score(
                     ind,
                     ref_py=task_path,
@@ -2985,9 +3129,12 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         prompt_file.write_text(opt_prompt, encoding="utf-8")
                         # THE ROLLOUT. In MCTS terms this is the expansion: one
                         # child drawn from the selected state. It is the call the
-                        # search repeats every round and ~95% of the wall clock,
-                        # so it runs on --rollout_model at --rollout_effort while
-                        # the judge/analysis calls above stay on --model_name.
+                        # search repeats every round (~38% of a round's wall clock,
+                        # measured over the Sep-2026 MCTS runs), so it runs on
+                        # --rollout_model at --rollout_effort while the
+                        # judge/analysis calls above stay on --model_name. Under
+                        # --gate the agent cannot end this call while its kernel
+                        # fails the harness check (agents/query_server).
                         print(f"[rollout] Expanding with {args.rollout_model} at "
                               f"effort={args.rollout_effort} (subscription credit); "
                               f"judge/analysis remain on {args.model_name}", flush=True)

@@ -19,10 +19,13 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     CLIConnectionError,
     CLIJSONDecodeError,
+    HookMatcher,
     ResultMessage,
     TextBlock,
     query,
 )
+
+from utils.kernel_io import extract_code_block
 
 DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_EFFORT = "high"
@@ -138,7 +141,9 @@ this without a reason:
 DELIVER EARLY AND OFTEN, TO A FILE. `ANSWER.py` in your working directory is
 what gets scored if this call ends without a final message. On an OPTIMIZATION
 call it ALREADY EXISTS and already holds the kernel you were asked to improve --
-so the floor is already "no change", and your only job is to raise it. On a seed
+so the floor is already "no change", and your only job is to raise it. On a
+REPAIR call it holds the BROKEN kernel you were asked to fix: that is not a floor,
+so overwrite it the moment you have a fixed kernel that compiles. On a seed
 call you start with nothing there, so the moment you have a complete kernel that
 compiles -- however unambitious -- write it. Overwrite it whenever you have something better that still compiles.
 Treat it as a ratchet: `ANSWER.py` should always hold the best COMPLETE kernel
@@ -161,6 +166,288 @@ else of substance. Intermediate messages may say whatever you like -- only the
 last one is read. `ANSWER.py` is a FALLBACK, not a substitute: still post the
 code in your final message.
 """
+
+
+# ---------------------------------------------------------------------------
+# The harness gate: a Stop hook that runs the REAL correctness check on the
+# kernel the agent is about to deliver, and refuses to let the turn end while
+# it fails.
+#
+# The agent's own test is a re-implementation in eager PyTorch on the shapes it
+# picked, at a tolerance it picked. It never runs the checks the harness runs
+# after the call -- the extra scored shapes, the uninitialised-memory poisoning
+# pass, the device-state leak rejection -- and those are exactly what the
+# candidates that DID fail the harness failed on (state leak x4, extra-shape
+# mismatch x2, uninitialised memory x1 of the 11 on record). Before this, such a
+# failure surfaced one full round later as a separate repair call that started
+# from scratch (new session, cold builds, ~6-10 min). Here the failure comes back
+# into the SAME session, with the agent's files, builds and reasoning intact, and
+# a fix costs a few turns plus one gate run (~27 s cold, ~5 s once built).
+#
+# Mechanism (verified against SDK 0.2.110 / bundled CLI 2.1.191 with a smoke
+# test): a Stop hook returning {"decision": "block", "reason": ...} keeps the
+# agent in the same session and hands it the reason as the next user turn; the
+# hook input carries the final message text as `last_assistant_message`. Each
+# block consumes one of the call's turns, and the CLI itself allows at most
+# CLAUDE_CODE_STOP_HOOK_BLOCK_CAP (default 8) consecutive blocks, so the
+# refusal cap below must stay at or under that.
+#
+# What the gate is NOT: it is not the scorer. It runs warmup=0/repeat=1, reports
+# PASS/FAIL only, never a time, and the official bench and paired verdict still
+# run on the delivered kernel exactly as before. It also cannot see speed: a
+# kernel slower than its parent passes, and the tree deals with that.
+# ---------------------------------------------------------------------------
+_GATE_INSTRUCTION = """
+
+HARNESS GATE (STRICT). Ending your turn SUBMITS the kernel in your final message
+(the fenced code block the OUTPUT CONTRACT requires). Before the submission is
+accepted, the harness runs its REAL correctness check on that exact code, in the
+harness's own process: it builds the file, compares ModelNew against the task
+reference on the profiling shape AND every extra scored shape at the harness
+tolerance, re-runs each shape on a poisoned allocator to catch reads of
+uninitialised memory, and rejects kernels that corrupt device-global state.
+No timing from this check is recorded or scored. If the check FAILS, your turn
+does NOT end: you get the harness error verbatim, and you fix the kernel, write
+it to `ANSWER.py`, and end your turn again with the fixed kernel in your final
+message. You have at most {cap} rejections; after that the submission is scored
+as it is, and a failing kernel costs the round. Every gate run costs up to about
+30 s and one of your turns, so test correctness yourself first and submit when
+you are confident. There is no way to waive the check: resubmitting the same
+failing kernel is checked again and counts as another rejection, so if you
+believe the harness or the reference is at fault, say so in one sentence AND
+still deliver the closest-to-correct kernel you have. A final message with no
+fenced kernel is rejected the same way.
+"""
+
+_GATE_NO_CHANGE_NUDGE = (
+    "HARNESS GATE: your submission is byte-identical to the kernel you were given "
+    "to improve, so the plan was not applied. Implement it, or state in ONE "
+    "sentence why it cannot be done under the rules (for example, it would need "
+    "reduced precision), then end your turn again.")
+
+_GATE_NO_CODE = (
+    "HARNESS GATE: your final message contains no complete kernel in a fenced "
+    "```python block, so there is nothing to check. End your turn again with the "
+    "complete kernel file in exactly one fenced code block.")
+
+# Upper bound on one hook invocation. A gate run is bounded by the harness's own
+# 20-minute bench join, and a FAIL may run the gate a second time on the parent
+# to rule out an environment fault, so this must exceed two of those. The CLI
+# treats a hook that overruns as non-blocking, i.e. a failing kernel would slip
+# through -- so this is a ceiling, never a target.
+_GATE_HOOK_TIMEOUT_S = float(os.environ.get("KERNELMEM_GATE_HOOK_TIMEOUT", "2700"))
+
+
+def _fence(code: str) -> str:
+    return f"```python\n{code}\n```"
+
+
+def _last_assistant_text(inp: Dict[str, Any]) -> str:
+    """The final message the agent is about to end its turn with.
+
+    The bundled CLI hands it over as `last_assistant_message` (a plain string in
+    the smoke test that verified this path). Older CLIs may omit it; the JSONL
+    transcript at `transcript_path` then holds the same text as the last
+    assistant entry.
+    """
+    msg = inp.get("last_assistant_message")
+    if isinstance(msg, str) and msg.strip():
+        return msg
+    if isinstance(msg, dict):
+        parts = []
+        for blk in msg.get("content", []) or []:
+            if isinstance(blk, dict) and blk.get("type") == "text":
+                parts.append(blk.get("text", ""))
+        if "".join(parts).strip():
+            return "\n".join(parts)
+    path = inp.get("transcript_path")
+    if not path or not os.path.isfile(path):
+        return ""
+    import json as _json
+    last = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    rec = _json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("type") != "assistant":
+                    continue
+                content = (rec.get("message") or {}).get("content", [])
+                if isinstance(content, str):
+                    last = content
+                    continue
+                texts = [b.get("text", "") for b in content or []
+                         if isinstance(b, dict) and b.get("type") == "text"]
+                # Track the last assistant entry even when it has no text (a
+                # tool call): falling back to an older text entry would gate a
+                # stale draft instead of what the agent is ending on.
+                last = "\n".join(texts)
+    except OSError:
+        return ""
+    return last
+
+
+def _effective_gate_cap(requested: int) -> int:
+    """Clamp the rejection cap below the CLI's own consecutive-block cap.
+
+    The bundled CLI overrides a Stop hook that blocks more than
+    CLAUDE_CODE_STOP_HOOK_BLOCK_CAP times in a row (default 8; 0 = no cap) and
+    ends the call as a success carrying the kernel the hook just rejected. A
+    cap at or above it would silently stop gating, so keep one below it.
+    """
+    requested = int(requested)
+    try:
+        cli_cap = int(os.environ.get("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP", "") or 8)
+    except ValueError:
+        cli_cap = 8
+    if cli_cap <= 0:
+        return requested
+    return max(1, min(requested, cli_cap - 1))
+
+
+def _reset_gate_attempt(state: Dict[str, Any]) -> None:
+    """Per-attempt counters back to zero before a retried SDK call.
+
+    retry_with_backoff re-runs the same options, i.e. the same hook and state.
+    The new session's system prompt promises the full cap, so the rejection
+    count and the nudge must start over. `checks` stays cumulative (every gate
+    run is real work), and a PASS or a parent PASS from attempt 1 stays valid.
+    """
+    if state:
+        state["blocks"] = 0
+        state["nudged"] = False
+        if state.get("gate") != "pass":
+            state["gate"] = "none"
+
+
+def _new_gate_state() -> Dict[str, Any]:
+    return {"checks": 0, "blocks": 0, "nudged": False, "gate": "none",
+            "last_pass_code": None, "parent_verdict": None, "error": None,
+            "last_error_type": None}
+
+
+def _make_stop_gate(*, gate: Callable[[str], Dict[str, Any]],
+                    extract: Optional[Callable[[str], str]],
+                    baseline_code: Optional[str],
+                    baseline_known_good: bool,
+                    cap: int,
+                    call_type: str,
+                    state: Dict[str, Any]):
+    """Build the Stop-hook callback for one agent call.
+
+    *gate* takes source text and returns ``{"ok": bool, "error_type": str|None,
+    "message": str|None}``; it is the harness's own check, run by the caller's
+    process. *extract* pulls the kernel out of the final message the way the
+    caller will pull it afterwards, so the bytes checked are the bytes delivered.
+    *baseline_code* is the kernel the agent was asked to improve (or repair);
+    *baseline_known_good* says whether it passed the harness before, which is
+    what lets a FAIL on both be read as an environment fault rather than the
+    agent's bug. *state* is mutated so the caller can log what the gate did.
+
+    Every path returns; a hook that raised would be reported by the CLI as a
+    hook failure and the stop would go through unchecked, which is worse than an
+    explicit allow with `state["gate"] = "error"`.
+    """
+    _extract = extract or extract_code_block
+
+    def _block(reason: str) -> Dict[str, Any]:
+        state["blocks"] += 1
+        # Overwritten by any later verdict. If the CLI ends the call right after
+        # this block (turn wall, its own consecutive-block cap) the row must not
+        # read "gate=none" as if the hook never fired.
+        state["gate"] = "blocked"
+        return {"decision": "block", "reason": reason}
+
+    async def _stop_gate(inp, tool_use_id, ctx):
+        try:
+            text = _last_assistant_text(dict(inp) if inp else {})
+            # Both extractors need a ``` fence; checking for one first also keeps
+            # extract_code_block from dumping an llm_output_error_*.txt file for
+            # every fence-less message the hook rejects.
+            try:
+                code = _extract(text) if ("```" in text and text.strip()) else ""
+            except Exception:
+                code = ""
+            if not code or not code.strip():
+                if state["blocks"] >= cap:
+                    state["gate"] = "fail_cap"
+                    return {}
+                return _block(_GATE_NO_CODE)
+
+            if (baseline_known_good and baseline_code is not None
+                    and code.strip() == baseline_code.strip()):
+                # Passing every gate by doing nothing is not a pass. One nudge,
+                # then let it through: the round's own no-change handling (and
+                # the log) take it from there rather than burning turns. Only for
+                # a known-good baseline (the rollout's parent): a repair handed
+                # back unchanged is the broken kernel, and must meet the real
+                # check below like any other submission.
+                if not state["nudged"] and state["blocks"] < cap:
+                    state["nudged"] = True
+                    return _block(_GATE_NO_CHANGE_NUDGE)
+                state["gate"] = "nochange"
+                return {}
+
+            # Blocking work off the event loop: the SDK reads the CLI's stdout on
+            # this loop, and a 30-second bench inside the callback would stall it.
+            verdict = await asyncio.to_thread(gate, code)
+            state["checks"] += 1
+            if verdict.get("ok"):
+                state["gate"] = "pass"
+                state["last_pass_code"] = code
+                return {}
+            state["last_error_type"] = verdict.get("error_type")
+
+            if baseline_known_good and baseline_code:
+                # A kernel that passed the harness before failing it now is the
+                # environment, not this candidate -- there is nothing for the
+                # agent to fix, so do not spend its turns on it.
+                pv = state.get("parent_verdict")
+                if pv is None:
+                    pv = await asyncio.to_thread(gate, baseline_code)
+                    # Remember only a PASS. A failing probe may be transient (a
+                    # timeout behind another GPU user, a crashed child); probing
+                    # again on the next FAIL costs seconds, while a remembered
+                    # FAIL would wave every later candidate through as env_fault.
+                    if pv.get("ok"):
+                        state["parent_verdict"] = pv
+                if not pv.get("ok"):
+                    state["gate"] = "env_fault"
+                    state["error"] = (f"parent also fails the gate: "
+                                      f"{pv.get('error_type')}: "
+                                      f"{str(pv.get('message') or '')[:300]}")
+                    return {}
+
+            if state["blocks"] >= cap:
+                state["gate"] = "fail_cap"
+                return {}
+            n = state["blocks"] + 1
+            reason = (f"HARNESS GATE: FAIL ({verdict.get('error_type')}), rejection "
+                      f"{n} of {cap}. Harness error:\n<<<\n"
+                      f"{verdict.get('message') or '(no message)'}\n>>>\n"
+                      f"Fix the kernel, write the complete fixed file to ANSWER.py, "
+                      f"and end your turn with it in exactly one fenced code block. "
+                      f"Resubmitting it unchanged is checked again and counts as "
+                      f"another rejection.")
+            return _block(reason)
+        except asyncio.CancelledError:
+            # The CLI cancels a hook that overruns its timeout (or dies mid-call).
+            # CancelledError is not an Exception, so say what happened before it
+            # propagates; the worker thread and its bench child cannot be
+            # cancelled and finish on their own.
+            state["gate"] = "cancelled"
+            state["error"] = "hook cancelled while the gate was running"
+            raise
+        except Exception as exc:  # never let the hook itself fail the stop
+            state["gate"] = "error"
+            state["error"] = f"{type(exc).__name__}: {exc}"
+            print(f"[gate] hook error ({state['error']}); letting the {call_type} "
+                  f"call end unchecked", flush=True)
+            return {}
+
+    return _stop_gate
 
 
 def _tools_enabled(call_type: str) -> bool:
@@ -558,10 +845,22 @@ def query_server(
     call_type: str = "unknown",
     round_idx: int = -1,
     baseline_code: Optional[str] = None,
+    gate: Optional[Callable[[str], Dict[str, Any]]] = None,
+    gate_extract: Optional[Callable[[str], str]] = None,
+    gate_refusals: int = 5,
+    baseline_known_good: bool = False,
 ):
     # temperature/top_p/top_k, budget_tokens, num_completions, and the server_*
     # params are accepted for caller compatibility but have no Agent SDK
     # equivalent; the CLI controls sampling and output length itself.
+    #
+    # `gate` installs the harness gate (see _make_stop_gate) on tool-mode calls:
+    # the agent may not end its turn while the kernel in its final message fails
+    # the harness's correctness check, up to `gate_refusals` rejections.
+    # `gate_extract` is how the caller will pull the kernel out of the reply, so
+    # the gate checks the same bytes; `baseline_known_good` marks `baseline_code`
+    # as a kernel that already passed, which turns a FAIL on both into an
+    # environment fault instead of a rejection. Ignored on non-tool calls.
     #
     # `is_reasoning_model` was the last parameter in this signature that was
     # neither honoured nor listed above -- the same defect `reasoning_effort` had.
@@ -585,6 +884,7 @@ def query_server(
 
     use_tools = _tools_enabled(call_type)
     workdir: Optional[str] = None
+    gate_state: Dict[str, Any] = {}   # filled only when the harness gate is installed
     if use_tools:
         # A private scratch cwd, so the agent's files land nowhere near the repo
         # or the run artifacts even though it holds a real Bash.
@@ -605,8 +905,24 @@ def query_server(
         if baseline_code:
             _seed_answer(workdir, baseline_code)
         _skills, _sources, _tools = _skills_config()
+        _hooks = None
+        _gate_text = ""
+        if gate is not None and gate_refusals > 0:
+            gate_state = _new_gate_state()
+            _cap = _effective_gate_cap(gate_refusals)
+            if _cap != int(gate_refusals):
+                print(f"[gate] {call_type}: rejection cap {gate_refusals} clamped to {_cap} "
+                      f"(the CLI overrides a Stop hook after its own consecutive-block cap)",
+                      flush=True)
+            _hooks = {"Stop": [HookMatcher(hooks=[_make_stop_gate(
+                gate=gate, extract=gate_extract, baseline_code=baseline_code,
+                baseline_known_good=baseline_known_good, cap=_cap,
+                call_type=call_type, state=gate_state)],
+                timeout=_GATE_HOOK_TIMEOUT_S)]}
+            _gate_text = _GATE_INSTRUCTION.format(cap=_cap)
         options = ClaudeAgentOptions(
             system_prompt=((system_prompt or "") + _TOOL_MODE_INSTRUCTION
+                           + _gate_text
                            + (_SKILLS_INSTRUCTION if _skills else "")),
             model=model,
             effort=effort,
@@ -618,6 +934,7 @@ def query_server(
             env={**_SUBSCRIPTION_ENV, **_agent_build_env(workdir)},
             skills=_skills,
             setting_sources=_sources,
+            hooks=_hooks,
         )
     else:
         options = ClaudeAgentOptions(
@@ -632,9 +949,13 @@ def query_server(
 
     salvaged: Optional[str] = None
     call_error: Optional[Exception] = None
+    def _attempt():
+        _reset_gate_attempt(gate_state)
+        return asyncio.run(_run_query(prompt_text, options, final_only=use_tools))
+
     try:
         texts, result = retry_with_backoff(
-            lambda: asyncio.run(_run_query(prompt_text, options, final_only=use_tools)),
+            _attempt,
             max_retries=3,
             retry_if=_is_transient_cli_result_error,
         )
@@ -658,6 +979,55 @@ def query_server(
               or (result is not None and result.is_error)
               or not texts)
     salvage_used = False
+    orig_failed = failed          # what the CALL did, before the gate's delivery
+    salvage_kind: Optional[str] = None
+    gated_code = gate_state.get("last_pass_code") if gate_state else None
+    if gated_code:
+        # The gate holds the last kernel that PASSED the harness check. On the
+        # paths where the message is not the delivery -- the call died, hit the
+        # turn wall, or ended with no fenced code -- that kernel is a better
+        # thing to score than whatever ANSWER.py holds: the file may be an older
+        # draft, or the untouched parent (agents routinely keep their real draft
+        # in a shared /tmp dir instead of the workdir), and it was never checked.
+        _delivered_has_code = False
+        if not failed:
+            try:
+                _delivered_has_code = bool(
+                    ((gate_extract or extract_code_block)("\n".join(texts))).strip())
+            except Exception:
+                _delivered_has_code = False
+        if failed or not _delivered_has_code:
+            why = (f"{type(call_error).__name__}: {call_error}" if call_error is not None
+                   else f"{result.subtype}: {result.result}" if (failed and result is not None)
+                   else "the final message carried no fenced kernel")
+            print(f"[gate] {call_type}: delivering the last kernel that passed the "
+                  f"harness gate ({len(gated_code)} chars) instead of the reply ({why}).",
+                  flush=True)
+            texts = [_fence(gated_code)]
+            salvaged = gated_code
+            salvage_used = True
+            salvage_kind = "gated"
+            failed = False
+            gate_state["gate"] = "pass"
+    if (not failed and not salvage_used and salvaged and gate_state
+            and gate_state.get("gate") == "fail_cap"):
+        # The gate let a message through at its cap with nothing passing. If that
+        # message has no fenced kernel the reply extracts to nothing and the
+        # round fails outright -- while ANSWER.py, already read, holds a complete
+        # kernel. Score that instead, exactly as for a call that died.
+        _joined = "\n".join(texts)
+        _has = False
+        if "```" in _joined:
+            try:
+                _has = bool(((gate_extract or extract_code_block)(_joined)).strip())
+            except Exception:
+                _has = False
+        if not _has:
+            print(f"[salvage] {call_type}: the final message carried no fenced kernel "
+                  f"after the harness gate's cap; scoring {_ANSWER_FILE} "
+                  f"({len(salvaged)} chars) instead.", flush=True)
+            texts = [_fence(salvaged)]
+            salvage_used = True
     if failed and salvaged:
         why = (f"{type(call_error).__name__}: {call_error}" if call_error is not None
                else f"{result.subtype}: {result.result}" if result is not None
@@ -684,20 +1054,31 @@ def query_server(
 
     # Before the raises, so a call that dies is recorded exactly as one that
     # lives. This is the row that was missing for every failure so far.
+    gate_note = ""
+    if gate_state:
+        gate_note = (f"gate={gate_state.get('gate')} checks={gate_state.get('checks')} "
+                     f"blocks={gate_state.get('blocks')}"
+                     + (f" last_error={gate_state.get('last_error_type')}"
+                        if gate_state.get("last_error_type") else "")
+                     + (f" ({gate_state.get('error')})" if gate_state.get("error") else ""))
+        print(f"[gate] {call_type}: {gate_note}", flush=True)
     _write_call_outcome(
         log_path, round_idx, call_type,
-        outcome=("ok" if not failed else
+        outcome=("ok" if not orig_failed else
                  "max_turns" if "maximum number of turns" in str(call_error or
                                                                  getattr(result, "subtype", ""))
                  else "error"),
         num_turns=getattr(result, "num_turns", None),
         duration_s=(getattr(result, "duration_ms", None) or 0) / 1000.0 if result else None,
-        salvaged=("moved" if salvage_used and (baseline_code is None
-                                               or salvaged.strip() != baseline_code.strip())
-                  else "parent" if salvage_used else "none"),
+        salvaged=(salvage_kind or
+                  ("moved" if salvage_used and (baseline_code is None
+                                                or salvaged.strip() != baseline_code.strip())
+                   else "parent" if salvage_used else "none")),
         model=model, effort=effort,
-        detail=(f"{type(call_error).__name__}: {call_error}" if call_error is not None
-                else getattr(result, "subtype", "") if failed else ""),
+        detail="; ".join(x for x in (
+            (f"{type(call_error).__name__}: {call_error}" if call_error is not None
+             else getattr(result, "subtype", "") if orig_failed else ""),
+            gate_note) if x),
     )
 
     if call_error is not None and not salvage_used:

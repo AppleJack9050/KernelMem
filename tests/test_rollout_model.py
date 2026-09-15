@@ -76,8 +76,39 @@ def main() -> None:
                   model_name="claude-opus-5", reasoning_effort="high")
         _check(calls[-1]["model_name"] == "claude-opus-5",
                "--rollout_model equal to --model_name disables the split")
+
+        print("\n[rollout] the harness gate rides on the writing calls only")
+        marker = object()
+        call_llm3 = mm._make_llm_caller(_args(gate_refusals=4), gate=marker)
+        for ct in ("seed", "optimization", "repair"):
+            call_llm3("p", call_type=ct, round_idx=1)
+            _check(calls[-1]["gate"] is marker and calls[-1]["gate_refusals"] == 4,
+                   f"{ct} gets the gate with the run's refusal cap")
+        _check(calls[-1]["baseline_known_good"] is False,
+               "a repair's baseline (the broken kernel) is not treated as known-good")
+        call_llm3("p", call_type="optimization", round_idx=1)
+        _check(calls[-1]["baseline_known_good"] is True
+               and calls[-1]["gate_extract"] is mm._extract_kernel_from_optimization_reply,
+               "the rollout's baseline is known-good and it is gated with the rollout extractor")
+        for ct in ("judge_optimization", "problem_identify"):
+            call_llm3("p", call_type=ct, round_idx=1)
+            _check(calls[-1]["gate"] is None, f"{ct} is never gated")
+        call_llm4 = mm._make_llm_caller(_args(gate_refusals=0), gate=marker)
+        call_llm4("p", call_type="optimization", round_idx=1)
+        _check(calls[-1]["gate"] is None, "gate_refusals=0 turns the gate off at the choke point")
     finally:
         mm.query_server = real
+
+    print("\n[rollout] parser defaults: Opus for the rollout, gate on")
+    ns = mm._build_arg_parser().parse_args(["tasks/x.py"])
+    _check(ns.rollout_model == "claude-opus-5",
+           f"--rollout_model defaults to claude-opus-5 (got {ns.rollout_model})")
+    _check(ns.rollout_effort == "high", "--rollout_effort stays high")
+    _check(ns.gate is True and ns.gate_refusals == 5,
+           f"--gate on by default with 5 refusals (got gate={ns.gate}, refusals={ns.gate_refusals})")
+    ns2 = mm._build_arg_parser().parse_args(["tasks/x.py", "--no_gate", "--rollout_model", "claude-sonnet-5"])
+    _check(ns2.gate is False and ns2.rollout_model == "claude-sonnet-5",
+           "--no_gate and --rollout_model claude-sonnet-5 still select the old behaviour")
 
     print("\n[rollout] explicit effort wins over the env var")
     prev = os.environ.get("KERNELMEM_CLAUDE_EFFORT")

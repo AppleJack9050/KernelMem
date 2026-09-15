@@ -134,7 +134,11 @@ def main() -> None:
     for path in (REPO / "run/vae_block_002/baselines_fastest_pytorch.json",):
         pass
 
-    kmod = _load(Path(a.kernel), "_cand")
+    # Same build policy as the harness (utils/ext_naming.py): the kernel reuses
+    # the build the bench and profilers made of it instead of recompiling plain.
+    from utils.ext_naming import kernel_build_context
+    with kernel_build_context(force_verbose=False):
+        kmod = _load(Path(a.kernel), "_cand")
     dev = torch.device("cuda:0")
     print(f"kernel: {Path(a.kernel).name}")
     print(f"device: {torch.cuda.get_device_name(0)}\n")

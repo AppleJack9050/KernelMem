@@ -31,7 +31,7 @@ from typing import List, Tuple
 
 import torch
 
-from utils import acf as acf_mod, clock_lock, device_state
+from utils import acf as acf_mod, clock_lock, device_state, ext_naming
 
 # ---------------------------------------------------------------------------
 
@@ -73,10 +73,11 @@ def _capture_import(path: Path, timeout: int = 600, *,
     timeout : int, optional
         Compilation timeout in seconds (default: 600 = 10 minutes).
     acf, acf_strict, ptxas_verbose
-        Passed to :func:`utils.acf.patched_extension_builds`: every
+        Passed to :func:`utils.ext_naming.kernel_build_context`: every
         ``load_inline``/``load`` the module runs while importing gets
-        ``--apply-controls <acf>`` and/or ``-Xptxas -v`` appended. The build
-        record is left on the module as ``__kernelmem_build__``.
+        ``--apply-controls <acf>`` and/or ``-Xptxas -v`` appended, and builds
+        under a content-hashed extension name. The build record is left on the
+        module as ``__kernelmem_build__``.
 
     Returns
     -------
@@ -121,8 +122,16 @@ def _capture_import(path: Path, timeout: int = 600, *,
 
             # ------------ REAL IMPORT (build/compile) with timeout --------------------
             signal.alarm(timeout)  # Start the timeout timer
-            with acf_mod.patched_extension_builds(acf=acf, strict=acf_strict,
-                                                  ptxas_verbose=ptxas_verbose) as build_rec:
+            # The same build policy as preload, the ncu/nsys driver and shape
+            # coverage (utils/ext_naming.py): content-hashed extension names, so
+            # a paired verdict alternating two same-named kernels stops
+            # rebuilding both every rep (round 5 of 20260911_214651: 16 nvcc
+            # builds, 449 s), and one flag set everywhere, so bench<->profile
+            # switches stop rebuilding cuda.o. force_verbose follows ptxas as it
+            # always did: the stream is only wanted for the ptxas report.
+            with ext_naming.kernel_build_context(acf=acf, strict=acf_strict,
+                                                 ptxas_verbose=ptxas_verbose,
+                                                 force_verbose=ptxas_verbose) as build_rec:
                 spec.loader.exec_module(module)                         # pyright: ignore[attr-defined]
             module.__dict__["__kernelmem_build__"] = build_rec
             signal.alarm(0)  # Cancel the alarm if compilation succeeds

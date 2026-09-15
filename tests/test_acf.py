@@ -32,13 +32,19 @@ ext = pytest.importorskip("torch.utils.cpp_extension")
 
 # ------------------------------------------------------------- injection
 class _Build:
-    """A stand-in for load_inline that records its flags and can be told to fail."""
+    """A stand-in for load_inline that records its flags and can be told to fail.
+
+    Its positional order is torch 2.11's (``sycl_sources`` at index 3, so
+    ``extra_cuda_cflags`` is index 6). The old stub omitted sycl_sources, which
+    is how a hard-coded index 5 in acf.py passed its positional test while
+    pointing at ``extra_cflags`` in the real torch.
+    """
 
     def __init__(self, fail_when=None):
         self.calls = []
         self.fail_when = fail_when  # predicate on extra_cuda_cflags
 
-    def __call__(self, name, cpp_sources, cuda_sources=None, functions=None,
+    def __call__(self, name, cpp_sources, cuda_sources=None, sycl_sources=None, functions=None,
                  extra_cflags=None, extra_cuda_cflags=None, **kw):
         flags = list(extra_cuda_cflags or [])
         self.calls.append({"flags": flags, "kw": kw})
@@ -68,7 +74,7 @@ def test_acf_flag_is_appended_by_keyword_and_positionally(stub, tmp_path):
     f.write_bytes(b"\x00")
     with acf.patched_extension_builds(acf=f) as rec:
         ext.load_inline("k", "", "", extra_cuda_cflags=["-O3"])
-        ext.load_inline("k", "", "", None, None, ["-O3"])  # positional index 5
+        ext.load_inline("k", "", "", None, None, None, ["-O3"])  # positional index 6
     assert rec["applied"] and not rec["fallback"]
     for call in stub.calls:
         assert call["flags"] == ["-O3", "--apply-controls", str(f)]
@@ -81,6 +87,51 @@ def test_ptxas_verbose_adds_flags_and_forces_verbose(stub):
     assert stub.calls[0]["flags"] == ["-O3", "-Xptxas", "-v"]
     assert stub.calls[0]["kw"]["verbose"] is True
     assert rec["ptxas_verbose"] and rec["acf"] is None
+
+
+def test_force_verbose_is_independent_of_the_flags(stub):
+    """Flags decide WHICH binary; verbose only whether the log streams.
+
+    Profilers and the preload need the bench's flags (or ninja rebuilds cuda.o
+    on every bench<->profile switch) but not its log.
+    """
+    with acf.patched_extension_builds(ptxas_verbose=True, force_verbose=False):
+        ext.load_inline("k", "", "", extra_cuda_cflags=["-O3"], verbose=False)
+    assert stub.calls[-1]["flags"] == ["-O3", "-Xptxas", "-v"]
+    assert stub.calls[-1]["kw"]["verbose"] is False
+    with acf.patched_extension_builds(force_verbose=True) as rec:
+        assert ext.load_inline is not stub          # verbose alone still patches
+        ext.load_inline("k", "", "", extra_cuda_cflags=["-O3"], verbose=False)
+    assert stub.calls[-1]["flags"] == ["-O3"] and stub.calls[-1]["kw"]["verbose"] is True
+    assert rec["ptxas_verbose"] is False
+    assert ext.load_inline is stub
+
+
+def test_positional_injection_matches_the_real_torch_signature(monkeypatch, tmp_path):
+    """Bind against torch's own load_inline, not a stub someone has to keep in sync."""
+    import functools
+    import inspect
+
+    real = ext.load_inline
+    while hasattr(real, "__wrapped__"):
+        real = real.__wrapped__
+    seen = []
+
+    @functools.wraps(real)
+    def recorder(*args, **kwargs):
+        seen.append(inspect.signature(real).bind(*args, **kwargs).arguments)
+        return "module"
+
+    monkeypatch.setattr(ext, "load_inline", recorder)
+    f = tmp_path / "c.bin"
+    f.write_bytes(b"\x00")
+    with acf.patched_extension_builds(acf=f, ptxas_verbose=True):
+        # name, cpp, cuda, sycl, functions, extra_cflags, extra_cuda_cflags, ..., verbose (11)
+        ext.load_inline("k", "", "", None, None, ["-Wall"], ["-O3"], None, None, None, None, False)
+    got = seen[0]
+    assert got["extra_cflags"] == ["-Wall"], "nvcc flags leaked into the g++ flags"
+    assert got["extra_cuda_cflags"] == ["-O3", "-Xptxas", "-v", "--apply-controls", str(f)]
+    assert got["verbose"] is True
 
 
 def test_failed_acf_build_falls_back_to_plain_and_says_so(monkeypatch, tmp_path):
@@ -217,6 +268,15 @@ def test_embed_applies_only_under_the_exact_nvcc(monkeypatch):
     assert flags[:2] == ["-O3", "--apply-controls"] and flags[2].endswith(".acf.bin")
     assert Path(flags[2]).read_bytes() == payload
     assert ext.load_inline is b  # restored after the kernel's single call
+
+    # A positional call (index 6 in torch 2.11) gets the controls in the nvcc flags.
+    positional = src.replace('cpp_sources="",\n    cuda_sources="",\n    extra_cuda_cflags=["-O3"],',
+                             '"", "", None, None, ["-Wall"], ["-O3"],')
+    positional = positional.replace('name="my_ext",', '"my_ext",')
+    assert '"", "", None, None, ["-Wall"], ["-O3"],' in positional
+    bp = _Build()
+    _exec_embedded(positional, monkeypatch, bp, nvcc="13.3.33")
+    assert bp.calls[0]["flags"][:2] == ["-O3", "--apply-controls"]
 
     b2 = _Build()
     _exec_embedded(src, monkeypatch, b2, nvcc="13.4.0")

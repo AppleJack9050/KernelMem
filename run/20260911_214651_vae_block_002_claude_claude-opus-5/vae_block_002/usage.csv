@@ -1,0 +1,16 @@
+timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens,model,effort
+2026-09-11 21:51:25,0,seed,149262,22741,172003,claude-opus-5,high
+2026-09-11 21:57:25,0,seed,236147,26552,262699,claude-opus-5,high
+2026-09-11 22:02:25,1,judge_optimization,47254,14030,61284,claude-opus-5,high
+2026-09-11 22:04:41,1,optimization,198037,14879,212916,claude-sonnet-5,high
+2026-09-11 22:10:45,2,judge_optimization,54432,13426,67858,claude-opus-5,high
+2026-09-11 22:13:39,2,optimization,341451,18902,360353,claude-sonnet-5,high
+2026-09-11 22:22:36,3,judge_optimization,85107,25371,110478,claude-opus-5,high
+2026-09-11 22:26:30,3,optimization,593858,23238,617096,claude-sonnet-5,high
+2026-09-11 22:34:06,4,judge_optimization,86052,22086,108138,claude-opus-5,high
+2026-09-11 22:37:12,4,optimization,290245,21652,311897,claude-sonnet-5,high
+2026-09-11 22:44:01,5,judge_optimization,84197,19459,103656,claude-opus-5,high
+2026-09-11 22:48:01,5,optimization,399230,24451,423681,claude-sonnet-5,high
+2026-09-11 23:02:19,6,judge_optimization,88873,16652,105525,claude-opus-5,high
+2026-09-11 23:04:52,6,optimization,201429,15348,216777,claude-sonnet-5,high
+,,,2855574,278787,3134361,,

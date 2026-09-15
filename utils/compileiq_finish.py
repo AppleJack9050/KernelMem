@@ -70,6 +70,7 @@ from typing import Any, Dict, List, Optional
 os.environ.setdefault("CIQ_PROCESS_MODE", "fork")
 
 from utils import acf as acf_mod  # noqa: E402  (no torch import in this process)
+from utils import ext_naming  # noqa: E402  (stdlib-only at import)
 
 REPO = Path(__file__).resolve().parent.parent
 MIN_CUDA = (13, 3)      # first toolkit with --apply-controls
@@ -166,6 +167,13 @@ class Evaluator:
         env = dict(os.environ)
         env["TORCH_EXTENSIONS_DIR"] = str(self.ext_dir)
         env[acf_mod.PTXAS_VERBOSE_ENV] = "1"
+        # Keep the one-shared-folder design above: content-hashed names would
+        # give each candidate ACF its own folder (a cold main.o every time, and
+        # ~2 MB x 150 on a disk at 94%). Every Evaluator run is one import in a
+        # fresh process under a private root, so the collisions content naming
+        # exists to prevent cannot happen here. The paired verdict child below
+        # alternates two kernels in ONE process and keeps content naming.
+        env[ext_naming.MODE_ENV] = ext_naming.MODE_OFF
         env.pop(acf_mod.ACF_ENV, None)
         if acf is not None:
             env[acf_mod.ACF_ENV] = str(acf)

@@ -1,0 +1,4 @@
+timestamp,round_idx,call_type,outcome,num_turns,duration_s,salvaged,model,effort,detail
+2026-09-14 22:49:16,0,seed,ok,7,303.8,none,claude-opus-5,high,gate=pass checks=1 blocks=0
+2026-09-14 22:53:29,1,judge_optimization,ok,1,203.2,none,claude-opus-5,high,
+2026-09-14 23:02:38,1,optimization,ok,18,548.0,none,claude-opus-5,high,gate=pass checks=1 blocks=0

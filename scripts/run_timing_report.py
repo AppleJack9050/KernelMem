@@ -33,6 +33,10 @@ from typing import Dict, List, Tuple
 _LIFECYCLE = {"process_start", "process_exit", "resume", "stop_signal", "abort_signal"}
 _FMT = "%Y-%m-%d %H:%M:%S"
 
+# Phases recorded while an llm:<call_type> phase is still open; summing them
+# alongside it would count the same seconds twice.
+_NESTED_IN_LLM = {"bench:gate"}
+
 
 def _load(path: Path) -> List[dict]:
     rows = []
@@ -117,9 +121,12 @@ def report(path: Path) -> int:
         for rnd in sorted(set(per_round) | set(round_total)):
             phases = per_round.get(rnd, {})
             # ncu_invocation rows are the components of ncu:*; counting both double-counts.
+            # bench:gate likewise runs INSIDE an llm:<call_type> row (the Stop hook
+            # benches while the agent call is open), so it is a component too.
             summed = sum(v for k, v in phases.items()
                          if not k.startswith("ncu_invocation")
-                         and k != "ncu_profile_total")
+                         and k != "ncu_profile_total"
+                         and k not in _NESTED_IN_LLM)
             total = round_total.get(rnd)
             head = f"  round {rnd:>3}  total {_fmt(total) if total else '      ?'}"
             if total:
@@ -130,6 +137,9 @@ def report(path: Path) -> int:
             print(head)
             for name, secs in sorted(phases.items(), key=lambda kv: -kv[1]):
                 if name.startswith("ncu_invocation") or name == "ncu_profile_total":
+                    continue
+                if name in _NESTED_IN_LLM:
+                    print(f"          (inside llm:*) {name:21s} {_fmt(secs)}")
                     continue
                 print(f"        {name:34s} {_fmt(secs)}")
 
